@@ -15,12 +15,12 @@ Minimize expected **total tokens to a verified result**, with correctness as a h
 
    | Work | Starting choice |
    | --- | --- |
-   | Short, fully specified extraction, formatting, or classification with easy checks | GPT-5.6 Luna, none or low |
+   | Short, fully specified extraction, formatting, or classification with easy checks | GPT-5.6 Luna, low |
    | Routine coding, document work, or research with bounded decisions | GPT-5.6 Terra, low or medium |
    | Difficult focused debugging or analysis where a cheaper attempt is likely to need rework | GPT-5.6 Sol, medium or high |
    | Hard end-to-end, cross-system, ambiguous, or consequential work needing strong judgment | GPT-6 Astra, medium or high |
 
-   These are heuristics, not a required ladder. Choose a stronger model at the start when the failure cost warrants it. Astra does not support `none` reasoning. Do not assume higher effort always improves a task. For a consequential or repeated workload, prefer representative task results over a generic benchmark ranking; match any benchmark to the actual work before using it.
+   These are heuristics, not a required ladder. ModelLabs also selects the reasoning-effort slider independently: `low` for simple checked work, `medium` for routine work, `high` for difficult analysis, `xhigh` for consequential architecture/security/release work, `max` for formal verification or adversarial audit, and `ultra` only for an explicit exhaustive-rigor request. It checks the selected model's live supported efforts before submitting a new turn and fails closed when unavailable. Do not assume higher effort always improves a task. For a consequential or repeated workload, prefer representative task results over a generic benchmark ranking; match any benchmark to the actual work before using it.
 4. Keep the prompt, retrieved context, and exposed tools relevant; request only the response detail needed and use meaningful verification. Reassess the choice when the task or evidence shows that the current model is too weak, too costly, or using unnecessary reasoning effort. Switch up or down when the expected benefit exceeds the cost of switching; do not wait for a failed attempt when the mismatch is already clear. Where usage data exists, compare **total** input, cached input, reasoning/output tokens, retries, latency, and outcome across representative tasks before changing a standing default.
 
 ## Apply the choice
