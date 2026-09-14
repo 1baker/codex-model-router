@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modellabs import route
+from turn_proxy import selection_is_listed
 
 
 class RoutingTests(unittest.TestCase):
@@ -25,6 +26,14 @@ class RoutingTests(unittest.TestCase):
     def test_explicit_effort_wins(self):
         choice = route("Format these values as CSV with reasoning effort ultra.")
         self.assertEqual(choice["effort"], "max")
+
+    def test_catalog_gate_requires_listed_model_and_effort(self):
+        catalog = {"data": [{"id": "gpt-6-astra", "hidden": False,
+                             "supportedReasoningEfforts": [{"reasoningEffort": "high"},
+                                                           {"reasoningEffort": "ultra"}]}]}
+        self.assertTrue(selection_is_listed(catalog, {"model": "gpt-6-astra", "effort": "ultra"}))
+        self.assertFalse(selection_is_listed(catalog, {"model": "gpt-6-astra", "effort": "max"}))
+        self.assertFalse(selection_is_listed(catalog, {"model": "gpt-5.6-luna", "effort": "low"}))
 
 
 if __name__ == "__main__":

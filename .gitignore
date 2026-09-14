@@ -5,4 +5,6 @@ venv/
 host-token
 *.log
 routes.jsonl
+metrics.jsonl
 host.lock
+proxy-supervisor.pid

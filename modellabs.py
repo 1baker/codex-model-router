@@ -140,7 +140,7 @@ async def start(prompt: str, cwd: str, override_model: str | None,
         efforts = {e.get("reasoningEffort") for e in entry.get("supportedReasoningEfforts", [])}
         if choice["effort"] not in efforts:
             raise ValueError(f"Model {choice['model']} does not support {choice['effort']} effort.")
-        begun = await _rpc(ws, "thread/start", {"cwd": cwd, "model": choice["model"],
+        begun = await _rpc(ws, "thread/start", {"cwd": cwd, "model": choice["model"], "experimentalRawEvents": True,
                                                  "config": config_for(choice["servers"])}, 3)
         thread_id = begun["thread"]["id"]
         choice["thread_id"] = thread_id

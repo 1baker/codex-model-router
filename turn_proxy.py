@@ -7,11 +7,14 @@ import hashlib
 import json
 import os
 import sys
+import time
+from typing import Any
 
 import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
 from modellabs import record_route, route
+from telemetry import record as record_metric, usage_from
 
 
 PROXY_PORT = int(os.environ.get("MODELLABS_PROXY_PORT", "45173"))
@@ -20,6 +23,7 @@ if not 1024 <= PROXY_PORT <= 65535:
 PROXY_URL = f"ws://127.0.0.1:{PROXY_PORT}"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 CONTINUATIONS = {"ok go", "go ahead", "continue", "yes", "do it"}
+CATALOG_TTL_SECONDS = 60.0
 
 
 async def previous_task(thread_id: str, token: str) -> str | None:
@@ -79,6 +83,50 @@ def route_request(raw: str, context_prompt: str | None = None,
         return raw, None
 
 
+def selection_is_listed(catalog: dict[str, Any], choice: dict[str, Any]) -> bool:
+    """Reject a stale or unsupported model/effort pair before host admission."""
+    for entry in catalog.get("data", []):
+        if entry.get("id") != choice.get("model") or entry.get("hidden"):
+            continue
+        efforts = {item.get("reasoningEffort") for item in entry.get("supportedReasoningEfforts", [])}
+        return choice.get("effort") in efforts
+    return False
+
+
+async def live_catalog(token: str) -> dict[str, Any]:
+    async with websockets.connect(HOST_URL, additional_headers={"Authorization": f"Bearer {token}"},
+                                  open_timeout=2, close_timeout=1, max_size=MAX_MESSAGE_BYTES) as ws:
+        await _rpc(ws, "initialize", {"clientInfo": {"name": "modellabs-catalog", "version": "0.1"},
+                                      "capabilities": {"experimentalApi": True}}, 1)
+        await ws.send(json.dumps({"method": "initialized", "params": {}}))
+        return await _rpc(ws, "model/list", {}, 2)
+
+
+async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, Any], token: str) -> None:
+    """Poll the durable turn record when event delivery belongs to another client."""
+    deadline = time.monotonic() + 15 * 60
+    while time.monotonic() < deadline:
+        try:
+            async with websockets.connect(HOST_URL, additional_headers={"Authorization": f"Bearer {token}"},
+                                          open_timeout=2, close_timeout=1, max_size=MAX_MESSAGE_BYTES) as ws:
+                await _rpc(ws, "initialize", {"clientInfo": {"name": "modellabs-telemetry", "version": "0.1"},
+                                              "capabilities": {"experimentalApi": True}}, 1)
+                await ws.send(json.dumps({"method": "initialized", "params": {}}))
+                turns = await _rpc(ws, "thread/turns/list", {"threadId": thread_id, "limit": 1,
+                                                             "itemsView": "full", "sortDirection": "desc"}, 2)
+            turn = next((item for item in turns.get("data", []) if item.get("id") == turn_id), None)
+            if turn and turn.get("status") != "inProgress":
+                record_metric("turn_completed", thread_id=thread_id, turn_id=turn_id, model=route_info["model"],
+                              effort=route_info["effort"], task_class=route_info["class"],
+                              elapsed_ms=turn.get("durationMs"), status=turn.get("status"), usage=None)
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    record_metric("turn_completion_timeout", thread_id=thread_id, turn_id=turn_id,
+                  model=route_info["model"], effort=route_info["effort"])
+
+
 async def handler(client: websockets.ServerConnection) -> None:
     token = _read_token()
     if client.request.headers.get("Authorization") != f"Bearer {token}":
@@ -88,8 +136,12 @@ async def handler(client: websockets.ServerConnection) -> None:
                                   max_size=MAX_MESSAGE_BYTES) as upstream:
         pending: dict[object, dict] = {}
         manual_model_threads: set[str] = set()
+        active: dict[tuple[str, str], dict[str, Any]] = {}
+        catalog: dict[str, Any] | None = None
+        catalog_at = 0.0
 
         async def inbound() -> None:
+            nonlocal catalog, catalog_at
             async for raw in client:
                 try:
                     ping = json.loads(raw)
@@ -117,6 +169,20 @@ async def handler(client: websockets.ServerConnection) -> None:
                 routed, info = route_request(raw, context, thread_id in manual_model_threads)
                 if info:
                     try:
+                        if catalog is None or time.monotonic() - catalog_at > CATALOG_TTL_SECONDS:
+                            catalog = await live_catalog(token)
+                            catalog_at = time.monotonic()
+                        if not selection_is_listed(catalog, info):
+                            raise ValueError("selected model or reasoning effort is unavailable on this host")
+                    except Exception as exc:
+                        request_id = json.loads(routed).get("id")
+                        if request_id is not None:
+                            await client.send(json.dumps({"id": request_id, "error": {
+                                "code": -32001, "message": f"ModelLabs rejected turn before inference: {exc}"}}))
+                        record_metric("route_rejected", thread_id=info.get("thread_id"), model=info.get("model"),
+                                      effort=info.get("effort"), reason=type(exc).__name__)
+                        continue
+                    try:
                         request_id = json.loads(routed).get("id")
                         if request_id is not None:
                             pending[request_id] = info
@@ -134,6 +200,24 @@ async def handler(client: websockets.ServerConnection) -> None:
                         info["status"] = "accepted_by_host" if "error" not in response else "rejected_by_host"
                         info["turn_id"] = (result.get("turn") or {}).get("id")
                         record_route(info)
+                        if info["status"] == "accepted_by_host" and info.get("thread_id") and info.get("turn_id"):
+                            active[(info["thread_id"], info["turn_id"])] = {**info, "started_at": time.monotonic()}
+                            record_metric("route_accepted", thread_id=info["thread_id"], turn_id=info["turn_id"],
+                                          model=info["model"], effort=info["effort"], task_class=info["class"])
+                            asyncio.create_task(record_completion(info["thread_id"], info["turn_id"], info, token))
+                    params = response.get("params") or {}
+                    key = (params.get("threadId"), params.get("turnId"))
+                    route_info = active.get(key)
+                    if response.get("method") == "rawResponse/completed" and route_info:
+                        record_metric("response_usage", thread_id=key[0], turn_id=key[1], model=route_info["model"],
+                                      effort=route_info["effort"], usage=usage_from(params))
+                    if response.get("method") == "turn/completed" and route_info:
+                        turn = params.get("turn") or {}
+                        record_metric("turn_completed", thread_id=key[0], turn_id=key[1], model=route_info["model"],
+                                      effort=route_info["effort"], task_class=route_info["class"],
+                                      elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
+                                      status=turn.get("status"), usage=usage_from(params))
+                        active.pop(key, None)
                 except (TypeError, ValueError, KeyError):
                     pass
                 await client.send(raw)

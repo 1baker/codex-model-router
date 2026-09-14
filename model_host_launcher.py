@@ -27,6 +27,8 @@ READY_URL = "http://127.0.0.1:45172/readyz"
 # retain their old connection until they exit or reconnect.
 PROXY_URL = "ws://127.0.0.1:45174"
 PROXY_LOG = ROOT / "proxy.log"
+SUPERVISOR_PID = ROOT / "proxy-supervisor.pid"
+SUPERVISOR_LOG = ROOT / "proxy-supervisor.log"
 
 
 def ready() -> bool:
@@ -91,6 +93,29 @@ def ensure_proxy() -> None:
         raise RuntimeError(f"ModelLabs proxy did not become ready; see {PROXY_LOG}")
 
 
+def ensure_proxy_supervisor() -> None:
+    """Start one local watchdog for the new proxy; it never touches old ports."""
+    try:
+        pid = int(SUPERVISOR_PID.read_text(encoding="utf-8").strip())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if b"proxy_supervisor.py" in cmdline:
+            return
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    environment = os.environ.copy()
+    for key in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_TURN_ID", "CODEX_CI"):
+        environment.pop(key, None)
+    environment["MODELLABS_PROXY_PORT"] = "45174"
+    with SUPERVISOR_LOG.open("ab") as log:
+        child = subprocess.Popen(
+            [str(ROOT / "venv/bin/python"), str(ROOT / "proxy_supervisor.py")],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, close_fds=True, env=environment,
+        )
+    SUPERVISOR_PID.write_text(f"{child.pid}\n", encoding="utf-8")
+    os.chmod(SUPERVISOR_PID, 0o600)
+
+
 def proxy_ready() -> bool:
     async def probe() -> bool:
         async with websockets.connect(PROXY_URL,
@@ -122,6 +147,7 @@ def main() -> None:
         require_unowned(args_in[1])
     token = _read_token()
     ensure_proxy()
+    ensure_proxy_supervisor()
     environment = os.environ.copy()
     environment["MODEL_SELECTOR_HOST_TOKEN"] = token
     # A CLI model flag is an explicit user choice. Keep its normal direct-host

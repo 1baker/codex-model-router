@@ -4,6 +4,16 @@ ModelLabs is a local Codex prompt router. It selects a model, reasoning effort,
 and starting MCP shortlist before the host begins inference. A managed Codex
 chat can be adjusted again on later turns through the protected local host.
 
+ModelLabs writes a mode-0600 local `metrics.jsonl` file containing route choice,
+host admission, completion status, elapsed time, and server-reported token
+usage when Codex delivers it to the proxy. It records no prompt or response
+text in telemetry.
+
+The launcher directs new managed chats to the current loopback proxy and starts
+a local watchdog for that proxy. Older proxies are left in place for already
+connected chats; no new managed launcher uses their port. Retire an older proxy
+only after its connected chats have exited.
+
 ## Network boundary
 
 The ModelLabs host and proxy bind only to `127.0.0.1`. They are not registered
