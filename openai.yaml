@@ -1,0 +1,3 @@
+interface:
+  display_name: "Model Selector"
+  short_description: "Choose a token-efficient GPT model for a Codex task"
