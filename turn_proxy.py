@@ -14,7 +14,10 @@ from host_control import HOST_URL, _read_token, _rpc
 from modellabs import record_route, route
 
 
-PROXY_URL = "ws://127.0.0.1:45173"
+PROXY_PORT = int(os.environ.get("MODELLABS_PROXY_PORT", "45173"))
+if not 1024 <= PROXY_PORT <= 65535:
+    raise ValueError("MODELLABS_PROXY_PORT must be an unprivileged TCP port.")
+PROXY_URL = f"ws://127.0.0.1:{PROXY_PORT}"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 CONTINUATIONS = {"ok go", "go ahead", "continue", "yes", "do it"}
 
@@ -146,7 +149,10 @@ async def handler(client: websockets.ServerConnection) -> None:
 
 
 async def main() -> None:
-    async with websockets.serve(handler, "127.0.0.1", 45173, max_size=MAX_MESSAGE_BYTES):
+    # This bearer-token control plane is deliberately local-only. Do not place
+    # it behind a public Traefik router: Authelia does not replace this client
+    # capability token or provide a safe interactive authentication flow for it.
+    async with websockets.serve(handler, "127.0.0.1", PROXY_PORT, max_size=MAX_MESSAGE_BYTES):
         await asyncio.Future()
 
 

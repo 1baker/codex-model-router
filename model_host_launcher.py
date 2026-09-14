@@ -23,7 +23,9 @@ ROOT = Path("/home/bak3r/.local/share/model-selector")
 LOCK_FILE = ROOT / "host.lock"
 LOG_FILE = ROOT / "host.log"
 READY_URL = "http://127.0.0.1:45172/readyz"
-PROXY_URL = "ws://127.0.0.1:45173"
+# A new port permits a no-interruption proxy rollout. Existing managed TUIs
+# retain their old connection until they exit or reconnect.
+PROXY_URL = "ws://127.0.0.1:45174"
 PROXY_LOG = ROOT / "proxy.log"
 
 
@@ -73,6 +75,7 @@ def ensure_proxy() -> None:
         environment = os.environ.copy()
         for key in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_TURN_ID", "CODEX_CI"):
             environment.pop(key, None)
+        environment["MODELLABS_PROXY_PORT"] = "45174"
         with PROXY_LOG.open("ab") as log:
             child = subprocess.Popen(
                 [str(ROOT / "venv/bin/python"), str(ROOT / "turn_proxy.py")],

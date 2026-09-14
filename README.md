@@ -4,6 +4,15 @@ ModelLabs is a local Codex prompt router. It selects a model, reasoning effort,
 and starting MCP shortlist before the host begins inference. A managed Codex
 chat can be adjusted again on later turns through the protected local host.
 
+## Network boundary
+
+The ModelLabs host and proxy bind only to `127.0.0.1`. They are not registered
+with Traefik, Cloudflare Tunnel, or Authelia because they are bearer-token
+control-plane WebSockets rather than a browser application. Authelia protects
+browser-facing services at the existing Traefik edge; it cannot replace the
+ModelLabs capability token. Keep any future browser dashboard on a separate,
+Authelia-protected HTTPS route, and keep the control-plane ports local-only.
+
 ## Reasoning effort
 
 The router selects the least effort expected to reach a verified result:
