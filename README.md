@@ -9,6 +9,11 @@ host admission, completion status, elapsed time, and server-reported token
 usage when Codex delivers it to the proxy. It records no prompt or response
 text in telemetry.
 
+For the initial turn, ModelLabs starts a short-lived local observer after turn
+admission. It resumes the managed thread and records the exact upstream token
+usage from `rawResponse/completed`; later turns use the managed proxy's event
+stream and durable completion poller.
+
 The launcher directs new managed chats to the current loopback proxy and starts
 a local watchdog for that proxy. Older proxies are left in place for already
 connected chats; no new managed launcher uses their port. Retire an older proxy

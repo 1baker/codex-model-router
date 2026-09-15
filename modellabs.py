@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -123,6 +124,19 @@ def record_route(choice: dict) -> None:
         out.write(json.dumps(choice, sort_keys=True) + "\n")
 
 
+def launch_usage_observer(thread_id: str, turn_id: str, choice: dict) -> None:
+    """Observe initial-turn usage without retaining user prompt text."""
+    root = Path(__file__).parent
+    with (root / "usage-observer.log").open("ab") as log:
+        subprocess.Popen(
+            [sys.executable, str(root / "usage_observer.py"), "--thread-id", thread_id,
+             "--turn-id", turn_id, "--model", choice["model"], "--effort", choice["effort"],
+             "--task-class", choice["class"]],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, close_fds=True,
+        )
+
+
 async def start(prompt: str, cwd: str, override_model: str | None,
                 override_effort: str | None) -> tuple[str, dict]:
     choice = route(prompt, override_model, override_effort)
@@ -147,9 +161,12 @@ async def start(prompt: str, cwd: str, override_model: str | None,
         # The first-turn hook must see the launcher choice before turn/start.
         record_route({**choice, "status": "initial_route"})
         # The first inference happens only after both the model and tool config are set.
-        await _rpc(ws, "turn/start", {"threadId": thread_id,
-                                      "input": [{"type": "text", "text": prompt}],
-                                      "model": choice["model"], "effort": choice["effort"]}, 4)
+        started = await _rpc(ws, "turn/start", {"threadId": thread_id,
+                                                 "input": [{"type": "text", "text": prompt}],
+                                                 "model": choice["model"], "effort": choice["effort"]}, 4)
+        turn_id = (started.get("turn") or {}).get("id")
+        if isinstance(turn_id, str):
+            launch_usage_observer(thread_id, turn_id, choice)
     return thread_id, choice
 
 

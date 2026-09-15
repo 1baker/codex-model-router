@@ -102,10 +102,13 @@ async def live_catalog(token: str) -> dict[str, Any]:
         return await _rpc(ws, "model/list", {}, 2)
 
 
-async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, Any], token: str) -> None:
+async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, Any], token: str,
+                            delivered: asyncio.Event) -> None:
     """Poll the durable turn record when event delivery belongs to another client."""
     deadline = time.monotonic() + 15 * 60
     while time.monotonic() < deadline:
+        if delivered.is_set():
+            return
         try:
             async with websockets.connect(HOST_URL, additional_headers={"Authorization": f"Bearer {token}"},
                                           open_timeout=2, close_timeout=1, max_size=MAX_MESSAGE_BYTES) as ws:
@@ -201,12 +204,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                         info["turn_id"] = (result.get("turn") or {}).get("id")
                         record_route(info)
                         if info["status"] == "accepted_by_host" and info.get("thread_id") and info.get("turn_id"):
-                            active[(info["thread_id"], info["turn_id"])] = {**info, "started_at": time.monotonic()}
+                            route_info = {**info, "started_at": time.monotonic(), "delivered": asyncio.Event()}
+                            active[(info["thread_id"], info["turn_id"])] = route_info
                             record_metric("route_accepted", thread_id=info["thread_id"], turn_id=info["turn_id"],
                                           model=info["model"], effort=info["effort"], task_class=info["class"])
-                            asyncio.create_task(record_completion(info["thread_id"], info["turn_id"], info, token))
+                            asyncio.create_task(record_completion(info["thread_id"], info["turn_id"], route_info, token,
+                                                                  route_info["delivered"]))
                     params = response.get("params") or {}
-                    key = (params.get("threadId"), params.get("turnId"))
+                    event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
+                    key = (params.get("threadId"), event_turn_id)
                     route_info = active.get(key)
                     if response.get("method") == "rawResponse/completed" and route_info:
                         record_metric("response_usage", thread_id=key[0], turn_id=key[1], model=route_info["model"],
@@ -217,6 +223,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                                       effort=route_info["effort"], task_class=route_info["class"],
                                       elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
                                       status=turn.get("status"), usage=usage_from(params))
+                        route_info["delivered"].set()
                         active.pop(key, None)
                 except (TypeError, ValueError, KeyError):
                     pass
