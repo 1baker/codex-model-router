@@ -47,6 +47,22 @@ and unsupported effort values before a new managed turn starts.
 
 ## Run a managed chat
 
+Install or upgrade for the current user:
+
+```bash
+python3 install.py
+```
+
+In plain English: This copies ModelLabs into your local data directory, creates
+its Python environment and private host token, installs the global Codex skill,
+preserves existing hooks, and writes a user service that restarts the local
+proxy after reboot. It updates your Codex configuration and local command
+wrappers, but does not publish a network port.
+
+The installed `modellabs-proxy.service` is a lingered user service. It keeps the
+updated loopback proxy healthy after logout and restart; it does not replace an
+older proxy that still serves an existing chat.
+
 ```bash
 codex-model-host start
 ```

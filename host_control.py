@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import websockets
+from paths import ROOT
 
 
 HOST_URL = "ws://127.0.0.1:45172"
-TOKEN_FILE = Path("/home/bak3r/.local/share/model-selector/host-token")
+TOKEN_FILE = ROOT / "host-token"
 THREAD_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 

@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modellabs import route
+from install import upsert_toml
 from turn_proxy import selection_is_listed
 
 
@@ -34,6 +35,15 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(selection_is_listed(catalog, {"model": "gpt-6-astra", "effort": "ultra"}))
         self.assertFalse(selection_is_listed(catalog, {"model": "gpt-6-astra", "effort": "max"}))
         self.assertFalse(selection_is_listed(catalog, {"model": "gpt-5.6-luna", "effort": "low"}))
+
+    def test_toml_upsert_preserves_existing_sections(self):
+        source = '[features]\nmemories = true\n\n[mcp_servers.other]\ncommand = "other"\n'
+        result = upsert_toml(source, "features", {"step_model_switching": "true"})
+        result = upsert_toml(result, "mcp_servers.modelControl", {"command": '"python"'})
+        self.assertIn("memories = true", result)
+        self.assertIn("step_model_switching = true", result)
+        self.assertIn('[mcp_servers.other]', result)
+        self.assertIn('[mcp_servers.modelControl]', result)
 
 
 if __name__ == "__main__":

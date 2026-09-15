@@ -6,9 +6,10 @@ import os
 from pathlib import Path
 
 from host_control import HOST_URL, THREAD_ID_PATTERN
+from paths import CODEX_HOME
 
 
-SESSIONS = Path.home() / ".codex/sessions"
+SESSIONS = CODEX_HOME / "sessions"
 
 
 def rollout_for(thread_id: str) -> Path:

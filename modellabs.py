@@ -20,9 +20,9 @@ import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
 from model_host_launcher import PROXY_URL, ensure_host, ensure_proxy
+from paths import ROOT
 
 
-ROOT = Path(__file__).parent
 ROUTES = ROOT / "routes.jsonl"
 SERVERS = frozenset({
     "agentBrowser", "cloudflare", "cloudflare-docs", "cloudflare-bindings",
@@ -126,10 +126,9 @@ def record_route(choice: dict) -> None:
 
 def launch_usage_observer(thread_id: str, turn_id: str, choice: dict) -> None:
     """Observe initial-turn usage without retaining user prompt text."""
-    root = Path(__file__).parent
-    with (root / "usage-observer.log").open("ab") as log:
+    with (ROOT / "usage-observer.log").open("ab") as log:
         subprocess.Popen(
-            [sys.executable, str(root / "usage_observer.py"), "--thread-id", thread_id,
+            [sys.executable, str(ROOT / "usage_observer.py"), "--thread-id", thread_id,
              "--turn-id", turn_id, "--model", choice["model"], "--effort", choice["effort"],
              "--task-class", choice["class"]],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

@@ -5,6 +5,17 @@ description: Choose or revise the GPT model and reasoning effort for a Codex tas
 
 # Model Selector
 
+## Install or upgrade ModelLabs
+
+Clone the ModelLabs repository and run `python3 install.py`. The installer uses
+`MODELLABS_HOME` when set, otherwise the portable default
+`$XDG_DATA_HOME/model-selector` (normally `~/.local/share/model-selector`). It
+creates a private host token, installs the global skill and prompt hook without
+discarding existing hooks, writes wrappers to `~/.local/bin`, and enables the
+lingered user service `modellabs-proxy.service`. The app-server and proxy remain
+bound to loopback. An installer that cannot reach the user service manager still
+completes the local installation and reports `service_enabled: false`.
+
 Minimize expected **total tokens to a verified result**, with correctness as a hard requirement. Account for prompt and context size, reasoning and output tokens, tool use, verification, and likely retries. If the user asks to minimize money or latency instead, optimize that measure across the complete task. The cheapest token price or shortest first response can still produce more work overall. Honor any model, quality, budget, or latency constraint the user specifies.
 
 ## Route the task

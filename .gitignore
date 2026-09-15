@@ -9,3 +9,5 @@ metrics.jsonl
 host.lock
 proxy-supervisor.pid
 usage-observer.log
+install-state.json
+venv/

@@ -1,0 +1,15 @@
+[Unit]
+Description=ModelLabs local proxy supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=@HOME@
+Environment=MODELLABS_HOME=@MODELLABS_HOME@
+ExecStart=@PYTHON@ @MODELLABS_HOME@/proxy_supervisor.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

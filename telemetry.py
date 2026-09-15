@@ -7,9 +7,10 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+from paths import ROOT
 
 
-DEFAULT_PATH = Path("/home/bak3r/.local/share/model-selector/metrics.jsonl")
+DEFAULT_PATH = ROOT / "metrics.jsonl"
 METRICS_PATH = Path(os.environ.get("MODELLABS_METRICS_PATH", DEFAULT_PATH))
 
 

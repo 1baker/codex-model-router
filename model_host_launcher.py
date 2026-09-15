@@ -16,10 +16,10 @@ from pathlib import Path
 import websockets
 
 from host_control import HOST_URL, TOKEN_FILE, _read_token
+from paths import ROOT
 from thread_owner import require_unowned
 
 
-ROOT = Path("/home/bak3r/.local/share/model-selector")
 LOCK_FILE = ROOT / "host.lock"
 LOG_FILE = ROOT / "host.log"
 READY_URL = "http://127.0.0.1:45172/readyz"
@@ -140,7 +140,7 @@ def main() -> None:
                         "archive", "delete", "fork", "cloud", "features", "help"}
     if not args_in or args_in[0] == "start" or (not args_in[0].startswith("-") and args_in[0] not in utility_commands):
         args = args_in[1:] if args_in and args_in[0] == "start" else args_in
-        os.execv("/home/bak3r/.local/bin/modellabs", ["modellabs", "run", *args])
+        os.execv(sys.executable, [sys.executable, str(ROOT / "modellabs.py"), "run", *args])
     if args_in and args_in[0] == "resume":
         if len(args_in) < 2 or args_in[1].startswith("-"):
             raise ValueError("Managed resume requires an exact thread UUID, not the session picker or --last.")
