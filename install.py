@@ -16,7 +16,7 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parent
 PYTHON_FILES = [
-    "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
+    "health_dashboard.py", "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
     "modellabs.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
     "thread_owner.py", "turn_proxy.py", "usage_observer.py",
 ]
@@ -103,7 +103,8 @@ def configure_codex(codex_home: Path, home: Path) -> None:
 
 def write_wrappers(home: Path, bin_dir: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
-    for name, module in (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py")):
+    for name, module in (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py"),
+                         ("modellabs-health", "health_dashboard.py")):
         path = bin_dir / name
         path.write_text(f"#!/bin/sh\nexec {home / 'venv/bin/python'} {home / module} \"$@\"\n", encoding="utf-8")
         path.chmod(0o755)
