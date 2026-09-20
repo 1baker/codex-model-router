@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -42,7 +43,8 @@ class RoutingTests(unittest.TestCase):
         records = [{"event": "outcome_signal", "outcome": "retry", "source": "explicit",
                     "thread_id": "thread", "task_bucket": choice["task_bucket"],
                     "recorded_at_ms": 2_000_000_000_000}] * 4
-        result = adapt(choice, thread_id="thread", records=records, now_ms=2_000_000_000_000)
+        with patch.dict("os.environ", {"MODELLABS_ADAPTIVE_MODE": "shadow"}):
+            result = adapt(choice, thread_id="thread", records=records, now_ms=2_000_000_000_000)
         self.assertEqual(result["model"], choice["model"])
         self.assertEqual(result["adaptive_reason"], "shadow_retry_escalation")
 

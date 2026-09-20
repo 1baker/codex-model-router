@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adaptive_policy import adapt
@@ -12,7 +13,8 @@ class AdaptiveTests(unittest.TestCase):
   evidence = [{'event':'outcome_signal','source':'explicit','outcome':'retry',
                'thread_id':'thread','task_bucket':choice['task_bucket'],
                'recorded_at_ms':2_000_000_000_000}] * 4
-  result = adapt(choice, thread_id='thread', records=evidence, now_ms=2_000_000_000_000)
+  with patch.dict('os.environ', {'MODELLABS_ADAPTIVE_MODE': 'shadow'}):
+   result = adapt(choice, thread_id='thread', records=evidence, now_ms=2_000_000_000_000)
   self.assertEqual(result['model'], 'gpt-5.6-terra')
   self.assertEqual(result['adaptive_recommendation']['model'], 'gpt-5.6-sol')
 
