@@ -33,6 +33,8 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     event_counts: Counter[str] = Counter()
     token_totals: dict[str, int] = defaultdict(int)
     scorecards: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    latencies: dict[tuple[str, str], list[int]] = defaultdict(list)
+    accepted_turns: dict[tuple[str, str], tuple[str, str]] = {}
     for row in records:
         event = row.get("event")
         event_counts[str(event)] += 1
@@ -42,18 +44,52 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             accepted[model] += 1
             card = scorecards[(model, str(row.get("effort", "unknown")))]
             card["accepted_turns"] += 1
+            if isinstance(thread, str) and isinstance(row.get("turn_id"), str):
+                accepted_turns[(thread, row["turn_id"])] = (model, str(row.get("effort", "unknown")))
             if isinstance(thread, str):
                 latest[thread] = {key: row.get(key) for key in ("model", "effort", "task_class", "adaptive_reason", "recorded_at_ms")}
+    unpaired_usage_events = 0
+    unpaired_completion_events = 0
+    for row in records:
+        model = row.get("model")
+        thread = row.get("thread_id")
+        turn = row.get("turn_id")
+        key = accepted_turns.get((thread, turn)) if isinstance(thread, str) and isinstance(turn, str) else None
+        event = row.get("event")
         usage = row.get("usage")
         if isinstance(usage, dict) and isinstance(model, str):
-            token_totals[model] += int(usage.get("totalTokens", usage.get("total_tokens", 0)) or 0)
+            total = int(usage.get("totalTokens", usage.get("total_tokens", 0)) or 0)
+            token_totals[model] += total
+            if key:
+                card = scorecards[key]
+                card["usage_events"] += 1
+                card["total_tokens"] += total
+            else:
+                unpaired_usage_events += 1
+        if event == "turn_completed" and isinstance(model, str):
+            if key:
+                card = scorecards[key]
+                card["completed_turns"] += 1
+                elapsed = row.get("elapsed_ms")
+                if isinstance(elapsed, (int, float)) and elapsed >= 0:
+                    latencies[key].append(int(elapsed))
+            else:
+                unpaired_completion_events += 1
         if event == "outcome_signal" and row.get("source") == "explicit" and isinstance(model, str):
             scorecards[(model, str(row.get("effort", "unknown")))][f"{row.get('outcome')}_outcomes"] += 1
-    cards = [{"model": model, "effort": effort, **dict(sorted(values.items()))}
-             for (model, effort), values in sorted(scorecards.items())]
+    cards = []
+    for (model, effort), values in sorted(scorecards.items()):
+        card = {"model": model, "effort": effort, **dict(sorted(values.items()))}
+        samples = sorted(latencies[(model, effort)])
+        if samples:
+            card["latency_p50_ms"] = samples[(len(samples) - 1) // 2]
+            card["latency_p95_ms"] = samples[min(len(samples) - 1, (len(samples) * 95 + 99) // 100 - 1)]
+        cards.append(card)
     return {"accepted_turn_counts": dict(sorted(accepted.items())),
             "event_counts": dict(sorted(event_counts.items())),
             "token_totals": dict(sorted(token_totals.items())),
+            "unpaired_usage_events": unpaired_usage_events,
+            "unpaired_completion_events": unpaired_completion_events,
             "scorecards": cards, "latest_by_thread": latest}
 
 
