@@ -110,12 +110,14 @@ def main() -> None:
     turn_id = payload.get("turn_id", "")
     initial = initial_route_for(session_id, choice["prompt_sha256"])
     if initial:
-        choice = {key: initial[key] for key in ("class", "model", "effort", "servers", "prompt_sha256")}
+        choice = {key: initial[key] for key in ("class", "model", "effort", "intelligence_slider",
+                                                "servers", "prompt_sha256")}
     applied = False if initial else asyncio.run(apply_on_host(session_id, turn_id, choice))
     record = {**choice, "session_id": session_id, "turn_id": turn_id,
               "status": "initial_route_preserved" if initial else "applied_to_managed_turn" if applied else "advisory_only"}
     record_route(record)
-    message = (f"ModelLabs route: {choice['model']} ({choice['effort']}); "
+    message = (f"ModelLabs route: {choice['model']}; intelligence slider: "
+               f"{choice['intelligence_slider']} ({choice['effort']} reasoning effort); "
                f"suggested MCPs: {', '.join(choice['servers'])}. ")
     if initial:
         message += "The managed launcher already applied the first-turn model, effort, and tool scope; do not override its explicit choice."

@@ -19,9 +19,9 @@ class HealthDashboardTests(unittest.TestCase):
                 "not-json",
             )) + "\n", encoding="utf-8")
             summary = summarize(read_records(path))
-        self.assertEqual(summary["route_counts"], {"gpt-5.6-sol": 2})
+        self.assertEqual(summary["accepted_turn_counts"], {"gpt-5.6-sol": 1})
         self.assertEqual(summary["token_totals"], {"gpt-5.6-sol": 42})
-        self.assertEqual(summary["latest_by_thread"]["thread-a"]["event"], "response_usage")
+        self.assertEqual(summary["latest_by_thread"]["thread-a"]["model"], "gpt-5.6-sol")
 
 
 if __name__ == "__main__":

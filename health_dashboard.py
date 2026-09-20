@@ -18,44 +18,53 @@ def read_records(path: Path) -> list[dict[str, Any]]:
         return records
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
-            record = json.loads(line)
+            row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict):
-            records.append(record)
+        if isinstance(row, dict):
+            records.append(row)
     return records
 
 
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
-    routes: dict[str, dict[str, Any]] = {}
-    totals: dict[str, int] = defaultdict(int)
-    route_counts: Counter[str] = Counter()
-    for record in records:
-        model = record.get("model")
-        if isinstance(model, str):
-            route_counts[model] += 1
-        thread = record.get("thread_id")
-        if isinstance(thread, str) and model:
-            routes[thread] = {key: record.get(key) for key in ("model", "effort", "event", "recorded_at_ms")}
-        usage = record.get("usage")
+    """Separate accepted turns from telemetry event volume and token usage."""
+    latest: dict[str, dict[str, Any]] = {}
+    accepted: Counter[str] = Counter()
+    event_counts: Counter[str] = Counter()
+    token_totals: dict[str, int] = defaultdict(int)
+    scorecards: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for row in records:
+        event = row.get("event")
+        event_counts[str(event)] += 1
+        model = row.get("model")
+        thread = row.get("thread_id")
+        if event == "route_accepted" and isinstance(model, str):
+            accepted[model] += 1
+            card = scorecards[(model, str(row.get("effort", "unknown")))]
+            card["accepted_turns"] += 1
+            if isinstance(thread, str):
+                latest[thread] = {key: row.get(key) for key in ("model", "effort", "task_class", "adaptive_reason", "recorded_at_ms")}
+        usage = row.get("usage")
         if isinstance(usage, dict) and isinstance(model, str):
-            totals[model] += int(usage.get("totalTokens", usage.get("total_tokens", 0)) or 0)
-    return {"route_counts": dict(sorted(route_counts.items())),
-            "token_totals": dict(sorted(totals.items())), "latest_by_thread": routes}
+            token_totals[model] += int(usage.get("totalTokens", usage.get("total_tokens", 0)) or 0)
+        if event == "outcome_signal" and row.get("source") == "explicit" and isinstance(model, str):
+            scorecards[(model, str(row.get("effort", "unknown")))][f"{row.get('outcome')}_outcomes"] += 1
+    cards = [{"model": model, "effort": effort, **dict(sorted(values.items()))}
+             for (model, effort), values in sorted(scorecards.items())]
+    return {"accepted_turn_counts": dict(sorted(accepted.items())),
+            "event_counts": dict(sorted(event_counts.items())),
+            "token_totals": dict(sorted(token_totals.items())),
+            "scorecards": cards, "latest_by_thread": latest}
 
 
 def tmux_tabs(session: str) -> list[dict[str, str]]:
     try:
-        output = subprocess.check_output(
-            ["tmux", "list-windows", "-t", session, "-F",
-             "#{window_index}\t#{window_name}\t#{@byobu-codex-mode}\t#{@byobu-codex-thread-id}"], text=True)
+        output = subprocess.check_output(["tmux", "list-windows", "-t", session, "-F",
+            "#{window_index}\t#{window_name}\t#{@byobu-codex-mode}\t#{@byobu-codex-thread-id}"], text=True)
     except (OSError, subprocess.CalledProcessError):
         return []
-    tabs = []
-    for line in output.splitlines():
-        index, name, mode, thread = (line.split("\t") + ["", "", "", ""])[:4]
-        tabs.append({"index": index, "name": name, "mode": mode, "thread_id": thread})
-    return tabs
+    return [{"index": parts[0], "name": parts[1], "mode": parts[2], "thread_id": parts[3]}
+            for line in output.splitlines() for parts in [(line.split("\t") + ["", "", "", ""])[:4]]]
 
 
 def process_count(pattern: str) -> int:
@@ -68,8 +77,8 @@ def report(metrics: Path, session: str) -> dict[str, Any]:
     tabs = tmux_tabs(session)
     for tab in tabs:
         tab["latest_route"] = summary["latest_by_thread"].get(tab["thread_id"])
-    return {"schema": "modellabs.health.v1", "metrics_path": str(metrics),
-            "managed_tabs": tabs, "routing": {key: value for key, value in summary.items() if key != "latest_by_thread"},
+    return {"schema": "modellabs.health.v2", "metrics_path": str(metrics), "managed_tabs": tabs,
+            "routing": {key: value for key, value in summary.items() if key != "latest_by_thread"},
             "mcp_processes": {"modelControl": process_count("model_host_mcp.py"),
                               "agentBrowser": process_count("agent-browser mcp serve"),
                               "litScout": process_count("litscout.mcp_server"),

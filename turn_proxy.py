@@ -65,19 +65,31 @@ def route_request(raw: str, context_prompt: str | None = None,
         if not prompt.strip():
             return raw, None
         note_followup(params.get("threadId"), prompt)
-        choice = adapt(route(context_prompt or prompt))
+        baseline = route(context_prompt or prompt)
+        # A model selected through Codex's settings UI is an explicit user
+        # choice even though it is not present in this turn's natural language.
+        if preserve_model and params.get("model"):
+            baseline["explicit_model"] = True
+            if params.get("effort"):
+                baseline["explicit_effort"] = True
+        choice = adapt(baseline, thread_id=params.get("threadId"))
         choice["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
         if preserve_model and params.get("model"):
             choice["model"] = params["model"]
+            choice["explicit_model"] = True
             if params.get("effort"):
                 choice["effort"] = params["effort"]
+                choice["intelligence_slider"] = params["effort"]
+                choice["explicit_effort"] = True
         else:
             params["model"] = choice["model"]
             params["effort"] = choice["effort"]
         context = params.setdefault("additionalContext", {})
         if isinstance(context, dict) and "modellabs" not in context:
             context["modellabs"] = {"kind": "application", "value":
-                "ModelLabs starting tool shortlist for this task: " + ", ".join(choice["servers"])
+                f"ModelLabs selected the Codex intelligence slider {choice['intelligence_slider']} "
+                f"({choice['effort']} reasoning effort). Starting tool shortlist for this task: "
+                + ", ".join(choice["servers"])
                 + ". Use other tools available in this thread if the task requires them; this shortlist does not grant access."}
         info = {**choice, "thread_id": params.get("threadId"), "status": "submitted_to_host"}
         return json.dumps(message), info
@@ -209,7 +221,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                             route_info = {**info, "started_at": time.monotonic(), "delivered": asyncio.Event()}
                             active[(info["thread_id"], info["turn_id"])] = route_info
                             record_metric("route_accepted", thread_id=info["thread_id"], turn_id=info["turn_id"],
-                                          model=info["model"], effort=info["effort"], task_class=info["class"])
+                                          model=info["model"], effort=info["effort"], task_class=info["class"],
+                                          task_bucket=info.get("task_bucket"),
+                                          adaptive_reason=info.get("adaptive_reason"))
                             asyncio.create_task(record_completion(info["thread_id"], info["turn_id"], route_info, token,
                                                                   route_info["delivered"]))
                     params = response.get("params") or {}

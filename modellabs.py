@@ -64,6 +64,12 @@ def choose_effort(prompt: str, task_class: str, model: str) -> str:
     return "max" if effort == "ultra" and model == "gpt-5.6-luna" else effort
 
 
+def explicit_effort_requested(prompt: str) -> bool:
+    """Whether the user, rather than the router, selected a reasoning effort."""
+    return bool(re.search(r"\b(?:reasoning|intelligence)(?:\s+effort|\s+slider)?\s*"
+                          r"(?:at|to|=|:)?\s*(low|medium|high|xhigh|max|ultra)\b", prompt.lower()))
+
+
 def route(prompt: str, model_override: str | None = None,
           effort_override: str | None = None) -> dict:
     if not prompt.strip():
@@ -76,12 +82,14 @@ def route(prompt: str, model_override: str | None = None,
     task_class = "consequential" if high else "difficult" if hard else "simple" if simple else "routine"
     model = MODEL_BY_CLASS[task_class]
     requested = re.search(r"\b(?:use|run|route to|switch to)\s+(?:the\s+)?(gpt-6-astra|gpt-5\.6-(?:luna|terra|sol)|astra|luna|terra|sol)\b", p)
+    explicit_model = bool(requested or model_override)
     if requested:
         alias = requested.group(1)
         model = alias if alias.startswith("gpt-") else {"astra": "gpt-6-astra", "luna": "gpt-5.6-luna",
                                                      "terra": "gpt-5.6-terra", "sol": "gpt-5.6-sol"}[alias]
     if model_override:
         model = model_override
+    explicit_effort = explicit_effort_requested(prompt) or bool(effort_override)
     effort = choose_effort(prompt, task_class, model)
     if effort_override:
         effort = effort_override
@@ -105,7 +113,11 @@ def route(prompt: str, model_override: str | None = None,
     # Ambiguous requests retain evidence/browser access so they can be resolved.
     if p.strip().rstrip(".!?") in {"ok go", "go ahead", "continue", "yes", "do it"}:
         selected.update({"agentBrowser", "codexResearch", "litScout", "previews"})
+    task_bucket = f"{task_class}:" + ",".join(sorted(selected))
     return {"class": task_class, "model": model, "effort": effort,
+            "intelligence_slider": effort,
+            "explicit_model": explicit_model, "explicit_effort": explicit_effort,
+            "task_bucket": task_bucket,
             "servers": sorted(selected), "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
 
 
@@ -191,13 +203,24 @@ def read_prompt(args: argparse.Namespace) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Route a new Codex chat before its first model call")
-    parser.add_argument("action", choices=["route", "start", "run"])
+    parser.add_argument("action", choices=["route", "start", "run", "outcome"])
     parser.add_argument("prompt", nargs="*")
     parser.add_argument("--prompt-file")
     parser.add_argument("--model")
     parser.add_argument("--effort")
     parser.add_argument("--cwd", default=os.getcwd())
+    parser.add_argument("--thread-id")
+    parser.add_argument("--turn-id")
+    parser.add_argument("--outcome", choices=["verified", "retry"])
     args = parser.parse_intermixed_args()
+    if args.action == "outcome":
+        if not args.thread_id or not args.turn_id or not args.outcome:
+            parser.error("outcome requires --thread-id, --turn-id, and --outcome")
+        from adaptive_policy import record_explicit_outcome
+        record_explicit_outcome(args.thread_id, args.turn_id, args.outcome)
+        print(json.dumps({"recorded": "outcome_signal", "thread_id": args.thread_id,
+                          "turn_id": args.turn_id, "outcome": args.outcome}, sort_keys=True))
+        return
     prompt = read_prompt(args)
     if args.action == "route":
         print(json.dumps(route(prompt, args.model, args.effort), sort_keys=True))

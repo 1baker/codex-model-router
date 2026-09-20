@@ -43,7 +43,27 @@ The router selects the least effort expected to reach a verified result:
 
 An explicit model or effort request in the prompt takes precedence. The live
 Codex model catalog remains the authority: ModelLabs rejects unavailable models
-and unsupported effort values before a new managed turn starts.
+and unsupported effort values before a new managed turn starts. Route output and
+managed-turn context expose the same value as `intelligence_slider`, while the
+host receives it as Codex's `effort` setting before inference.
+
+## Adaptive routing evidence
+
+Adaptive routing defaults to **shadow mode**. It records a recommendation but
+does not change a selected route until `MODELLABS_ADAPTIVE_MODE=enforce` is set
+deliberately. Only an explicit, prompt-free outcome record can influence a
+future route; keyword matches in a later user message are observation-only.
+Evidence is limited to the same managed chat, task bucket, and a recent
+30-day window. Explicit model or reasoning-effort choices always win.
+
+To add an operator-confirmed outcome for a managed turn, use:
+
+`modellabs outcome --thread-id THREAD_ID --turn-id TURN_ID --outcome verified`
+
+The command writes metadata only, with no prompt or response content. The
+health summary is available via
+`python3 ~/.local/share/model-selector/health_dashboard.py`; its model counts
+represent accepted turns, not duplicated telemetry events.
 
 ## Run a managed chat
 
