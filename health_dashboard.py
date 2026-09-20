@@ -35,6 +35,9 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     scorecards: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
     latencies: dict[tuple[str, str], list[int]] = defaultdict(list)
     accepted_turns: dict[tuple[str, str], tuple[str, str]] = {}
+    benchmark_cards: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(
+        lambda: {"runs": 0, "product_passes": 0, "exact_final_responses": 0,
+                 "total_tokens": 0, "elapsed_ms": 0})
     for row in records:
         event = row.get("event")
         event_counts[str(event)] += 1
@@ -48,6 +51,14 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
                 accepted_turns[(thread, row["turn_id"])] = (model, str(row.get("effort", "unknown")))
             if isinstance(thread, str):
                 latest[thread] = {key: row.get(key) for key in ("model", "effort", "task_class", "adaptive_reason", "recorded_at_ms")}
+        if event == "benchmark_result" and isinstance(model, str):
+            key = (str(row.get("task_class", "unknown")), model, str(row.get("effort", "unknown")))
+            bench = benchmark_cards[key]
+            bench["runs"] += 1
+            bench["product_passes"] += int(row.get("product_pass") is True)
+            bench["exact_final_responses"] += int(row.get("exact_final_response") is True)
+            bench["total_tokens"] += int(row.get("total_tokens", 0) or 0)
+            bench["elapsed_ms"] += int(row.get("elapsed_ms", 0) or 0)
     unpaired_usage_events = 0
     unpaired_completion_events = 0
     for row in records:
@@ -85,12 +96,20 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             card["latency_p50_ms"] = samples[(len(samples) - 1) // 2]
             card["latency_p95_ms"] = samples[min(len(samples) - 1, (len(samples) * 95 + 99) // 100 - 1)]
         cards.append(card)
+    benchmarks = []
+    for (task_class, model, effort), values in sorted(benchmark_cards.items()):
+        runs = values["runs"]
+        benchmarks.append({"task_class": task_class, "model": model, "effort": effort, **values,
+                           "pass_rate": values["product_passes"] / runs,
+                           "average_tokens": values["total_tokens"] // runs,
+                           "average_elapsed_ms": values["elapsed_ms"] // runs})
     return {"accepted_turn_counts": dict(sorted(accepted.items())),
             "event_counts": dict(sorted(event_counts.items())),
             "token_totals": dict(sorted(token_totals.items())),
             "unpaired_usage_events": unpaired_usage_events,
             "unpaired_completion_events": unpaired_completion_events,
-            "scorecards": cards, "latest_by_thread": latest}
+            "scorecards": cards, "benchmark_scorecards": benchmarks,
+            "latest_by_thread": latest}
 
 
 def tmux_tabs(session: str) -> list[dict[str, str]]:

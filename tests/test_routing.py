@@ -40,8 +40,9 @@ class RoutingTests(unittest.TestCase):
     def test_adaptation_is_shadow_by_default(self):
         choice = route("Implement a small validated parser.")
         records = [{"event": "outcome_signal", "outcome": "retry", "source": "explicit",
-                    "task_bucket": choice["task_bucket"], "recorded_at_ms": 2_000_000_000_000}] * 4
-        result = adapt(choice, records=records, now_ms=2_000_000_000_000)
+                    "thread_id": "thread", "task_bucket": choice["task_bucket"],
+                    "recorded_at_ms": 2_000_000_000_000}] * 4
+        result = adapt(choice, thread_id="thread", records=records, now_ms=2_000_000_000_000)
         self.assertEqual(result["model"], choice["model"])
         self.assertEqual(result["adaptive_reason"], "shadow_retry_escalation")
 

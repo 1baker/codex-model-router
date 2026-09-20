@@ -25,6 +25,19 @@ class HealthDashboardTests(unittest.TestCase):
         self.assertEqual(summary["latest_by_thread"]["thread-a"]["model"], "gpt-5.6-sol")
         self.assertEqual(summary["scorecards"][0]["latency_p50_ms"], 125)
 
+    def test_summarize_reports_benchmark_product_passes(self):
+        summary = summarize([
+            {"event": "benchmark_result", "task_class": "routine", "model": "gpt-5.6-terra",
+             "effort": "medium", "product_pass": True, "exact_final_response": True,
+             "total_tokens": 100, "elapsed_ms": 250},
+            {"event": "benchmark_result", "task_class": "routine", "model": "gpt-5.6-terra",
+             "effort": "medium", "product_pass": False, "exact_final_response": True,
+             "total_tokens": 50, "elapsed_ms": 150},
+        ])
+        card = summary["benchmark_scorecards"][0]
+        self.assertEqual((card["runs"], card["product_passes"], card["pass_rate"]), (2, 1, 0.5))
+        self.assertEqual((card["average_tokens"], card["average_elapsed_ms"]), (75, 200))
+
 
 if __name__ == "__main__":
     unittest.main()

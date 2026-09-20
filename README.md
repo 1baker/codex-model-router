@@ -56,6 +56,32 @@ future route; keyword matches in a later user message are observation-only.
 Evidence is limited to the same managed chat, task bucket, and a recent
 30-day window. Explicit model or reasoning-effort choices always win.
 
+Verified smoke benchmarks provide a second, prompt-free evidence stream. Each
+run uses a disposable workspace, independently executes the produced artifact,
+and records only the scenario digest, model, effort, pass/fail result, latency,
+and token counts. Correctness is a hard gate; token efficiency ranks only
+products that pass. Fewer than three successful samples or fewer than two
+distinct scenarios for a model/effort pair can produce a shadow recommendation
+but can never change a route, even when adaptive enforcement is enabled.
+Consequential routes remain benchmark shadow-only.
+
+Run the representative matrix and add its verified metadata to the dashboard:
+
+```bash
+modellabs-smoke --record-metrics
+```
+
+In plain English: This gives several models identical small product tasks,
+checks each generated product by actually running it, and records private
+scorecard metadata for future routing decisions. It consumes model tokens and
+creates only temporary workspaces, which are deleted when each run finishes.
+Use `--repeat 3` when promoting a fresh comparison beyond preliminary shadow
+evidence; repeated runs still remain subject to the configured adaptive mode.
+After reviewing verified multi-scenario evidence, use
+`modellabs adaptive-mode --mode enforce` to permit qualified non-consequential
+recommendations to affect routing. Explicit user selections always win, and
+consequential tasks remain benchmark shadow-only.
+
 To add an operator-confirmed outcome for a managed turn, use:
 
 `modellabs outcome --thread-id THREAD_ID --turn-id TURN_ID --outcome verified`

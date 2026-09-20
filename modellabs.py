@@ -21,6 +21,8 @@ import websockets
 from host_control import HOST_URL, _read_token, _rpc
 from model_host_launcher import PROXY_URL, ensure_host, ensure_proxy
 from paths import ROOT
+from adaptive_policy import adapt, set_adaptive_mode
+from telemetry import record as record_metric
 
 
 ROUTES = ROOT / "routes.jsonl"
@@ -150,7 +152,7 @@ def launch_usage_observer(thread_id: str, turn_id: str, choice: dict) -> None:
 
 async def start(prompt: str, cwd: str, override_model: str | None,
                 override_effort: str | None) -> tuple[str, dict]:
-    choice = route(prompt, override_model, override_effort)
+    choice = adapt(route(prompt, override_model, override_effort))
     ensure_host()
     async with websockets.connect(HOST_URL,
                                   additional_headers={"Authorization": f"Bearer {_read_token()}"},
@@ -177,6 +179,10 @@ async def start(prompt: str, cwd: str, override_model: str | None,
                                                  "model": choice["model"], "effort": choice["effort"]}, 4)
         turn_id = (started.get("turn") or {}).get("id")
         if isinstance(turn_id, str):
+            record_metric("route_accepted", thread_id=thread_id, turn_id=turn_id,
+                          model=choice["model"], effort=choice["effort"],
+                          task_class=choice["class"], task_bucket=choice["task_bucket"],
+                          adaptive_reason=choice.get("adaptive_reason"))
             launch_usage_observer(thread_id, turn_id, choice)
     return thread_id, choice
 
@@ -203,7 +209,7 @@ def read_prompt(args: argparse.Namespace) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Route a new Codex chat before its first model call")
-    parser.add_argument("action", choices=["route", "start", "run", "outcome"])
+    parser.add_argument("action", choices=["route", "start", "run", "outcome", "adaptive-mode"])
     parser.add_argument("prompt", nargs="*")
     parser.add_argument("--prompt-file")
     parser.add_argument("--model")
@@ -212,7 +218,14 @@ def main() -> None:
     parser.add_argument("--thread-id")
     parser.add_argument("--turn-id")
     parser.add_argument("--outcome", choices=["verified", "retry"])
+    parser.add_argument("--mode", choices=["shadow", "enforce"])
     args = parser.parse_intermixed_args()
+    if args.action == "adaptive-mode":
+        if not args.mode:
+            parser.error("adaptive-mode requires --mode")
+        set_adaptive_mode(args.mode)
+        print(json.dumps({"adaptive_mode": args.mode}, sort_keys=True))
+        return
     if args.action == "outcome":
         if not args.thread_id or not args.turn_id or not args.outcome:
             parser.error("outcome requires --thread-id, --turn-id, and --outcome")
@@ -223,7 +236,7 @@ def main() -> None:
         return
     prompt = read_prompt(args)
     if args.action == "route":
-        print(json.dumps(route(prompt, args.model, args.effort), sort_keys=True))
+        print(json.dumps(adapt(route(prompt, args.model, args.effort)), sort_keys=True))
         return
     thread_id, choice = asyncio.run(start(prompt, str(Path(args.cwd).resolve()), args.model, args.effort))
     print(json.dumps(choice, sort_keys=True), flush=True)

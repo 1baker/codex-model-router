@@ -1,0 +1,64 @@
+{
+  "schema": "modellabs.smoke.v1",
+  "scenarios": [
+    {
+      "id": "simple_transform",
+      "task_class": "simple",
+      "prompt": "Read values.txt and create result.json containing one JSON array of the distinct integers in ascending order. Do not include booleans or quoted numbers. Finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "values.txt": "8, 3, true, 3, 1, \"5\", 2, 8\n",
+        "verify.py": "import json\nfrom pathlib import Path\nvalue=json.loads(Path('result.json').read_text())\nassert value == [1,2,3,8]\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-5.6-luna", "low"], ["gpt-5.6-terra", "low"]]
+    },
+    {
+      "id": "routine_cli",
+      "task_class": "routine",
+      "prompt": "Build normalize.py as a usable command-line program. It must read a JSON array from stdin, output the sorted unique integers as compact JSON, and reject booleans, floats, strings, objects, and malformed input with exit code 2 and a compact JSON error object on stderr. Do not modify verify.py. Run it before finishing. Finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "verify.py": "import json,subprocess,sys\ndef run(data):\n p=subprocess.run([sys.executable,'normalize.py'],input=data,text=True,capture_output=True)\n return p\nfor raw,want in [('[3,1,3,2]',[1,2,3]),('[]',[]),('[-2,4,-2,0]',[-2,0,4])]:\n p=run(raw); assert p.returncode==0,(raw,p.stderr); assert json.loads(p.stdout)==want\nfor raw in ['[true,1]','[1.5]','[\"2\"]','{}','not-json']:\n p=run(raw); assert p.returncode==2,(raw,p.returncode); assert isinstance(json.loads(p.stderr),dict); assert not p.stdout\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-5.6-terra", "low"], ["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"]]
+    },
+    {
+      "id": "difficult_debug",
+      "task_class": "difficult",
+      "prompt": "Diagnose and fix ledger.py. The ledger must reject duplicate transaction IDs atomically, preserve the previous balance on every rejected transaction, and permit a later corrected transaction with the same ID. Make the smallest correct source change, do not modify verify.py, and run it. Finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "ledger.py": "class Ledger:\n def __init__(self): self.balance=0; self.seen=set()\n def apply(self,txid,amount):\n  if txid in self.seen: raise ValueError('duplicate')\n  self.seen.add(txid)\n  if not isinstance(amount,int) or isinstance(amount,bool): raise TypeError('amount')\n  if self.balance+amount<0: raise ValueError('overdraft')\n  self.balance+=amount\n  return self.balance\n",
+        "verify.py": "from ledger import Ledger\nl=Ledger(); assert l.apply('a',10)==10\nfor bad in [True,1.5]:\n try:l.apply('bad',bad)\n except TypeError:pass\n else:raise AssertionError('accepted invalid')\n assert l.balance==10\ntry:l.apply('b',-11)\nexcept ValueError:pass\nelse:raise AssertionError('accepted overdraft')\nassert l.balance==10\nassert l.apply('b',-4)==6\ntry:l.apply('a',1)\nexcept ValueError:pass\nelse:raise AssertionError('accepted duplicate')\nassert l.balance==6\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"], ["gpt-5.6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "consequential_policy",
+      "task_class": "consequential",
+      "prompt": "Harden policy.json for a local bearer-token control service. It must bind only to loopback, deny unauthenticated requests, redact Authorization and Cookie headers from logs, cap requests at 8 MiB, disable forwarding, and retain the existing service name. Do not modify verify.py. Validate the final artifact and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "policy.json": "{\"service\":\"modellabs-control\",\"bind\":\"0.0.0.0\",\"auth\":\"optional\",\"redact_headers\":[],\"max_request_bytes\":67108864,\"forwarding\":true}\n",
+        "verify.py": "import json\np=json.load(open('policy.json'))\nassert p=={'service':'modellabs-control','bind':'127.0.0.1','auth':'required','redact_headers':['Authorization','Cookie'],'max_request_bytes':8388608,'forwarding':False}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-5.6-sol", "high"], ["gpt-6-astra", "medium"], ["gpt-6-astra", "high"]]
+    },
+    {
+      "id": "difficult_merge",
+      "task_class": "difficult",
+      "prompt": "Diagnose and fix profile.py. apply_patch must be atomic, reject unknown top-level keys, recursively merge nested dictionaries, replace lists rather than append them, and never mutate either input. Make the smallest correct source change, do not modify verify.py, and run it. Finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "profile.py": "def apply_patch(current, patch):\n current.update(patch)\n return current\n",
+        "verify.py": "from copy import deepcopy\nfrom profile import apply_patch\nbase={'name':'Ada','prefs':{'theme':'dark','alerts':{'email':True,'sms':False}},'tags':['a']}\npatch={'prefs':{'alerts':{'sms':True}},'tags':['b']}\nb0,p0=deepcopy(base),deepcopy(patch)\nout=apply_patch(base,patch)\nassert out=={'name':'Ada','prefs':{'theme':'dark','alerts':{'email':True,'sms':True}},'tags':['b']}\nassert base==b0 and patch==p0\ntry:apply_patch(base,{'admin':True})\nexcept (KeyError,ValueError):pass\nelse:raise AssertionError('unknown key accepted')\nassert base==b0\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-5.6-sol", "high"], ["gpt-6-astra", "medium"]]
+    }
+  ]
+}
