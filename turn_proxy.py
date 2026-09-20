@@ -15,6 +15,7 @@ import websockets
 from host_control import HOST_URL, _read_token, _rpc
 from modellabs import record_route, route
 from telemetry import record as record_metric, usage_from
+from adaptive_policy import adapt, note_followup
 
 
 PROXY_PORT = int(os.environ.get("MODELLABS_PROXY_PORT", "45173"))
@@ -63,7 +64,8 @@ def route_request(raw: str, context_prompt: str | None = None,
             prompt = "Analyze " + ", ".join(kinds) + " input."
         if not prompt.strip():
             return raw, None
-        choice = route(context_prompt or prompt)
+        note_followup(params.get("threadId"), prompt)
+        choice = adapt(route(context_prompt or prompt))
         choice["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
         if preserve_model and params.get("model"):
             choice["model"] = params["model"]

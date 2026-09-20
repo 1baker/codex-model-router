@@ -16,7 +16,7 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parent
 PYTHON_FILES = [
-    "health_dashboard.py", "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
+    "adaptive_policy.py", "health_dashboard.py", "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
     "modellabs.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
     "thread_owner.py", "turn_proxy.py", "usage_observer.py",
 ]
