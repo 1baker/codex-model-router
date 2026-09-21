@@ -25,7 +25,7 @@ LOG_FILE = ROOT / "host.log"
 READY_URL = "http://127.0.0.1:45172/readyz"
 # A new port permits a no-interruption proxy rollout. Existing managed TUIs
 # retain their old connection until they exit or reconnect.
-PROXY_PORT = 45176
+PROXY_PORT = 45177
 PROXY_URL = f"ws://127.0.0.1:{PROXY_PORT}"
 PROXY_LOG = ROOT / "proxy.log"
 SUPERVISOR_PID = ROOT / f"proxy-supervisor-{PROXY_PORT}.pid"

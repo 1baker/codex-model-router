@@ -26,6 +26,20 @@ def read_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def letter_grade(score: float | None) -> str:
+    if score is None:
+        return "ungraded"
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Separate accepted turns from telemetry event volume and token usage."""
     latest: dict[str, dict[str, Any]] = {}
@@ -35,6 +49,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     scorecards: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
     latencies: dict[tuple[str, str], list[int]] = defaultdict(list)
     accepted_turns: dict[tuple[str, str], tuple[str, str]] = {}
+    turn_rows: dict[tuple[str, str], dict[str, Any]] = {}
     benchmark_cards: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(
         lambda: {"runs": 0, "product_passes": 0, "exact_final_responses": 0,
                  "total_tokens": 0, "elapsed_ms": 0})
@@ -49,6 +64,10 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             card["accepted_turns"] += 1
             if isinstance(thread, str) and isinstance(row.get("turn_id"), str):
                 accepted_turns[(thread, row["turn_id"])] = (model, str(row.get("effort", "unknown")))
+                turn_rows[(thread, row["turn_id"])] = {"model": model, "effort": str(row.get("effort", "unknown")),
+                                                        "task_class": row.get("task_class"), "task_bucket": row.get("task_bucket"),
+                                                        "quality_score": None, "verification": None,
+                                                        "total_tokens": None, "elapsed_ms": None}
             if isinstance(thread, str):
                 latest[thread] = {key: row.get(key) for key in ("model", "effort", "task_class", "adaptive_reason", "recorded_at_ms")}
         if event == "benchmark_result" and isinstance(model, str):
@@ -64,11 +83,11 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     for row in records:
         model = row.get("model")
         thread = row.get("thread_id")
-        turn = row.get("turn_id")
+        turn = row.get("turn_id") or row.get("source_turn_id")
         key = accepted_turns.get((thread, turn)) if isinstance(thread, str) and isinstance(turn, str) else None
         event = row.get("event")
         usage = row.get("usage")
-        if isinstance(usage, dict) and isinstance(model, str):
+        if event == "turn_usage" and isinstance(usage, dict) and isinstance(model, str):
             total = int(usage.get("totalTokens", usage.get("total_tokens", 0)) or 0)
             token_totals[model] += total
             if key:
@@ -88,6 +107,21 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
                 unpaired_completion_events += 1
         if event == "outcome_signal" and row.get("source") == "explicit" and isinstance(model, str):
             scorecards[(model, str(row.get("effort", "unknown")))][f"{row.get('outcome')}_outcomes"] += 1
+        key = (thread, turn) if isinstance(thread, str) and isinstance(turn, str) else None
+        if key not in turn_rows:
+            continue
+        turn_row = turn_rows[key]
+        if event == "turn_usage" and isinstance(usage, dict):
+            turn_row["total_tokens"] = int(usage.get("totalTokens", usage.get("total_tokens", 0)) or 0)
+        elif event == "turn_completed":
+            elapsed = row.get("elapsed_ms")
+            if isinstance(elapsed, (int, float)) and elapsed >= 0:
+                turn_row["elapsed_ms"] = int(elapsed)
+        elif event == "quality_grade" and row.get("source") == "explicit":
+            score = row.get("quality_score")
+            if isinstance(score, int) and 0 <= score <= 100:
+                turn_row["quality_score"] = score
+                turn_row["verification"] = row.get("verification")
     cards = []
     for (model, effort), values in sorted(scorecards.items()):
         card = {"model": model, "effort": effort, **dict(sorted(values.items()))}
@@ -103,12 +137,30 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
                            "pass_rate": values["product_passes"] / runs,
                            "average_tokens": values["total_tokens"] // runs,
                            "average_elapsed_ms": values["elapsed_ms"] // runs})
+    comparable = [item for item in turn_rows.values() if item["verification"] == "passed"
+                  and item["quality_score"] is not None and item["total_tokens"] not in {None, 0}]
+    best_tokens: dict[str, int] = {}
+    for item in comparable:
+        bucket = str(item.get("task_bucket") or item.get("task_class") or "unknown")
+        best_tokens[bucket] = min(best_tokens.get(bucket, item["total_tokens"]), item["total_tokens"])
+    graded_turns = []
+    for key, item in sorted(turn_rows.items()):
+        quality = item["quality_score"] if item["verification"] == "passed" else None
+        bucket = str(item.get("task_bucket") or item.get("task_class") or "unknown")
+        token_score = None
+        if quality is not None and item["total_tokens"] not in {None, 0} and bucket in best_tokens:
+            token_score = round(100 * best_tokens[bucket] / item["total_tokens"], 1)
+        overall = round(0.8 * quality + 0.2 * token_score, 1) if quality is not None and token_score is not None else None
+        graded_turns.append({"thread_id": key[0], "turn_id": key[1], **item,
+                             "quality_grade": letter_grade(quality), "token_efficiency_score": token_score,
+                             "token_efficiency_grade": letter_grade(token_score),
+                             "overall_score": overall, "overall_grade": letter_grade(overall)})
     return {"accepted_turn_counts": dict(sorted(accepted.items())),
             "event_counts": dict(sorted(event_counts.items())),
             "token_totals": dict(sorted(token_totals.items())),
             "unpaired_usage_events": unpaired_usage_events,
             "unpaired_completion_events": unpaired_completion_events,
-            "scorecards": cards, "benchmark_scorecards": benchmarks,
+            "scorecards": cards, "benchmark_scorecards": benchmarks, "graded_turns": graded_turns,
             "latest_by_thread": latest}
 
 

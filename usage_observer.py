@@ -10,7 +10,7 @@ import time
 import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
-from telemetry import record as record_metric, usage_from
+from telemetry import aggregate_usage, record as record_metric, usage_from
 
 
 async def initialize(ws: websockets.ClientConnection) -> None:
@@ -39,6 +39,7 @@ async def observe(args: argparse.Namespace) -> None:
                       model=args.model, effort=args.effort)
         return
     try:
+        usage_samples: list[dict] = []
         while True:
             message = json.loads(await asyncio.wait_for(ws.recv(), timeout=15 * 60))
             params = message.get("params") or {}
@@ -46,13 +47,19 @@ async def observe(args: argparse.Namespace) -> None:
             if params.get("threadId") != args.thread_id or event_turn_id != args.turn_id:
                 continue
             if message.get("method") == "rawResponse/completed":
-                record_metric("response_usage", thread_id=args.thread_id, turn_id=args.turn_id,
-                              model=args.model, effort=args.effort, usage=usage_from(params))
+                usage = usage_from(params)
+                if usage:
+                    usage_samples.append(usage)
             elif message.get("method") == "turn/completed":
                 turn = params.get("turn") or {}
                 record_metric("turn_completed", thread_id=args.thread_id, turn_id=args.turn_id,
                               model=args.model, effort=args.effort, task_class=args.task_class,
                               elapsed_ms=turn.get("durationMs"), status=turn.get("status"), usage=None)
+                aggregated = aggregate_usage(usage_samples)
+                if aggregated:
+                    record_metric("turn_usage", thread_id=args.thread_id, turn_id=args.turn_id,
+                                  model=args.model, effort=args.effort, usage=aggregated,
+                                  sample_count=len(usage_samples), source="usage_observer")
                 return
     finally:
         await ws.close()

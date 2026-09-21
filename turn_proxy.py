@@ -14,7 +14,7 @@ import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
 from modellabs import record_route, route
-from telemetry import record as record_metric, usage_from
+from telemetry import aggregate_usage, record as record_metric, usage_from
 from adaptive_policy import adapt, note_followup
 
 
@@ -231,14 +231,20 @@ async def handler(client: websockets.ServerConnection) -> None:
                     key = (params.get("threadId"), event_turn_id)
                     route_info = active.get(key)
                     if response.get("method") == "rawResponse/completed" and route_info:
-                        record_metric("response_usage", thread_id=key[0], turn_id=key[1], model=route_info["model"],
-                                      effort=route_info["effort"], usage=usage_from(params))
+                        usage = usage_from(params)
+                        if usage:
+                            route_info.setdefault("usage_samples", []).append(usage)
                     if response.get("method") == "turn/completed" and route_info:
                         turn = params.get("turn") or {}
                         record_metric("turn_completed", thread_id=key[0], turn_id=key[1], model=route_info["model"],
                                       effort=route_info["effort"], task_class=route_info["class"],
                                       elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
                                       status=turn.get("status"), usage=usage_from(params))
+                        aggregated = aggregate_usage(route_info.get("usage_samples", []))
+                        if aggregated:
+                            record_metric("turn_usage", thread_id=key[0], turn_id=key[1], model=route_info["model"],
+                                          effort=route_info["effort"], usage=aggregated,
+                                          sample_count=len(route_info["usage_samples"]), source="proxy")
                         route_info["delivered"].set()
                         active.pop(key, None)
                 except (TypeError, ValueError, KeyError):

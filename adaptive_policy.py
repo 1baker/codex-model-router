@@ -151,6 +151,38 @@ def record_explicit_outcome(thread_id: str, turn_id: str, outcome: str) -> None:
     record("outcome_signal", **{key: value for key, value in staged[0].items() if key != "event"})
 
 
+def record_explicit_grade(thread_id: str, turn_id: str, quality_score: int,
+                          verification: str) -> dict[str, Any]:
+    """Attach a prompt-free, operator-verified product grade to one routed turn.
+
+    A high score is not enough by itself: only an independently verified product
+    can be positive learning evidence.  A failed verification or a score below
+    the release threshold becomes retry evidence so routing can escalate within
+    the same managed chat and task bucket.
+    """
+    if not 0 <= quality_score <= 100:
+        raise ValueError("quality_score must be an integer from 0 through 100")
+    if verification not in {"passed", "failed"}:
+        raise ValueError("verification must be 'passed' or 'failed'")
+    rows = read_records()
+    route = next((row for row in reversed(rows) if row.get("event") == "route_accepted"
+                  and row.get("thread_id") == thread_id and row.get("turn_id") == turn_id), None)
+    if route is None:
+        raise ValueError("No accepted ModelLabs route matches that thread and turn.")
+    if any(row.get("event") == "quality_grade" and row.get("thread_id") == thread_id
+           and row.get("source_turn_id") == turn_id for row in rows):
+        raise ValueError("An explicit quality grade is already recorded for that turn.")
+    outcome = "verified" if verification == "passed" and quality_score >= 90 else "retry"
+    payload = {"thread_id": thread_id, "source_turn_id": turn_id,
+               "quality_score": quality_score, "verification": verification,
+               "outcome": outcome, "task_class": route["task_class"],
+               "model": route["model"], "effort": route["effort"],
+               "task_bucket": route.get("task_bucket", f"{route['task_class']}:legacy")}
+    record("quality_grade", source="explicit", **payload)
+    record("outcome_signal", source="explicit", **payload)
+    return payload
+
+
 def adapt(choice: dict[str, Any], *, thread_id: str | None = None,
           records: Iterable[dict[str, Any]] | None = None, now_ms: int | None = None) -> dict[str, Any]:
     """Recommend or enforce only well-scoped, explicit, recent evidence."""

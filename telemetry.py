@@ -27,3 +27,15 @@ def record(event: str, **fields: Any) -> None:
 def usage_from(params: dict[str, Any]) -> Any:
     usage = params.get("usage")
     return usage if isinstance(usage, dict) else None
+
+
+def aggregate_usage(samples: list[dict[str, Any]]) -> dict[str, int] | None:
+    """Return one exact per-turn sum from raw upstream completion samples."""
+    totals: dict[str, int] = {}
+    for sample in samples:
+        for field in ("inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
+                      "reasoningOutputTokens", "totalTokens"):
+            value = sample.get(field)
+            if isinstance(value, (int, float)) and value >= 0:
+                totals[field] = totals.get(field, 0) + int(value)
+    return totals or None

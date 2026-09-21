@@ -209,7 +209,7 @@ def read_prompt(args: argparse.Namespace) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Route a new Codex chat before its first model call")
-    parser.add_argument("action", choices=["route", "start", "run", "outcome", "adaptive-mode"])
+    parser.add_argument("action", choices=["route", "start", "run", "outcome", "grade", "adaptive-mode"])
     parser.add_argument("prompt", nargs="*")
     parser.add_argument("--prompt-file")
     parser.add_argument("--model")
@@ -218,6 +218,8 @@ def main() -> None:
     parser.add_argument("--thread-id")
     parser.add_argument("--turn-id")
     parser.add_argument("--outcome", choices=["verified", "retry"])
+    parser.add_argument("--quality-score", type=int)
+    parser.add_argument("--verification", choices=["passed", "failed"])
     parser.add_argument("--mode", choices=["shadow", "enforce"])
     args = parser.parse_intermixed_args()
     if args.action == "adaptive-mode":
@@ -233,6 +235,13 @@ def main() -> None:
         record_explicit_outcome(args.thread_id, args.turn_id, args.outcome)
         print(json.dumps({"recorded": "outcome_signal", "thread_id": args.thread_id,
                           "turn_id": args.turn_id, "outcome": args.outcome}, sort_keys=True))
+        return
+    if args.action == "grade":
+        if not args.thread_id or not args.turn_id or args.quality_score is None or not args.verification:
+            parser.error("grade requires --thread-id, --turn-id, --quality-score, and --verification")
+        from adaptive_policy import record_explicit_grade
+        grade = record_explicit_grade(args.thread_id, args.turn_id, args.quality_score, args.verification)
+        print(json.dumps({"recorded": "quality_grade", **grade}, sort_keys=True))
         return
     prompt = read_prompt(args)
     if args.action == "route":

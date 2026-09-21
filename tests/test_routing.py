@@ -56,7 +56,7 @@ class RoutingTests(unittest.TestCase):
     def test_dashboard_counts_accepted_turns_not_every_event(self):
         summary = summarize([
             {"event": "route_accepted", "model": "gpt-5.6-terra", "effort": "medium", "thread_id": "t"},
-            {"event": "response_usage", "model": "gpt-5.6-terra", "usage": {"totalTokens": 23}},
+            {"event": "turn_usage", "model": "gpt-5.6-terra", "usage": {"totalTokens": 23}},
             {"event": "turn_completed", "model": "gpt-5.6-terra"},
         ])
         self.assertEqual(summary["accepted_turn_counts"], {"gpt-5.6-terra": 1})

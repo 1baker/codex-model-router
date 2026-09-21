@@ -91,6 +91,26 @@ health summary is available via
 `python3 ~/.local/share/model-selector/health_dashboard.py`; its model counts
 represent accepted turns, not duplicated telemetry events.
 
+For a completed product with an independently checked final result, record a
+quality grade rather than relying on a conversational success signal:
+
+`modellabs grade --thread-id THREAD_ID --turn-id TURN_ID --quality-score 94 --verification passed`
+
+The grade stores only the numeric score, pass/fail verification state, routed
+model, effort, task bucket, final per-turn upstream token sum, and latency. The dashboard
+reports a quality letter grade, a token-efficiency score relative to the lowest
+token verified result in the same task bucket, and an overall grade weighted
+80% to quality and 20% to token efficiency. Missing verification, missing
+usage, or a non-comparable task remains `ungraded`; it never becomes positive
+adaptive evidence. A verified score below 90 and any failed verification record
+retry evidence, while a verified score of at least 90 records positive evidence
+for the same managed chat and task bucket.
+
+Raw upstream completions are buffered until the turn finishes and then written
+as one `turn_usage` record. This prevents partial tool-step usage from being
+mistaken for the final product's cost and makes an unmatched legacy raw-usage
+record visibly non-gradeable.
+
 ## Run a managed chat
 
 Install or upgrade for the current user:
