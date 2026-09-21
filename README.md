@@ -10,9 +10,10 @@ usage when Codex delivers it to the proxy. It records no prompt or response
 text in telemetry.
 
 For the initial turn, ModelLabs starts a short-lived local observer after turn
-admission. It resumes the managed thread and records the exact upstream token
-usage from `rawResponse/completed`; later turns use the managed proxy's event
-stream and durable completion poller.
+admission and records exact upstream usage from `rawResponse/completed`. For
+later turns, the owning managed proxy aggregates the live, turn-ID-scoped
+`thread/tokenUsage/updated` samples. Durable completion polling remains a
+lifecycle fallback and is never treated as token-accounting evidence.
 
 The launcher directs new managed chats to the current loopback proxy and starts
 a local watchdog for that proxy. Older proxies are left in place for already
@@ -122,26 +123,31 @@ python3 install.py
 In plain English: This copies ModelLabs into your local data directory, creates
 its Python environment and private host token, installs the global Codex skill,
 preserves existing hooks, and writes a user service that restarts the local
-proxy after reboot. It updates your Codex configuration and local command
-wrappers, but does not publish a network port.
+proxy after reboot. It also installs a managed `codex` wrapper first in the
+shell path, while preserving the underlying executable as `codex-direct`. It
+does not publish a network port. New Codex launches are affected; already
+running chats are not replaced.
 
 The installed `modellabs-proxy.service` is a lingered user service. It keeps the
 updated loopback proxy healthy after logout and restart; it does not replace an
 older proxy that still serves an existing chat.
 
 ```bash
-codex-model-host start
+codex
 ```
 
-In plain English: This starts a new Codex chat through ModelLabs. It reads your
-first prompt before any model responds, then chooses a suitable model and
-reasoning effort. It only starts a local process and does not modify your files.
+In plain English: This is now the normal way to start Codex. The installed
+wrapper reads your first prompt before any model responds, then ModelLabs
+chooses a suitable model and reasoning effort. `codex-model-host start` remains
+as a compatibility alias, while `codex-direct` bypasses routing for maintenance
+or recovery. Starting a chat only starts local processes and does not modify
+your project files.
 
 To move an already closed standalone chat to ModelLabs, use its exact thread
 UUID:
 
 ```bash
-codex-model-host resume THREAD_ID
+codex resume THREAD_ID
 ```
 
 In plain English: This reconnects the same saved conversation through the

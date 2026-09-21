@@ -29,6 +29,15 @@ def usage_from(params: dict[str, Any]) -> Any:
     return usage if isinstance(usage, dict) else None
 
 
+def thread_usage_from(params: dict[str, Any]) -> Any:
+    """Read one live per-response usage sample from a thread usage event."""
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    usage = token_usage.get("last")
+    return usage if isinstance(usage, dict) else None
+
+
 def aggregate_usage(samples: list[dict[str, Any]]) -> dict[str, int] | None:
     """Return one exact per-turn sum from raw upstream completion samples."""
     totals: dict[str, int] = {}

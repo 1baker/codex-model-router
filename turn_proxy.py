@@ -14,7 +14,7 @@ import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
 from modellabs import record_route, route
-from telemetry import aggregate_usage, record as record_metric, usage_from
+from telemetry import aggregate_usage, record as record_metric, thread_usage_from, usage_from
 from adaptive_policy import adapt, note_followup
 
 
@@ -230,8 +230,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                     event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
                     key = (params.get("threadId"), event_turn_id)
                     route_info = active.get(key)
-                    if response.get("method") == "rawResponse/completed" and route_info:
-                        usage = usage_from(params)
+                    if response.get("method") == "thread/tokenUsage/updated" and route_info:
+                        usage = thread_usage_from(params)
                         if usage:
                             route_info.setdefault("usage_samples", []).append(usage)
                     if response.get("method") == "turn/completed" and route_info:
@@ -244,7 +244,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                         if aggregated:
                             record_metric("turn_usage", thread_id=key[0], turn_id=key[1], model=route_info["model"],
                                           effort=route_info["effort"], usage=aggregated,
-                                          sample_count=len(route_info["usage_samples"]), source="proxy")
+                                          sample_count=len(route_info["usage_samples"]), source="proxy_thread_usage")
                         route_info["delivered"].set()
                         active.pop(key, None)
                 except (TypeError, ValueError, KeyError):

@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -20,6 +21,8 @@ PYTHON_FILES = [
     "modellabs.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
     "thread_owner.py", "turn_proxy.py", "usage_observer.py", "smoke_bench.py",
 ]
+SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
+SHELL_PATH_END = "# <<< ModelLabs managed Codex route <<<"
 
 
 def default_home() -> Path:
@@ -101,7 +104,40 @@ def configure_codex(codex_home: Path, home: Path) -> None:
     hooks_path.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 
 
-def write_wrappers(home: Path, bin_dir: Path) -> None:
+def discover_real_codex(home: Path, bin_dir: Path) -> Path:
+    candidates: list[Path] = []
+    configured = os.environ.get("MODELLABS_REAL_CODEX")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    state = home / "install-state.json"
+    try:
+        saved = json.loads(state.read_text(encoding="utf-8")).get("real_codex")
+        if saved:
+            candidates.append(Path(saved).expanduser())
+    except (OSError, ValueError, TypeError):
+        pass
+    current = shutil.which("codex")
+    if current:
+        candidates.append(Path(current))
+    candidates.extend([
+        Path.home() / ".npm-global/bin/codex",
+        Path("/usr/local/bin/codex"),
+        Path("/snap/bin/codex"),
+    ])
+    shim = bin_dir.expanduser().resolve() / "codex"
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        try:
+            if candidate.resolve() == shim or candidate == shim:
+                continue
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate.absolute()
+        except OSError:
+            continue
+    raise RuntimeError("Cannot install the managed codex route because the real Codex executable was not found.")
+
+
+def write_wrappers(home: Path, bin_dir: Path, real_codex: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     for name, module in (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py"),
                          ("modellabs-health", "health_dashboard.py"),
@@ -109,6 +145,35 @@ def write_wrappers(home: Path, bin_dir: Path) -> None:
         path = bin_dir / name
         path.write_text(f"#!/bin/sh\nexec {home / 'venv/bin/python'} {home / module} \"$@\"\n", encoding="utf-8")
         path.chmod(0o755)
+    codex = bin_dir / "codex"
+    codex.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(str(home / 'venv/bin/python'))} "
+        f"{shlex.quote(str(home / 'model_host_launcher.py'))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    direct = bin_dir / "codex-direct"
+    direct.write_text(f"#!/bin/sh\nexec {shlex.quote(str(real_codex))} \"$@\"\n", encoding="utf-8")
+    direct.chmod(0o755)
+
+
+def ensure_managed_route_precedence(path: Path, bin_dir: Path) -> None:
+    """Idempotently put the ModelLabs shim first for future interactive shells."""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    block = (
+        f"{SHELL_PATH_START}\n"
+        f"export PATH={shlex.quote(str(bin_dir.expanduser().resolve()))}:\"$PATH\"\n"
+        f"{SHELL_PATH_END}"
+    )
+    if SHELL_PATH_START in text:
+        before, remainder = text.split(SHELL_PATH_START, 1)
+        if SHELL_PATH_END not in remainder:
+            raise RuntimeError(f"Incomplete ModelLabs PATH block in {path}")
+        _, after = remainder.split(SHELL_PATH_END, 1)
+        text = before.rstrip() + "\n\n" + block + after
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+    path.write_text(text, encoding="utf-8")
 
 
 def write_service(home: Path) -> Path:
@@ -136,6 +201,7 @@ def enable_service() -> bool:
 
 def install(args: argparse.Namespace) -> None:
     home = args.home.expanduser().resolve()
+    real_codex = discover_real_codex(home, args.bin_dir)
     home.mkdir(parents=True, exist_ok=True)
     for name in PYTHON_FILES + ["requirements.txt"]:
         shutil.copy2(SOURCE / name, home / name)
@@ -161,13 +227,19 @@ def install(args: argparse.Namespace) -> None:
     (skill / "agents").mkdir(exist_ok=True)
     shutil.copy2(SOURCE / "openai.yaml", skill / "agents/openai.yaml")
     configure_codex(args.codex_home, home)
-    write_wrappers(home, args.bin_dir)
+    (home / "real-codex-path").write_text(str(real_codex) + "\n", encoding="utf-8")
+    set_private(home / "real-codex-path")
+    write_wrappers(home, args.bin_dir, real_codex)
+    for shell_file in (Path.home() / ".profile", Path.home() / ".bashrc"):
+        ensure_managed_route_precedence(shell_file, args.bin_dir)
     service = write_service(home)
     service_enabled = False if args.no_service else enable_service()
     state = home / "install-state.json"
-    state.write_text(json.dumps({"home": str(home), "service": str(service), "service_enabled": service_enabled}, indent=2) + "\n")
+    state.write_text(json.dumps({"home": str(home), "service": str(service), "service_enabled": service_enabled,
+                                 "real_codex": str(real_codex), "managed_codex": str(args.bin_dir / 'codex')}, indent=2) + "\n")
     set_private(state)
     print(json.dumps({"home": str(home), "bin_dir": str(args.bin_dir), "codex_home": str(args.codex_home),
+                      "real_codex": str(real_codex), "managed_codex": str(args.bin_dir / 'codex'),
                       "service": str(service), "service_enabled": service_enabled}, sort_keys=True))
 
 

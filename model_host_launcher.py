@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -16,7 +17,7 @@ from pathlib import Path
 import websockets
 
 from host_control import HOST_URL, TOKEN_FILE, _read_token
-from paths import ROOT
+from paths import ROOT, real_codex_binary
 from thread_owner import require_unowned
 
 
@@ -30,6 +31,11 @@ PROXY_URL = f"ws://127.0.0.1:{PROXY_PORT}"
 PROXY_LOG = ROOT / "proxy.log"
 SUPERVISOR_PID = ROOT / f"proxy-supervisor-{PROXY_PORT}.pid"
 SUPERVISOR_LOG = ROOT / "proxy-supervisor.log"
+CONFIGURED_MCP_SERVERS = {
+    "agentBrowser", "cloudflare", "cloudflare-docs", "cloudflare-bindings",
+    "cloudflare-builds", "cloudflare-observability", "openaiDeveloperDocs",
+    "codegraph", "previews", "codexResearch", "litScout", "modelControl",
+}
 
 
 def ready() -> bool:
@@ -51,7 +57,7 @@ def ensure_host() -> None:
             host_environment.pop(key, None)
         with LOG_FILE.open("ab") as log:
             child = subprocess.Popen(
-                ["codex", "app-server", "--listen", HOST_URL,
+                [str(real_codex_binary()), "app-server", "--listen", HOST_URL,
                  "--ws-auth", "capability-token", "--ws-token-file", str(TOKEN_FILE)],
                 stdin=subprocess.DEVNULL,
                 stdout=log,
@@ -131,10 +137,86 @@ def proxy_ready() -> bool:
         return False
 
 
+def _exec_prompt(args: list[str]) -> str | None:
+    """Extract the direct `codex exec` prompt without changing its arguments."""
+    if not args or args[0] not in {"exec", "e"}:
+        return None
+    tail = args[1:]
+    if tail and tail[0] in {"resume", "fork", "review", "help"}:
+        return None
+    value_options = {
+        "-c", "--config", "-i", "--image", "-m", "--model", "--local-provider",
+        "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
+        "--thread-source", "--output-schema", "--color", "-o", "--output-last-message",
+    }
+    positionals: list[str] = []
+    index = 0
+    while index < len(tail):
+        item = tail[index]
+        if item in value_options:
+            index += 2
+            continue
+        if item.startswith("-"):
+            index += 1
+            continue
+        positionals.append(item)
+        index += 1
+    return positionals[-1] if positionals else None
+
+
+def _explicit_model(args: list[str]) -> bool:
+    return any(arg in {"-m", "--model"} or arg.startswith("--model=") for arg in args)
+
+
+def run_routed_exec(args: list[str]) -> int:
+    """Route a noninteractive prompt before invoking the real Codex binary."""
+    prompt = _exec_prompt(args)
+    stdin_text = None if sys.stdin.isatty() else sys.stdin.read()
+    if stdin_text == "":
+        stdin_text = None
+    route_text = "\n\n".join(part for part in (prompt, stdin_text) if part and part != "-")
+    binary = real_codex_binary()
+    if not route_text.strip() or _explicit_model(args):
+        command = [str(binary), *args]
+    else:
+        routed = subprocess.run(
+            [sys.executable, str(ROOT / "modellabs.py"), "route"],
+            input=route_text, text=True, capture_output=True, check=True,
+        )
+        choice = json.loads(routed.stdout)
+        record = {
+            **choice,
+            "prompt_sha256": hashlib.sha256(route_text.encode()).hexdigest(),
+            "status": "noninteractive_explicit_route",
+        }
+        routes = ROOT / "routes.jsonl"
+        fd = os.open(routes, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.chmod(routes, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as destination:
+            destination.write(json.dumps(record, sort_keys=True) + "\n")
+        tool_config: list[str] = []
+        selected = set(choice.get("servers", []))
+        for server in sorted(CONFIGURED_MCP_SERVERS):
+            tool_config.extend(["--config", f'mcp_servers.{server}.enabled={str(server in selected).lower()}'])
+        command = [str(binary), args[0], "--model", choice["model"],
+                   "--config", f'model_reasoning_effort="{choice["effort"]}"',
+                   *tool_config, *args[1:]]
+    if stdin_text is None:
+        os.execve(binary, command, os.environ.copy())
+    return subprocess.run(command, input=stdin_text, text=True, env=os.environ.copy()).returncode
+
+
 def main() -> None:
     # New prompt-first chats go through ModelLabs before the first model call.
     # Resume and utility commands retain the existing TUI behavior.
     args_in = sys.argv[1:]
+    if args_in and args_in[0] in {"exec", "e"}:
+        raise SystemExit(run_routed_exec(args_in))
+    passthrough_commands = {"login", "logout", "mcp", "plugin", "app-server",
+                            "completion", "update", "doctor", "features", "help"}
+    if args_in and (args_in[0] in passthrough_commands or args_in[0] in {"-h", "--help", "-V", "--version"}):
+        binary = real_codex_binary()
+        os.execve(binary, [str(binary), *args_in], os.environ.copy())
     utility_commands = {"resume", "agents", "exec", "review", "login", "logout",
                         "mcp", "plugin", "app-server", "remote-control", "completion",
                         "update", "doctor", "sandbox", "debug", "apply", "queue",
@@ -155,9 +237,10 @@ def main() -> None:
     # behavior instead of silently overriding it in the proxy.
     explicit_model = any(arg in {"-m", "--model"} or arg.startswith("--model=") for arg in args_in)
     remote_url = HOST_URL if explicit_model else PROXY_URL
-    os.execvpe(
-        "codex",
-        ["codex", "--remote", remote_url,
+    binary = real_codex_binary()
+    os.execve(
+        binary,
+        [str(binary), "--remote", remote_url,
          "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN", *sys.argv[1:]],
         environment,
     )

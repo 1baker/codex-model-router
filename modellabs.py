@@ -20,7 +20,7 @@ import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
 from model_host_launcher import PROXY_URL, ensure_host, ensure_proxy
-from paths import ROOT
+from paths import ROOT, real_codex_binary
 from adaptive_policy import adapt, set_adaptive_mode
 from telemetry import record as record_metric
 
@@ -253,9 +253,10 @@ def main() -> None:
         ensure_proxy()
         env = os.environ.copy()
         env["MODEL_SELECTOR_HOST_TOKEN"] = _read_token()
-        os.execvpe("codex", ["codex", "--remote", PROXY_URL,
-                             "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN",
-                             "resume", thread_id], env)
+        binary = real_codex_binary()
+        os.execve(binary, [str(binary), "--remote", PROXY_URL,
+                           "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN",
+                           "resume", thread_id], env)
 
 
 if __name__ == "__main__":

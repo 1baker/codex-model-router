@@ -6,10 +6,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modellabs import route
-from install import upsert_toml
+from install import SHELL_PATH_START, ensure_managed_route_precedence, upsert_toml
+from paths import real_codex_binary
 from turn_proxy import selection_is_listed
 from adaptive_policy import adapt, record_outcome
 from health_dashboard import summarize
+from model_host_launcher import _exec_prompt
 
 
 class RoutingTests(unittest.TestCase):
@@ -78,6 +80,33 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("step_model_switching = true", result)
         self.assertIn('[mcp_servers.other]', result)
         self.assertIn('[mcp_servers.modelControl]', result)
+
+    def test_shell_route_precedence_is_idempotent(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / ".bashrc"
+            path.write_text('export PATH="$HOME/.npm-global/bin:$PATH"\n', encoding="utf-8")
+            bin_dir = Path(directory) / "bin"
+            ensure_managed_route_precedence(path, bin_dir)
+            ensure_managed_route_precedence(path, bin_dir)
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count(SHELL_PATH_START), 1)
+            self.assertTrue(text.rstrip().endswith("# <<< ModelLabs managed Codex route <<<"))
+            self.assertIn(f'export PATH={bin_dir}:"$PATH"', text)
+
+    def test_real_codex_override_avoids_managed_shim(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            binary = Path(directory) / "codex-real"
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o755)
+            with patch.dict("os.environ", {"MODELLABS_REAL_CODEX": str(binary)}):
+                self.assertEqual(real_codex_binary(), binary)
+
+    def test_exec_prompt_is_found_without_confusing_option_values(self):
+        args = ["exec", "--ephemeral", "--cd", "/tmp", "--skip-git-repo-check", "Reply exactly: OK"]
+        self.assertEqual(_exec_prompt(args), "Reply exactly: OK")
+        self.assertIsNone(_exec_prompt(["exec", "resume", "thread-id", "continue"]))
 
 
 if __name__ == "__main__":

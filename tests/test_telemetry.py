@@ -4,10 +4,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from telemetry import aggregate_usage
+from telemetry import aggregate_usage, thread_usage_from
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_thread_usage_reads_live_last_sample(self):
+        params = {"tokenUsage": {"last": {"inputTokens": 10, "totalTokens": 12},
+                                  "total": {"inputTokens": 30, "totalTokens": 35}}}
+        self.assertEqual(thread_usage_from(params), {"inputTokens": 10, "totalTokens": 12})
+
     def test_aggregate_usage_sums_each_upstream_completion(self):
         self.assertEqual(aggregate_usage([
             {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
