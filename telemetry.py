@@ -28,7 +28,6 @@ def record(event: str, **fields: Any) -> None:
     lock_descriptor = os.open(METRICS_PATH.with_suffix(METRICS_PATH.suffix + ".lock"),
                               os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-    created = not METRICS_PATH.exists()
     try:
         if receipt_id is not None:
             payload = _persist_receipt(receipt_id, payload)
@@ -44,12 +43,11 @@ def record(event: str, **fields: Any) -> None:
                 for line in content.splitlines())
             if not duplicate:
                 os.lseek(fd, 0, os.SEEK_END)
-                os.write(fd, (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+                _write_all(fd, (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
             os.fsync(fd)
         finally:
             os.close(fd)
-        if created:
-            _fsync_directory(METRICS_PATH.parent)
+        _fsync_directory(METRICS_PATH.parent)
     finally:
         os.close(lock_descriptor)
 
@@ -60,6 +58,15 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short telemetry write")
+        view = view[written:]
 
 
 def _persist_receipt(receipt_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -77,12 +84,19 @@ def _persist_receipt(receipt_id: str, payload: dict[str, Any]) -> dict[str, Any]
                 or existing.get("thread_id") != payload.get("thread_id")
                 or existing.get("turn_id") != payload.get("turn_id")):
             raise RuntimeError("Receipt identity collision.")
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(directory)
+        _fsync_directory(directory.parent)
         return existing
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(descriptor, encoded)
+            _write_all(descriptor, encoded)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -98,6 +112,17 @@ def _has_receipt(line: str, receipt_id: str) -> bool:
         return json.loads(line).get("receipt_id") == receipt_id
     except (ValueError, TypeError):
         return False
+
+
+def canonical_receipt(receipt_id: str) -> dict[str, Any] | None:
+    path = METRICS_PATH.parent / "receipts" / f"{hashlib.sha256(receipt_id.encode()).hexdigest()}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(payload, dict) or payload.get("receipt_id") != receipt_id:
+        raise RuntimeError("Invalid canonical receipt.")
+    return payload
 
 
 def usage_from(params: dict[str, Any]) -> Any:

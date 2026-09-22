@@ -42,6 +42,11 @@ def _atomic(path: Path, value: dict[str, Any]) -> None:
             os.fsync(directory)
         finally:
             os.close(directory)
+        parent = os.open(path.parent.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -124,3 +129,16 @@ def mark(path: Path, stage: str) -> dict[str, Any]:
         finally:
             os.close(directory)
     return value
+
+
+def retire_if_complete(path: Path) -> bool:
+    value = load(path)
+    if not (value["accepted"] and value["terminal"] and value["usage"]):
+        return False
+    path.unlink(missing_ok=True)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return True

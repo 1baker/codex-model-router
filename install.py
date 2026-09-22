@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import shlex
@@ -269,7 +270,12 @@ def verify_existing_venv_containment(venv: Path) -> None:
         if not path.is_symlink():
             continue
         relative = path.relative_to(venv)
-        if relative.parts[0] == "bin" and relative.name.startswith("python"):
+        if (len(relative.parts) == 2 and relative.parts[0] == "bin"
+                and (relative.name in {"python", "python3"}
+                     or re.fullmatch(r"python3\.\d+", relative.name))):
+            target = path.resolve(strict=True)
+            if not target.is_file() or not os.access(target, os.X_OK):
+                raise RuntimeError(f"Refusing invalid virtualenv interpreter link {path}.")
             continue
         try:
             path.resolve(strict=True).relative_to(root)

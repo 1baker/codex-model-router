@@ -20,6 +20,33 @@ from test_turn_proxy import ConnectContext, FakeClient, FakeUpstream, TwoRequest
 
 
 class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
+    def test_turn_route_normalizes_nested_effective_settings(self):
+        request = {"id": 1, "method": "turn/start", "params": {
+            "threadId": "thread", "model": "stale-top", "effort": "low",
+            "collaborationMode": {"settings": {
+                "model": "gpt-5.6-terra", "reasoning_effort": "high"}},
+            "input": [{"type": "text", "text": "Refactor this module."}]}}
+        choice = {"model": "gpt-5.6-sol", "effort": "medium",
+                  "intelligence_slider": "medium", "servers": [], "class": "coding",
+                  "explicit_model": False, "explicit_effort": False}
+        with patch.object(turn_proxy, "route", return_value=choice.copy()), \
+             patch.object(turn_proxy, "adapt", side_effect=lambda value, **_kwargs: value):
+            routed, _info = turn_proxy.route_request(json.dumps(request))
+        params = json.loads(routed)["params"]
+        self.assertEqual((params["model"], params["effort"]), ("gpt-5.6-sol", "medium"))
+        self.assertEqual(params["collaborationMode"]["settings"], {
+            "model": "gpt-5.6-sol", "reasoning_effort": "medium"})
+
+        with patch.object(turn_proxy, "route", return_value=choice.copy()), \
+             patch.object(turn_proxy, "adapt", side_effect=lambda value, **_kwargs: value):
+            routed, _info = turn_proxy.route_request(
+                json.dumps(request), preserve_model=True, preserve_effort=True,
+                explicit_model=True, explicit_effort=True)
+        params = json.loads(routed)["params"]
+        self.assertEqual((params["model"], params["effort"]), ("stale-top", "low"))
+        self.assertEqual(params["collaborationMode"]["settings"], {
+            "model": "stale-top", "reasoning_effort": "low"})
+
     def test_protocol_policy_rejects_known_unmanaged_and_unknown_methods(self):
         self.assertEqual(classify("thread/name/set"), "owner_mutation")
         self.assertEqual(classify("thread/unarchive"), "owner_mutation")
@@ -113,6 +140,58 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                     held = await turn_proxy.recover_receipt_obligations("token")
                     await asyncio.gather(*tasks)
                 self.assertIsNone(held)
+
+    async def test_recovery_reuses_canonical_receipts_and_retires_complete_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metrics, journal = root / "metrics.jsonl", root / "journal"
+            route = {"model": "gpt", "effort": "low", "class": "routine"}
+            with patch.object(telemetry, "METRICS_PATH", metrics), \
+                 patch.object(receipt_journal, "JOURNAL_DIR", journal):
+                receipt_journal.create("thread", "turn", route)
+                for stage, event in (("accepted", "route_accepted"),
+                                     ("terminal", "turn_completed"),
+                                     ("usage", "turn_usage_unavailable")):
+                    telemetry.record(event, receipt_id=f"thread:turn:{stage}",
+                                     thread_id="thread", turn_id="turn")
+                descriptor = os.open("/dev/null", os.O_RDONLY)
+                tasks = []
+                with patch.object(turn_proxy, "acquire_thread_ownership", return_value=descriptor), \
+                     patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+                    await turn_proxy.recover_receipt_obligations("token")
+                    await asyncio.gather(*tasks)
+                self.assertFalse(receipt_journal.path_for("thread", "turn").exists())
+                rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+                self.assertEqual(len(rows), 3)
+
+    async def test_recovery_setup_failure_releases_owner_before_retry(self):
+        path = Path("/tmp/recovery-obligation.json")
+        obligation = {"schema": receipt_journal.SCHEMA, "thread_id": "thread",
+                      "turn_id": "turn", "model": "gpt", "effort": "low",
+                      "task_class": "routine", "accepted": True,
+                      "terminal": True, "usage": True}
+        descriptors = [os.open("/dev/null", os.O_RDONLY) for _ in range(2)]
+        calls = 0
+
+        def load(_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("simulated setup failure")
+            return obligation.copy()
+
+        tasks = []
+        with patch.object(receipt_journal, "list_obligations", return_value=[(path, obligation)]), \
+             patch.object(Path, "exists", side_effect=[True, True, True, False]), \
+             patch.object(receipt_journal, "load", side_effect=load), \
+             patch.object(turn_proxy, "acquire_thread_ownership", side_effect=descriptors), \
+             patch.object(turn_proxy.asyncio, "sleep", new=AsyncMock()), \
+             patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+            await turn_proxy.recover_receipt_obligations("token")
+            await asyncio.gather(*tasks)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     async def test_route_accepted_metric_failure_keeps_completion_obligation(self):
         thread_id = "00000000-0000-4000-8000-000000000041"
@@ -334,6 +413,23 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 rows = [json.loads(line) for line in metrics.read_text().splitlines()]
                 self.assertEqual(sum(row.get("receipt_id") == "r2" for row in rows), 1)
 
+    def test_telemetry_retries_short_writes_until_payload_is_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "write-all"
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+            real_write = os.write
+
+            def short_write(fd, content):
+                length = max(1, len(content) // 2)
+                return real_write(fd, content[:length])
+
+            try:
+                with patch.object(telemetry.os, "write", side_effect=short_write):
+                    telemetry._write_all(descriptor, b"complete-payload")
+            finally:
+                os.close(descriptor)
+            self.assertEqual(path.read_bytes(), b"complete-payload")
+
     def test_existing_venv_rejects_escaping_site_packages_link(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -345,6 +441,11 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
             (site / "site-packages").symlink_to(outside, target_is_directory=True)
             (venv / "bin").mkdir()
             (venv / "bin/python").symlink_to(Path(sys.executable))
+            with self.assertRaisesRegex(RuntimeError, "escaping virtualenv"):
+                install.verify_existing_venv_containment(venv)
+
+            (site / "site-packages").unlink()
+            (venv / "bin/python-escape").symlink_to(outside, target_is_directory=True)
             with self.assertRaisesRegex(RuntimeError, "escaping virtualenv"):
                 install.verify_existing_venv_containment(venv)
 
@@ -394,9 +495,12 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_resume_choice_replaces_older_pin_before_next_turn(self):
         thread_id = "00000000-0000-4000-8000-000000000081"
         client = FakeClient({"id": 1, "method": "thread/resume", "params": {
-            "threadId": thread_id, "model": "gpt-5.6-terra", "effort": "low"}},
+            "threadId": thread_id, "model": "gpt-5.6-terra",
+            "config": {"model_reasoning_effort": "low"}}},
             authorization="Bearer token.explicit-both")
-        upstream = FakeUpstream([{"id": 1, "result": {"thread": {"id": thread_id}}}])
+        upstream = FakeUpstream([{"id": 1, "result": {"thread": {"id": thread_id},
+                                                         "model": "gpt-5.6-terra",
+                                                         "reasoningEffort": "low"}}])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with patch.object(authority, "ROOT", root), \
@@ -414,6 +518,161 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
                 value = authority.read_locked(thread_id)
                 self.assertEqual((value["model"], value["effort"]), ("gpt-5.6-terra", "low"))
+
+    async def test_resume_error_does_not_admit_pipelined_mutation_or_poison_proxy(self):
+        thread_id = "00000000-0000-4000-8000-000000000082"
+
+        class EagerClient:
+            request = SimpleNamespace(headers={"Authorization": "Bearer token"}, path="/")
+
+            def __init__(self):
+                self.items = iter([
+                    {"id": 1, "method": "thread/resume", "params": {"threadId": thread_id}},
+                    {"id": 2, "method": "thread/name/set", "params": {
+                        "threadId": thread_id, "name": "too early"}},
+                ])
+                self.done = asyncio.Event()
+                self.sent = []
+
+            def __aiter__(self): return self
+
+            async def __anext__(self):
+                try:
+                    return json.dumps(next(self.items))
+                except StopIteration:
+                    await self.done.wait()
+                    raise StopAsyncIteration
+
+            async def send(self, raw):
+                value = json.loads(raw)
+                self.sent.append(value)
+                if value.get("id") == 1:
+                    self.done.set()
+
+            async def close(self, **_kwargs): self.done.set()
+
+        client = EagerClient()
+        upstream = FakeUpstream([{"id": 1, "error": {"code": -32000, "message": "missing"}}])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                descriptor = authority.acquire_lock(thread_id)
+                try:
+                    authority.initialize_locked(thread_id, None, None,
+                                                explicit_model=False, explicit_effort=False)
+                finally:
+                    os.close(descriptor)
+                turn_proxy.ACCOUNTING_BLOCKED = False
+                with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                     patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                     patch.object(turn_proxy, "acquire_thread_ownership",
+                                  return_value=os.open("/dev/null", os.O_RDONLY)):
+                    await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+        self.assertEqual([item["id"] for item in upstream.sent], [1])
+        self.assertEqual(next(item for item in client.sent if item.get("id") == 2)["error"]["code"],
+                         -32003)
+        self.assertFalse(turn_proxy.ACCOUNTING_BLOCKED)
+
+    async def test_reused_rpc_id_cannot_settle_waiting_settings_lifecycle(self):
+        thread_id = "00000000-0000-4000-8000-000000000083"
+
+        class ReuseClient:
+            request = SimpleNamespace(headers={"Authorization": "Bearer token"}, path="/")
+
+            def __init__(self):
+                self.stage = 0
+                self.resume = asyncio.Event()
+                self.settings_response = asyncio.Event()
+                self.notification = asyncio.Event()
+                self.id2_responses = 0
+                self.sent = []
+
+            def __aiter__(self): return self
+
+            async def __anext__(self):
+                if self.stage == 0:
+                    self.stage += 1
+                    return json.dumps({"id": 1, "method": "thread/resume",
+                                       "params": {"threadId": thread_id}})
+                if self.stage == 1:
+                    await self.resume.wait()
+                    self.stage += 1
+                    return json.dumps({"id": 2, "method": "thread/settings/update", "params": {
+                        "threadId": thread_id, "collaborationMode": {"settings": {
+                            "model": "gpt-5.6-terra", "reasoning_effort": "low"}}}})
+                if self.stage == 2:
+                    await self.settings_response.wait()
+                    self.stage += 1
+                    return json.dumps({"id": 2, "method": "model/list", "params": {}})
+                await self.notification.wait()
+                raise StopAsyncIteration
+
+            async def send(self, raw):
+                value = json.loads(raw)
+                self.sent.append(value)
+                if value.get("id") == 1:
+                    self.resume.set()
+                elif value.get("id") == 2:
+                    self.id2_responses += 1
+                    if self.id2_responses == 1:
+                        self.settings_response.set()
+                elif value.get("method") == "thread/settings/updated":
+                    self.notification.set()
+
+            async def close(self, **_kwargs): self.notification.set()
+
+        class ReuseUpstream(FakeUpstream):
+            def __init__(self):
+                super().__init__([
+                    {"id": 1, "result": {"thread": {"id": thread_id}}},
+                    {"id": 2, "result": {}},
+                    {"id": 2, "result": {"data": []}},
+                    {"method": "thread/settings/updated", "params": {
+                        "threadId": thread_id, "threadSettings": {
+                            "model": "gpt-5.6-terra", "reasoning_effort": "low"}}},
+                ])
+                self.yielded = 0
+                self.notification_sent = False
+
+            async def __anext__(self):
+                if self.yielded >= 4:
+                    await asyncio.Future()
+                required = (1, 2, 3, 3)[self.yielded]
+                while len(self.sent) < required:
+                    await asyncio.sleep(0)
+                value = self.messages.pop(0)
+                self.yielded += 1
+                if self.yielded == 4:
+                    self.notification_sent = True
+                return value
+
+        client, upstream, cleared_after_notification = ReuseClient(), ReuseUpstream(), []
+        original_clear = receipt_journal.clear_quarantine
+
+        def clear(path):
+            cleared_after_notification.append(upstream.notification_sent)
+            original_clear(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                descriptor = authority.acquire_lock(thread_id)
+                try:
+                    authority.initialize_locked(thread_id, "gpt-5.6-sol", "high",
+                                                explicit_model=True, explicit_effort=True)
+                finally:
+                    os.close(descriptor)
+                with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                     patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                     patch.object(turn_proxy, "acquire_thread_ownership",
+                                  return_value=os.open("/dev/null", os.O_RDONLY)), \
+                     patch.object(receipt_journal, "clear_quarantine", side_effect=clear):
+                    await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+                value = authority.read_locked(thread_id)
+        self.assertEqual(cleared_after_notification, [False, True])
+        self.assertEqual((value["model"], value["effort"]), ("gpt-5.6-terra", "low"))
 
     async def test_duplicate_outstanding_client_id_is_rejected_before_forwarding(self):
         class DuplicateClient:
