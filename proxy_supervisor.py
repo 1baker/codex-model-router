@@ -46,7 +46,13 @@ def retire_drained_proxy_generations() -> None:
             if setting is None:
                 continue
             port = int(setting.split(b"=", 1)[1])
-            if port != PROXY_PORT and not port_has_established_connection(port):
+            unresolved = ROOT / f"proxy-unresolved-{port}.state"
+            unresolved_for_process = False
+            try:
+                unresolved_for_process = unresolved.read_text(encoding="utf-8").split()[0] == proc.name
+            except (OSError, IndexError):
+                pass
+            if port != PROXY_PORT and not port_has_established_connection(port) and not unresolved_for_process:
                 os.kill(int(proc.name), signal.SIGTERM)
         except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, OSError):
             continue

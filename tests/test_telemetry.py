@@ -27,10 +27,15 @@ class TelemetryTests(unittest.TestCase):
 
     @staticmethod
     def snapshot(total: int, last: int, *, input_total: int | None = None) -> dict:
+        total_input = total if input_total is None else input_total
+        total_output = total - total_input
         return {"tokenUsage": {
-            "total": {"inputTokens": total if input_total is None else input_total,
-                      "totalTokens": total},
-            "last": {"inputTokens": last, "totalTokens": last},
+            "total": {"inputTokens": total_input, "cachedInputTokens": 0,
+                      "cacheWriteInputTokens": 0, "outputTokens": total_output,
+                      "reasoningOutputTokens": 0, "totalTokens": total},
+            "last": {"inputTokens": last, "cachedInputTokens": 0,
+                     "cacheWriteInputTokens": 0, "outputTokens": 0,
+                     "reasoningOutputTokens": 0, "totalTokens": last},
         }}
 
     def test_tracker_accepts_repeated_and_equal_valued_snapshots_once(self):
@@ -50,6 +55,17 @@ class TelemetryTests(unittest.TestCase):
         malformed.observe({"tokenUsage": {"total": {"totalTokens": "12"},
                                            "last": {"totalTokens": 2}}})
         self.assertEqual(malformed.outcome(), (None, "malformed_usage_snapshot"))
+
+        partial = UsageTracker()
+        partial.observe({"tokenUsage": {"total": {"totalTokens": 10},
+                                         "last": {"totalTokens": 10}}})
+        self.assertEqual(partial.outcome(), (None, "malformed_usage_snapshot"))
+
+        inconsistent = UsageTracker()
+        broken = self.snapshot(10, 10)
+        broken["tokenUsage"]["total"]["inputTokens"] = 9
+        inconsistent.observe(broken)
+        self.assertEqual(inconsistent.outcome(), (None, "malformed_usage_snapshot"))
 
     def test_tracker_decrease_above_baseline_permanently_invalidates(self):
         tracker = UsageTracker()

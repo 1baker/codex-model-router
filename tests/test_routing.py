@@ -18,7 +18,8 @@ from adaptive_policy import adapt, record_outcome
 from health_dashboard import summarize
 import model_host_launcher
 from model_host_launcher import (_command_index, _exec_prompt, _explicit_setting,
-                                 _routed_exec_command, _routed_interactive_args)
+                                 _exec_subcommand, _create_launch_ticket, _routed_exec_command,
+                                 _routed_interactive_args, run_routed_exec)
 import thread_owner
 
 
@@ -146,6 +147,15 @@ class RoutingTests(unittest.TestCase):
             expected = f"mcp_servers.{server}.enabled={str(server == 'modelControl').lower()}"
             self.assertIn(expected, routed[:delimiter])
 
+    def test_launch_ticket_distinguishes_automatic_from_explicit_choice(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory, patch.object(model_host_launcher, "ROOT", Path(directory)):
+            choice = {"model": "gpt-5.6-terra", "effort": "medium", "servers": ["modelControl"]}
+            ticket = _create_launch_ticket(choice, explicit_model=False, explicit_effort=True)
+            payload = json.loads((Path(directory) / "launch-tickets" / f"{ticket}.json").read_text())
+            self.assertFalse(payload["explicit_model"])
+            self.assertTrue(payload["explicit_effort"])
+
     def test_proxy_preserves_preselection_without_marking_user_override(self):
         request = {"id": 1, "method": "turn/start", "params": {
             "threadId": "thread", "input": [{"type": "text", "text": "Format values as CSV."}],
@@ -164,6 +174,9 @@ class RoutingTests(unittest.TestCase):
         repeated = ["-c", "model_reasoning_effort=low", "exec", "-c",
                     "model_reasoning_effort=high", "hello"]
         self.assertEqual(_explicit_setting(repeated, "model_reasoning_effort"), "high")
+        self.assertEqual(_explicit_setting(["-mgpt-attached", "hello"], "model"), "gpt-attached")
+        self.assertEqual(_explicit_setting(["-cmodel_reasoning_effort=high", "hello"],
+                                           "model_reasoning_effort"), "high")
         choice = {"model": "gpt-routed", "effort": "medium", "servers": ["modelControl"]}
         command = _routed_exec_command(Path("/real/codex"), literal, choice)
         self.assertIn("gpt-routed", command)
@@ -175,6 +188,17 @@ class RoutingTests(unittest.TestCase):
     def test_review_and_resume_delimiter_prompts_are_classified_correctly(self):
         self.assertEqual(_exec_prompt(["exec", "review", "focus on races"]), "focus on races")
         self.assertEqual(_exec_prompt(["exec", "resume", "thread-id", "--", "--last"]), "--last")
+        self.assertEqual(_exec_subcommand(["exec", "--json", "resume", "thread-id", "continue"])[0],
+                         "resume")
+        self.assertEqual(_exec_prompt(["exec", "--", "help"]), "help")
+
+    def test_noninteractive_inference_fails_closed_without_receipts(self):
+        with patch.object(sys, "stdin", SimpleNamespace(isatty=lambda: True)):
+            with self.assertRaisesRegex(ValueError, "exact-or-unavailable usage receipts"):
+                run_routed_exec(["exec", "hello"])
+        with patch.object(sys, "stdin", SimpleNamespace(isatty=lambda: True)):
+            with self.assertRaisesRegex(ValueError, "exec resume"):
+                run_routed_exec(["exec", "--json", "resume", "thread-id", "continue"])
 
     def test_global_option_operands_do_not_become_commands(self):
         args = ["--enable", "search", "--remote", "ws://example", "-a", "never",
@@ -199,6 +223,19 @@ class RoutingTests(unittest.TestCase):
                 finally:
                     os.close(descriptor)
 
+    def test_fresh_managed_owner_blocks_resume_owner(self):
+        from tempfile import TemporaryDirectory
+        thread_id = "00000000-0000-4000-8000-000000000003"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(thread_owner, "ROOT", root):
+                descriptor = thread_owner.acquire_thread_ownership(thread_id, existing_thread=False)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "already owned"):
+                        thread_owner.acquire_thread_ownership(thread_id, existing_thread=False)
+                finally:
+                    os.close(descriptor)
+
     def test_wrapper_install_replaces_symlink_without_touching_target(self):
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as directory:
@@ -218,6 +255,26 @@ class RoutingTests(unittest.TestCase):
             self.assertIn("ModelLabs managed wrapper", (bin_dir / "codex").read_text(encoding="utf-8"))
             self.assertIn("ModelLabs recovery wrapper", (bin_dir / "codex-direct").read_text(encoding="utf-8"))
             self.assertIn(str(real), (bin_dir / "codex-direct").read_text(encoding="utf-8"))
+
+    def test_wrapper_install_refuses_unrelated_destination_before_any_change(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real-codex"
+            real.write_text("#!/bin/sh\necho real\n", encoding="utf-8")
+            real.chmod(0o755)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            unrelated = bin_dir / "codex-direct"
+            unrelated.write_text("#!/bin/sh\necho user-owned\n", encoding="utf-8")
+            unrelated.chmod(0o755)
+            home = root / "home"
+            (home / "venv/bin").mkdir(parents=True)
+            before = unrelated.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "unrelated executable"):
+                write_wrappers(home, bin_dir, real)
+            self.assertEqual(unrelated.read_bytes(), before)
+            self.assertFalse((bin_dir / "codex").exists())
 
     def test_discovery_preserves_a_legitimate_upstream_symlink(self):
         from tempfile import TemporaryDirectory

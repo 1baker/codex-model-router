@@ -18,6 +18,7 @@ from modellabs import config_for, record_route, route
 from telemetry import UsageTracker, record as record_metric, usage_from
 from adaptive_policy import adapt, note_followup
 from paths import ROOT, proxy_port, proxy_revision
+from thread_owner import acquire_thread_ownership
 
 
 PROXY_REVISION = proxy_revision()
@@ -28,6 +29,8 @@ PROXY_URL = f"ws://127.0.0.1:{PROXY_PORT}"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 CONTINUATIONS = {"ok go", "go ahead", "continue", "yes", "do it"}
 CATALOG_TTL_SECONDS = 60.0
+BACKGROUND_TASKS: set[asyncio.Task] = set()
+UNRESOLVED_FILE = ROOT / f"proxy-unresolved-{PROXY_PORT}.state"
 
 
 def apply_launch_choice(raw: str, choice: dict[str, Any] | None) -> str:
@@ -39,9 +42,25 @@ def apply_launch_choice(raw: str, choice: dict[str, Any] | None) -> str:
         if request.get("method") != "thread/start" or not isinstance(params, dict):
             return raw
         params["model"] = choice["model"]
-        params["config"] = config_for(choice["servers"])
+        existing = params.get("config", {})
+        if not isinstance(existing, dict):
+            raise ValueError("thread/start config must be an object")
+        merged = dict(existing)
+        existing_mcp = existing.get("mcp_servers", {})
+        if not isinstance(existing_mcp, dict):
+            raise ValueError("thread/start mcp_servers config must be an object")
+        route_mcp = config_for(choice["servers"])["mcp_servers"]
+        merged_mcp = {name: dict(value) if isinstance(value, dict) else value
+                      for name, value in existing_mcp.items()}
+        for name, scope in route_mcp.items():
+            current = merged_mcp.get(name, {})
+            if current is not None and not isinstance(current, dict):
+                raise ValueError(f"mcp_servers.{name} must be an object")
+            merged_mcp[name] = {**(current or {}), **scope}
+        merged["mcp_servers"] = merged_mcp
+        params["config"] = merged
         return json.dumps(request)
-    except (TypeError, ValueError, KeyError):
+    except (json.JSONDecodeError, TypeError, KeyError):
         return raw
 
 
@@ -140,6 +159,44 @@ async def live_catalog(token: str) -> dict[str, Any]:
         return await _rpc(ws, "model/list", {}, 2)
 
 
+def finalize_route(thread_id: str, turn_id: str, route_info: dict[str, Any], *,
+                   status: str, elapsed_ms: int | None, terminal_source: str) -> None:
+    """Emit exactly one terminal and one exact-or-unavailable usage receipt."""
+    if not route_info["terminal_recorded"].is_set():
+        route_info["terminal_recorded"].set()
+        record_metric("turn_completed", thread_id=thread_id, turn_id=turn_id,
+                      model=route_info["model"], effort=route_info["effort"],
+                      task_class=route_info["class"], elapsed_ms=elapsed_ms,
+                      status=status, source=terminal_source, usage=None)
+    if not route_info["usage_recorded"].is_set():
+        route_info["usage_recorded"].set()
+        usage, unavailable_reason = route_info["usage_tracker"].outcome()
+        if usage is not None:
+            record_metric("turn_usage", thread_id=thread_id, turn_id=turn_id,
+                          model=route_info["model"], effort=route_info["effort"], usage=usage,
+                          source="proxy_thread_usage_delta")
+        else:
+            record_metric("turn_usage_unavailable", thread_id=thread_id, turn_id=turn_id,
+                          model=route_info["model"], effort=route_info["effort"],
+                          reason=unavailable_reason)
+    route_info["finished"].set()
+
+
+def track_background(task: asyncio.Task) -> None:
+    BACKGROUND_TASKS.add(task)
+    UNRESOLVED_FILE.write_text(f"{os.getpid()} {len(BACKGROUND_TASKS)}\n", encoding="utf-8")
+    os.chmod(UNRESOLVED_FILE, 0o600)
+
+    def done(completed: asyncio.Task) -> None:
+        BACKGROUND_TASKS.discard(completed)
+        if BACKGROUND_TASKS:
+            UNRESOLVED_FILE.write_text(f"{os.getpid()} {len(BACKGROUND_TASKS)}\n", encoding="utf-8")
+        else:
+            UNRESOLVED_FILE.unlink(missing_ok=True)
+
+    task.add_done_callback(done)
+
+
 async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, Any], token: str,
                             delivered: asyncio.Event) -> None:
     """Poll the durable turn record when event delivery belongs to another client."""
@@ -153,25 +210,20 @@ async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, 
                 await _rpc(ws, "initialize", {"clientInfo": {"name": "modellabs-telemetry", "version": "0.1"},
                                               "capabilities": {"experimentalApi": True}}, 1)
                 await ws.send(json.dumps({"method": "initialized", "params": {}}))
-                turns = await _rpc(ws, "thread/turns/list", {"threadId": thread_id, "limit": 1,
+                turns = await _rpc(ws, "thread/turns/list", {"threadId": thread_id, "limit": 100,
                                                              "itemsView": "full", "sortDirection": "desc"}, 2)
             turn = next((item for item in turns.get("data", []) if item.get("id") == turn_id), None)
             if turn and turn.get("status") != "inProgress":
-                # The live completion notification may arrive while the
-                # durable-record RPC is in flight. Claim completion only
-                # after that await so the two paths cannot both emit it.
                 if delivered.is_set():
                     return
-                delivered.set()
-                record_metric("turn_completed", thread_id=thread_id, turn_id=turn_id, model=route_info["model"],
-                              effort=route_info["effort"], task_class=route_info["class"],
-                              elapsed_ms=turn.get("durationMs"), status=turn.get("status"), usage=None)
+                finalize_route(thread_id, turn_id, route_info, status=turn.get("status", "unknown"),
+                               elapsed_ms=turn.get("durationMs"), terminal_source="durable_poll")
                 return
         except Exception:
             pass
         await asyncio.sleep(1)
-    record_metric("turn_completion_timeout", thread_id=thread_id, turn_id=turn_id,
-                  model=route_info["model"], effort=route_info["effort"])
+    finalize_route(thread_id, turn_id, route_info, status="completion_unavailable",
+                   elapsed_ms=None, terminal_source="durable_poll_timeout")
 
 
 async def handler(client: websockets.ServerConnection) -> None:
@@ -196,7 +248,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                 launch_choice = None
             elif (not isinstance(launch_choice.get("model"), str)
                   or not isinstance(launch_choice.get("effort"), str)
-                  or not isinstance(launch_choice.get("servers"), list)):
+                  or not isinstance(launch_choice.get("servers"), list)
+                  or not isinstance(launch_choice.get("explicit_model", False), bool)
+                  or not isinstance(launch_choice.get("explicit_effort", False), bool)):
                 launch_choice = None
         except (OSError, ValueError, TypeError, KeyError):
             launch_choice = None
@@ -210,15 +264,20 @@ async def handler(client: websockets.ServerConnection) -> None:
         pending: dict[object, dict] = {}
         preserve_cli_model = client_mode in {"explicit-model", "explicit-both"}
         preserve_cli_effort = client_mode in {"explicit-effort", "explicit-both"}
-        preselected = client_mode == "preselected"
+        initial_preselection_available = client_mode == "preselected"
+        launch_scope_available = launch_choice is not None
+        ticket_explicit_model = bool((launch_choice or {}).get("explicit_model"))
+        ticket_explicit_effort = bool((launch_choice or {}).get("explicit_effort"))
         manual_model_threads: set[str] = set()
         active: dict[tuple[str, str], dict[str, Any]] = {}
         provisional: dict[str, list[dict[str, Any]]] = {}
+        ownership_pending: set[object] = set()
+        owner_descriptors: dict[str, int] = {}
         catalog: dict[str, Any] | None = None
         catalog_at = 0.0
 
         async def inbound() -> None:
-            nonlocal catalog, catalog_at
+            nonlocal catalog, catalog_at, initial_preselection_available, launch_scope_available
             async for raw in client:
                 try:
                     ping = json.loads(raw)
@@ -228,17 +287,45 @@ async def handler(client: websockets.ServerConnection) -> None:
                         continue
                 except (TypeError, ValueError, AttributeError):
                     pass
+                try:
+                    raw = apply_launch_choice(raw, launch_choice if launch_scope_available else None)
+                except ValueError as exc:
+                    try:
+                        request_id = json.loads(raw).get("id")
+                    except (TypeError, ValueError, AttributeError):
+                        request_id = None
+                    if request_id is not None:
+                        await client.send(json.dumps({"id": request_id, "error": {
+                            "code": -32005, "message": f"ModelLabs rejected thread configuration: {exc}"}}))
+                    continue
                 context = None
                 params = {}
                 try:
-                    raw = apply_launch_choice(raw, launch_choice)
                     request = json.loads(raw)
                     params = request.get("params", {})
+                    request_id = request.get("id")
+                    if request.get("method") == "thread/start":
+                        launch_scope_available = False
+                    if request.get("method") in {"thread/fork", "thread/compact/start"}:
+                        if request_id is not None:
+                            await client.send(json.dumps({"id": request_id, "error": {
+                                "code": -32004,
+                                "message": "ModelLabs refuses thread transitions without ownership transfer."}}))
+                        continue
+                    if request.get("method") == "thread/resume" and isinstance(params, dict):
+                        resume_thread = params.get("threadId")
+                        if resume_thread and resume_thread not in owner_descriptors:
+                            try:
+                                owner_descriptors[resume_thread] = acquire_thread_ownership(resume_thread)
+                            except Exception as exc:
+                                if request_id is not None:
+                                    await client.send(json.dumps({"id": request_id, "error": {
+                                        "code": -32003, "message": str(exc)}}))
+                                continue
+                    if request.get("method") == "thread/start" and request_id is not None:
+                        ownership_pending.add(request_id)
                     if (request.get("method") in {"thread/settings/update", "turn/settings/update"}
                             and isinstance(params, dict) and params.get("model") and params.get("threadId")):
-                        manual_model_threads.add(params["threadId"])
-                    if (request.get("method") == "thread/resume" and isinstance(params, dict)
-                            and params.get("model") and params.get("threadId")):
                         manual_model_threads.add(params["threadId"])
                     if request.get("method") == "turn/start" and isinstance(params, dict):
                         prompt = "\n".join(x.get("text", "") for x in params.get("input", [])
@@ -249,12 +336,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                     pass
                 thread_id = params.get("threadId") if isinstance(params, dict) else None
                 manual = thread_id in manual_model_threads
+                automatic_initial = initial_preselection_available
                 routed, info = route_request(raw, context,
-                                             preselected or preserve_cli_model or manual,
-                                             preselected or preserve_cli_effort or manual,
-                                             preserve_cli_model or manual,
-                                             preserve_cli_effort or manual)
+                                             automatic_initial or preserve_cli_model or ticket_explicit_model or manual,
+                                             automatic_initial or preserve_cli_effort or ticket_explicit_effort or manual,
+                                             preserve_cli_model or ticket_explicit_model or manual,
+                                             preserve_cli_effort or ticket_explicit_effort or manual)
                 if info:
+                    if automatic_initial:
+                        initial_preselection_available = False
                     try:
                         if catalog is None or time.monotonic() - catalog_at > CATALOG_TTL_SECONDS:
                             catalog = await live_catalog(token)
@@ -290,27 +380,26 @@ async def handler(client: websockets.ServerConnection) -> None:
                 route_info["usage_tracker"].observe(params)
             if response.get("method") == "turn/completed":
                 turn = params.get("turn") or {}
-                if not route_info["delivered"].is_set():
-                    route_info["delivered"].set()
-                    record_metric("turn_completed", thread_id=key[0], turn_id=key[1], model=route_info["model"],
-                                  effort=route_info["effort"], task_class=route_info["class"],
-                                  elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
-                                  status=turn.get("status"), usage=usage_from(params))
-                usage, unavailable_reason = route_info["usage_tracker"].outcome()
-                if usage is not None:
-                    record_metric("turn_usage", thread_id=key[0], turn_id=key[1], model=route_info["model"],
-                                  effort=route_info["effort"], usage=usage,
-                                  source="proxy_thread_usage_delta")
-                else:
-                    record_metric("turn_usage_unavailable", thread_id=key[0], turn_id=key[1],
-                                  model=route_info["model"], effort=route_info["effort"],
-                                  reason=unavailable_reason)
+                finalize_route(key[0], key[1], route_info, status=turn.get("status", "unknown"),
+                               elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
+                               terminal_source="live_event")
                 active.pop(key, None)
 
         async def outbound() -> None:
             async for raw in upstream:
                 try:
                     response = json.loads(raw)
+                    response_id = response.get("id")
+                    if response_id in ownership_pending:
+                        ownership_pending.discard(response_id)
+                        thread_id = ((response.get("result") or {}).get("thread") or {}).get("id")
+                        if thread_id:
+                            try:
+                                owner_descriptors[thread_id] = acquire_thread_ownership(
+                                    thread_id, existing_thread=False)
+                            except Exception as exc:
+                                response = {"id": response_id, "error": {"code": -32003, "message": str(exc)}}
+                                raw = json.dumps(response)
                     info = pending.pop(response.get("id"), None)
                     if info:
                         result = response.get("result") or {}
@@ -318,15 +407,21 @@ async def handler(client: websockets.ServerConnection) -> None:
                         info["turn_id"] = (result.get("turn") or {}).get("id")
                         record_route(info)
                         if info["status"] == "accepted_by_host" and info.get("thread_id") and info.get("turn_id"):
-                            route_info = {**info, "started_at": time.monotonic(), "delivered": asyncio.Event(),
+                            terminal_recorded = asyncio.Event()
+                            route_info = {**info, "started_at": time.monotonic(),
+                                          "delivered": terminal_recorded,
+                                          "terminal_recorded": terminal_recorded,
+                                          "usage_recorded": asyncio.Event(), "finished": asyncio.Event(),
                                           "usage_tracker": UsageTracker()}
                             active[(info["thread_id"], info["turn_id"])] = route_info
                             record_metric("route_accepted", thread_id=info["thread_id"], turn_id=info["turn_id"],
                                           model=info["model"], effort=info["effort"], task_class=info["class"],
                                           task_bucket=info.get("task_bucket"),
                                           adaptive_reason=info.get("adaptive_reason"))
-                            asyncio.create_task(record_completion(info["thread_id"], info["turn_id"], route_info, token,
-                                                                  route_info["delivered"]))
+                            task = asyncio.create_task(record_completion(
+                                info["thread_id"], info["turn_id"], route_info, token,
+                                route_info["terminal_recorded"]))
+                            track_background(task)
                             buffered = provisional.pop(info["thread_id"], [])
                             for event in buffered:
                                 await account_event(event)
@@ -344,14 +439,24 @@ async def handler(client: websockets.ServerConnection) -> None:
 
         tasks = [asyncio.create_task(inbound()), asyncio.create_task(outbound())]
         done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if tasks[0] in done and (ownership_pending or pending):
+            deadline = time.monotonic() + 15
+            while (ownership_pending or pending) and not tasks[1].done() and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+        for request_id in list(ownership_pending):
+            record_metric("route_admission_unresolved", request_id=str(request_id),
+                          reason="client_disconnected_before_admission_receipt")
+            ownership_pending.discard(request_id)
+        for request_id, info in list(pending.items()):
+            record_metric("route_admission_unresolved", request_id=str(request_id),
+                          thread_id=info.get("thread_id"), model=info.get("model"),
+                          effort=info.get("effort"), reason="admission_receipt_timeout")
+            pending.pop(request_id, None)
         for task in pending_tasks:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for (thread_id, turn_id), route_info in list(active.items()):
-            record_metric("turn_usage_unavailable", thread_id=thread_id, turn_id=turn_id,
-                          model=route_info["model"], effort=route_info["effort"],
-                          reason="proxy_disconnected_before_accounting_completion")
-            active.pop((thread_id, turn_id), None)
+        for descriptor in owner_descriptors.values():
+            os.close(descriptor)
         for result in results:
             if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                 print(f"ModelLabs proxy relay ended: {type(result).__name__}", file=sys.stderr, flush=True)

@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+KillMode=process
 Environment=HOME=@HOME@
 Environment=MODELLABS_HOME=@MODELLABS_HOME@
 ExecStart=@PYTHON@ @MODELLABS_HOME@/proxy_supervisor.py

@@ -152,7 +152,7 @@ def discover_real_codex(home: Path, bin_dir: Path) -> Path:
     raise RuntimeError("Cannot install the managed codex route because the real Codex executable was not found.")
 
 
-def write_wrappers(home: Path, bin_dir: Path, real_codex: Path) -> None:
+def write_wrappers(home: Path, bin_dir: Path, real_codex: Path, *, dry_run: bool = False) -> None:
     def atomic_executable(path: Path, content: str) -> None:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
@@ -176,17 +176,50 @@ def write_wrappers(home: Path, bin_dir: Path, real_codex: Path) -> None:
     direct = bin_dir / "codex-direct"
     if direct.exists() and os.path.samefile(upstream, direct):
         raise RuntimeError("codex-direct cannot be used as its own recovery target.")
-    for name, module in (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py"),
-                         ("modellabs-health", "health_dashboard.py"),
-                         ("modellabs-smoke", "smoke_bench.py")):
-        path = bin_dir / name
-        atomic_executable(path, f"#!/bin/sh\nexec {home / 'venv/bin/python'} {home / module} \"$@\"\n")
     codex = bin_dir / "codex"
-    atomic_executable(codex,
+    modules = (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py"),
+               ("modellabs-health", "health_dashboard.py"), ("modellabs-smoke", "smoke_bench.py"))
+    contents: dict[Path, str] = {}
+    legacy: dict[Path, str] = {}
+    for name, module in modules:
+        path = bin_dir / name
+        legacy[path] = f"#!/bin/sh\nexec {home / 'venv/bin/python'} {home / module} \"$@\"\n"
+        contents[path] = (f"#!/bin/sh\n# ModelLabs auxiliary wrapper\n"
+                          f"exec {home / 'venv/bin/python'} {home / module} \"$@\"\n")
+    contents[codex] = (
         f"#!/bin/sh\n# ModelLabs managed wrapper\nexec {shlex.quote(str(home / 'venv/bin/python'))} "
-        f"{shlex.quote(str(home / 'model_host_launcher.py'))} \"$@\"\n",
+        f"{shlex.quote(str(home / 'model_host_launcher.py'))} \"$@\"\n"
     )
-    atomic_executable(direct, f"#!/bin/sh\n# ModelLabs recovery wrapper\nexec {shlex.quote(str(upstream))} \"$@\"\n")
+    contents[direct] = (
+        f"#!/bin/sh\n# ModelLabs recovery wrapper\nexec {shlex.quote(str(upstream))} \"$@\"\n"
+    )
+
+    # Preflight every destination before replacing any of them. This prevents
+    # a partial installation from overwriting unrelated user executables.
+    for path, content in contents.items():
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path == codex and path.is_symlink():
+            try:
+                if path.resolve(strict=True) == upstream:
+                    continue
+            except OSError:
+                pass
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"Refusing to replace unrelated executable {path}.") from exc
+        if ("# ModelLabs managed wrapper" in existing
+                or "# ModelLabs recovery wrapper" in existing
+                or "# ModelLabs auxiliary wrapper" in existing
+                or existing == legacy.get(path)):
+            continue
+        raise RuntimeError(f"Refusing to replace unrelated executable {path}.")
+
+    if dry_run:
+        return
+    for path, content in contents.items():
+        atomic_executable(path, content)
 
 
 def ensure_managed_route_precedence(path: Path, bin_dir: Path) -> None:
@@ -264,6 +297,7 @@ def retire_old_supervisors(home: Path, current_port: int) -> None:
 def install(args: argparse.Namespace) -> None:
     home = args.home.expanduser().resolve()
     real_codex = discover_real_codex(home, args.bin_dir)
+    write_wrappers(home, args.bin_dir, real_codex, dry_run=True)
     home.mkdir(parents=True, exist_ok=True)
     for name in PYTHON_FILES + ["requirements.txt"]:
         shutil.copy2(SOURCE / name, home / name)

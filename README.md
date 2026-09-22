@@ -9,18 +9,16 @@ host admission, completion status, elapsed time, and server-reported token
 usage when Codex delivers it to the proxy. It records no prompt or response
 text in telemetry.
 
-For the initial turn, the same owning connection admits the turn, retains raw
-events received during admission, waits for completion, and records exact
-upstream usage from `rawResponse/completed` before handing the thread to the
-TUI. For later turns, the owning proxy computes a turn delta from monotonic,
+For initial and later turns, the owning proxy retains matching events received
+during admission and computes a turn delta from complete, monotonic,
 turn-ID-scoped `thread/tokenUsage/updated` totals; repeated snapshots do not
-add tokens. Durable completion polling remains a lifecycle fallback and is
-never treated as token-accounting evidence.
+add tokens. A durable-only completion still produces one terminal receipt and
+an explicit unavailable-usage receipt when exact evidence is absent.
 
 The launcher directs new managed chats to the current loopback proxy and starts
 a local watchdog for that proxy. Older proxies are left in place for already
 connected chats; no new managed launcher uses their port. Retire an older proxy
-only after its connected chats have exited.
+only after its connected chats have exited and its accounting work has settled.
 
 ## Network boundary
 
@@ -133,7 +131,9 @@ running chats are not replaced.
 The installed `modellabs-proxy.service` is a lingered user service. Each proxy
 implementation receives a revision-bound loopback port. Upgrades restart the
 lightweight supervisor onto the new revision while older proxy processes keep
-their existing chat connections until those sessions drain.
+their existing chat connections until those sessions drain. The unit uses
+supervisor-only termination so an installer restart does not kill established
+proxy or host children in the service cgroup.
 
 ```bash
 codex
@@ -159,6 +159,11 @@ In plain English: This reconnects the same saved conversation through the
 managed host. It refuses if the original standalone Codex process is still
 open, preventing two processes from writing to the same chat.
 
+Noninteractive inference through `codex exec` currently fails closed. Use the
+interactive TUI until ModelLabs can bind that branch to admission, terminal,
+cancellation, and exact-or-unavailable usage receipts. Help and version queries
+remain available and `codex-direct` remains the explicit maintenance bypass.
+
 ## Verification
 
 Install the one runtime dependency in a virtual environment first:
@@ -174,7 +179,7 @@ library.
 Run the local routing tests with:
 
 ```bash
-python3 -m unittest discover -s tests -v
+~/.local/share/model-selector/venv/bin/python -m unittest discover -s tests -v
 ```
 
 In plain English: This checks that representative prompts select the intended

@@ -19,7 +19,6 @@ import websockets
 
 from host_control import HOST_URL, TOKEN_FILE, _read_token
 from paths import ROOT, proxy_port, proxy_revision, real_codex_binary
-from thread_owner import acquire_thread_ownership
 
 
 LOCK_FILE = ROOT / "host.lock"
@@ -172,11 +171,12 @@ def _exec_prompt(args: list[str]) -> str | None:
     if command_index is None or args[command_index] not in {"exec", "e"}:
         return None
     tail = args[command_index + 1:]
-    subcommand = tail[0] if tail and tail[0] in {"resume", "fork", "review", "help"} else None
+    subcommand, subcommand_index = _exec_subcommand(args)
     if subcommand == "help":
         return None
     if subcommand:
-        tail = tail[1:]
+        relative = subcommand_index - command_index - 1
+        tail = tail[:relative] + tail[relative + 1:]
     value_options = {
         "-c", "--config", "-i", "--image", "-m", "--model", "--local-provider",
         "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
@@ -213,6 +213,36 @@ def _exec_prompt(args: list[str]) -> str | None:
     return positionals[-1] if positionals else None
 
 
+def _exec_subcommand(args: list[str]) -> tuple[str | None, int | None]:
+    """Find an exec subcommand after options while respecting literal `--`."""
+    command_index = _command_index(args)
+    if command_index is None or args[command_index] not in {"exec", "e"}:
+        return None, None
+    value_options = {
+        "-c", "--config", "-i", "--image", "-m", "--model", "--local-provider",
+        "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
+        "--thread-source", "--output-schema", "--color", "-o", "--output-last-message",
+    }
+    index = command_index + 1
+    while index < len(args):
+        item = args[index]
+        if item == "--":
+            return None, None
+        if item in value_options:
+            if index + 1 >= len(args):
+                raise ValueError(f"Missing value for {item}.")
+            index += 2
+            continue
+        if any(item.startswith(f"{option}=") for option in value_options if option.startswith("--")):
+            index += 1
+            continue
+        if item.startswith("-"):
+            index += 1
+            continue
+        return (item, index) if item in {"resume", "fork", "review", "help"} else (None, None)
+    return None, None
+
+
 def _explicit_setting(args: list[str], setting: str) -> str | None:
     """Return an explicit CLI/config value without consulting ambient config."""
     flag = "--model" if setting == "model" else None
@@ -225,8 +255,13 @@ def _explicit_setting(args: list[str], setting: str) -> str | None:
         if flag and item.startswith(f"{flag}="):
             result = item.split("=", 1)[1]
             continue
+        if flag == "--model" and item.startswith("-m") and len(item) > 2:
+            result = item[2:]
+            continue
         if item in {"-c", "--config"} and index + 1 < len(args):
             config = args[index + 1]
+        elif item.startswith("-c") and not item.startswith("--") and len(item) > 2:
+            config = item[2:]
         elif item.startswith("--config="):
             config = item.split("=", 1)[1]
         else:
@@ -340,7 +375,7 @@ def _read_interactive_prompt() -> str:
     return prompt
 
 
-def _create_launch_ticket(choice: dict) -> str:
+def _create_launch_ticket(choice: dict, *, explicit_model: bool, explicit_effort: bool) -> str:
     ticket_id = secrets.token_hex(16)
     directory = ROOT / "launch-tickets"
     directory.mkdir(parents=True, exist_ok=True)
@@ -349,43 +384,36 @@ def _create_launch_ticket(choice: dict) -> str:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump({"created_at": time.time(), "model": choice["model"],
-                   "effort": choice["effort"], "servers": choice.get("servers", [])}, handle)
+                   "effort": choice["effort"], "servers": choice.get("servers", []),
+                   "explicit_model": explicit_model,
+                   "explicit_effort": explicit_effort}, handle)
         handle.write("\n")
     return ticket_id
 
 
 def run_routed_exec(args: list[str]) -> int:
-    """Route a noninteractive prompt before invoking the real Codex binary."""
+    """Fail closed until noninteractive turns have authoritative receipts."""
     prompt = _exec_prompt(args)
     stdin_text = None if sys.stdin.isatty() else sys.stdin.read()
     if stdin_text == "":
         stdin_text = None
     command_index = _command_index(args)
-    tail = args[command_index + 1:] if command_index is not None else []
-    subcommand = tail[0] if tail else None
+    subcommand, _subcommand_index = _exec_subcommand(args)
     if subcommand in {"resume", "fork"}:
         raise ValueError(
             f"Managed codex exec {subcommand} is refused because safe shared-host ownership "
             "cannot be guaranteed; use interactive codex resume THREAD_ID instead."
         )
-    route_text = "\n\n".join(part for part in (prompt, stdin_text) if part and part != "-")
-    if not route_text.strip() and subcommand == "review":
-        route_text = "Review the current repository changes."
     binary = real_codex_binary()
-    if not route_text.strip():
-        if any(item in {"-h", "--help", "-V", "--version"} for item in args):
-            command = [str(binary), *args]
-        else:
-            raise ValueError(
-                "ModelLabs could not identify inference input for this exec invocation; "
-                "provide a prompt or stdin instead of launching it unmanaged."
-            )
-    else:
-        choice = _route_choice(route_text, args, "noninteractive_explicit_route")
-        command = _routed_exec_command(binary, args, choice)
-    if stdin_text is None:
-        os.execve(binary, command, os.environ.copy())
-    return subprocess.run(command, input=stdin_text, text=True, env=os.environ.copy()).returncode
+    if any(item in {"-h", "--help", "-V", "--version"} for item in args):
+        command = [str(binary), *args]
+        if stdin_text is None:
+            os.execve(binary, command, os.environ.copy())
+        return subprocess.run(command, input=stdin_text, text=True, env=os.environ.copy()).returncode
+    raise ValueError(
+        "Managed codex exec is refused until noninteractive admission, completion, cancellation, "
+        "and exact-or-unavailable usage receipts can be guaranteed; use the interactive TUI."
+    )
 
 
 def main() -> None:
@@ -394,12 +422,15 @@ def main() -> None:
     args_in = sys.argv[1:]
     command_index = _command_index(args_in)
     command_name = args_in[command_index] if command_index is not None else None
+    literal_after_delimiter = (command_index is not None and "--" in args_in
+                               and command_index == args_in.index("--") + 1)
     if command_name in {"exec", "e"}:
         raise SystemExit(run_routed_exec(args_in))
     passthrough_commands = {"login", "logout", "mcp", "plugin", "app-server",
                             "completion", "update", "doctor", "features", "help"}
-    if command_name in passthrough_commands or (command_name is None and any(
-            item in {"-h", "--help", "-V", "--version"} for item in args_in)):
+    if ((not literal_after_delimiter and command_name in passthrough_commands)
+            or (command_name is None and any(
+            item in {"-h", "--help", "-V", "--version"} for item in args_in))):
         binary = real_codex_binary()
         os.execve(binary, [str(binary), *args_in], os.environ.copy())
     utility_commands = {"resume", "agents", "exec", "review", "login", "logout",
@@ -410,10 +441,12 @@ def main() -> None:
         args_in = [*args_in[:command_index], *args_in[command_index + 1:]]
         command_index = _command_index(args_in)
         command_name = args_in[command_index] if command_index is not None else None
-    new_chat = command_name is None or command_name not in utility_commands
+    new_chat = literal_after_delimiter or command_name is None or command_name not in utility_commands
     preselected = False
     launch_ticket = None
     if new_chat:
+        explicit_model = _explicit_setting(args_in, "model") is not None
+        explicit_effort = _explicit_setting(args_in, "model_reasoning_effort") is not None
         if command_index is None:
             prompt = _read_interactive_prompt()
             append_prompt = True
@@ -425,20 +458,17 @@ def main() -> None:
         choice = _route_choice(prompt, args_in, "interactive_preselection")
         args_in = _routed_interactive_args(args_in, prompt, choice, append_prompt)
         preselected = True
-        launch_ticket = _create_launch_ticket(choice)
-    owner_descriptor = None
+        launch_ticket = _create_launch_ticket(choice, explicit_model=explicit_model,
+                                               explicit_effort=explicit_effort)
     if command_name == "resume":
         resume_index = command_index + 1
         if len(args_in) <= resume_index or args_in[resume_index].startswith("-"):
             raise ValueError("Managed resume requires an exact thread UUID, not the session picker or --last.")
-        owner_descriptor = acquire_thread_ownership(args_in[resume_index])
     token = _read_token()
     ensure_proxy()
     ensure_proxy_supervisor()
     environment = os.environ.copy()
     client_mode = None
-    if owner_descriptor is not None:
-        environment["MODELLABS_THREAD_OWNER_FD"] = str(owner_descriptor)
     binary = real_codex_binary()
     if preselected:
         client_mode = f"launch-{launch_ticket}"

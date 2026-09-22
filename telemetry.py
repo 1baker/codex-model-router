@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -69,15 +70,17 @@ class UsageTracker:
     def _counters(value: Any) -> dict[str, int] | None:
         if not isinstance(value, dict):
             return None
-        if "totalTokens" not in value:
+        if any(field not in value for field in USAGE_FIELDS):
             return None
         result: dict[str, int] = {}
         for field in USAGE_FIELDS:
-            item = value.get(field, 0)
+            item = value[field]
             if (not isinstance(item, (int, float)) or isinstance(item, bool)
-                    or item < 0 or int(item) != item):
+                    or not math.isfinite(item) or item < 0 or int(item) != item):
                 return None
             result[field] = int(item)
+        if result["totalTokens"] != result["inputTokens"] + result["outputTokens"]:
+            return None
         return result
 
     def observe(self, params: dict[str, Any]) -> None:
