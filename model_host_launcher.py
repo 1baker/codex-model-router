@@ -137,11 +137,25 @@ def proxy_ready() -> bool:
         return False
 
 
+def _command_index(args: list[str]) -> int | None:
+    value_options = {"-c", "--config", "-p", "--profile", "-C", "--cd", "-m", "--model"}
+    index = 0
+    while index < len(args):
+        if args[index] in value_options:
+            index += 2
+        elif args[index].startswith("-"):
+            index += 1
+        else:
+            return index
+    return None
+
+
 def _exec_prompt(args: list[str]) -> str | None:
     """Extract the direct `codex exec` prompt without changing its arguments."""
-    if not args or args[0] not in {"exec", "e"}:
+    command_index = _command_index(args)
+    if command_index is None or args[command_index] not in {"exec", "e"}:
         return None
-    tail = args[1:]
+    tail = args[command_index + 1:]
     if tail and tail[0] in {"resume", "fork", "review", "help"}:
         return None
     value_options = {
@@ -176,11 +190,16 @@ def run_routed_exec(args: list[str]) -> int:
         stdin_text = None
     route_text = "\n\n".join(part for part in (prompt, stdin_text) if part and part != "-")
     binary = real_codex_binary()
-    if not route_text.strip() or _explicit_model(args):
+    if not route_text.strip():
         command = [str(binary), *args]
     else:
+        model_override = None
+        for index, item in enumerate(args[:-1]):
+            if item in {"-m", "--model"}:
+                model_override = args[index + 1]
         routed = subprocess.run(
-            [sys.executable, str(ROOT / "modellabs.py"), "route"],
+            [sys.executable, str(ROOT / "modellabs.py"), "route",
+             *(["--model", model_override] if model_override else [])],
             input=route_text, text=True, capture_output=True, check=True,
         )
         choice = json.loads(routed.stdout)
@@ -198,9 +217,11 @@ def run_routed_exec(args: list[str]) -> int:
         selected = set(choice.get("servers", []))
         for server in sorted(CONFIGURED_MCP_SERVERS):
             tool_config.extend(["--config", f'mcp_servers.{server}.enabled={str(server in selected).lower()}'])
-        command = [str(binary), args[0], "--model", choice["model"],
-                   "--config", f'model_reasoning_effort="{choice["effort"]}"',
-                   *tool_config, *args[1:]]
+        command_index = _command_index(args)
+        assert command_index is not None
+        injected = ([] if model_override else ["--model", choice["model"]]) + [
+            "--config", f'model_reasoning_effort="{choice["effort"]}"', *tool_config]
+        command = [str(binary), *args[:command_index + 1], *injected, *args[command_index + 1:]]
     if stdin_text is None:
         os.execve(binary, command, os.environ.copy())
     return subprocess.run(command, input=stdin_text, text=True, env=os.environ.copy()).returncode
@@ -210,7 +231,9 @@ def main() -> None:
     # New prompt-first chats go through ModelLabs before the first model call.
     # Resume and utility commands retain the existing TUI behavior.
     args_in = sys.argv[1:]
-    if args_in and args_in[0] in {"exec", "e"}:
+    command_index = _command_index(args_in)
+    command_name = args_in[command_index] if command_index is not None else None
+    if command_name in {"exec", "e"}:
         raise SystemExit(run_routed_exec(args_in))
     passthrough_commands = {"login", "logout", "mcp", "plugin", "app-server",
                             "completion", "update", "doctor", "features", "help"}
@@ -221,9 +244,21 @@ def main() -> None:
                         "mcp", "plugin", "app-server", "remote-control", "completion",
                         "update", "doctor", "sandbox", "debug", "apply", "queue",
                         "archive", "delete", "fork", "cloud", "features", "help"}
-    if not args_in or args_in[0] == "start" or (not args_in[0].startswith("-") and args_in[0] not in utility_commands):
-        args = args_in[1:] if args_in and args_in[0] == "start" else args_in
-        os.execv(sys.executable, [sys.executable, str(ROOT / "modellabs.py"), "run", *args])
+    if not args_in or command_name == "start" or (command_name is not None and command_name not in utility_commands):
+        raw = args_in[command_index + 1:] if command_name == "start" else args_in
+        translated: list[str] = []
+        index = 0
+        while index < len(raw):
+            item = raw[index]
+            if item in {"-C", "--cd"} and index + 1 < len(raw):
+                translated.extend(["--cwd", raw[index + 1]]); index += 2
+            elif item in {"-m", "--model"} and index + 1 < len(raw):
+                translated.extend(["--model", raw[index + 1]]); index += 2
+            elif item.startswith("-"):
+                raise ValueError(f"Unsupported managed-start option: {item}")
+            else:
+                translated.append(item); index += 1
+        os.execv(sys.executable, [sys.executable, str(ROOT / "modellabs.py"), "run", *translated])
     if args_in and args_in[0] == "resume":
         if len(args_in) < 2 or args_in[1].startswith("-"):
             raise ValueError("Managed resume requires an exact thread UUID, not the session picker or --last.")
@@ -233,14 +268,10 @@ def main() -> None:
     ensure_proxy_supervisor()
     environment = os.environ.copy()
     environment["MODEL_SELECTOR_HOST_TOKEN"] = token
-    # A CLI model flag is an explicit user choice. Keep its normal direct-host
-    # behavior instead of silently overriding it in the proxy.
-    explicit_model = any(arg in {"-m", "--model"} or arg.startswith("--model=") for arg in args_in)
-    remote_url = HOST_URL if explicit_model else PROXY_URL
     binary = real_codex_binary()
     os.execve(
         binary,
-        [str(binary), "--remote", remote_url,
+        [str(binary), "--remote", PROXY_URL,
          "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN", *sys.argv[1:]],
         environment,
     )

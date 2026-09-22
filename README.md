@@ -9,11 +9,13 @@ host admission, completion status, elapsed time, and server-reported token
 usage when Codex delivers it to the proxy. It records no prompt or response
 text in telemetry.
 
-For the initial turn, ModelLabs starts a short-lived local observer after turn
-admission and records exact upstream usage from `rawResponse/completed`. For
-later turns, the owning managed proxy aggregates the live, turn-ID-scoped
-`thread/tokenUsage/updated` samples. Durable completion polling remains a
-lifecycle fallback and is never treated as token-accounting evidence.
+For the initial turn, the same owning connection admits the turn, retains raw
+events received during admission, waits for completion, and records exact
+upstream usage from `rawResponse/completed` before handing the thread to the
+TUI. For later turns, the owning proxy computes a turn delta from monotonic,
+turn-ID-scoped `thread/tokenUsage/updated` totals; repeated snapshots do not
+add tokens. Durable completion polling remains a lifecycle fallback and is
+never treated as token-accounting evidence.
 
 The launcher directs new managed chats to the current loopback proxy and starts
 a local watchdog for that proxy. Older proxies are left in place for already

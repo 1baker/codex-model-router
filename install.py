@@ -124,37 +124,49 @@ def discover_real_codex(home: Path, bin_dir: Path) -> Path:
         Path("/usr/local/bin/codex"),
         Path("/snap/bin/codex"),
     ])
-    shim = bin_dir.expanduser().resolve() / "codex"
+    shim = (bin_dir.expanduser().absolute() / "codex")
     for candidate in candidates:
         candidate = candidate.expanduser()
         try:
-            if candidate.resolve() == shim or candidate == shim:
+            resolved = candidate.resolve(strict=True)
+            if resolved == shim.resolve(strict=False):
                 continue
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate.absolute()
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                prefix = resolved.read_bytes()[:4096]
+                if b"model_host_launcher.py" in prefix:
+                    continue
+                return resolved
         except OSError:
             continue
     raise RuntimeError("Cannot install the managed codex route because the real Codex executable was not found.")
 
 
 def write_wrappers(home: Path, bin_dir: Path, real_codex: Path) -> None:
+    def atomic_executable(path: Path, content: str) -> None:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     bin_dir.mkdir(parents=True, exist_ok=True)
     for name, module in (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py"),
                          ("modellabs-health", "health_dashboard.py"),
                          ("modellabs-smoke", "smoke_bench.py")):
         path = bin_dir / name
-        path.write_text(f"#!/bin/sh\nexec {home / 'venv/bin/python'} {home / module} \"$@\"\n", encoding="utf-8")
-        path.chmod(0o755)
+        atomic_executable(path, f"#!/bin/sh\nexec {home / 'venv/bin/python'} {home / module} \"$@\"\n")
     codex = bin_dir / "codex"
-    codex.write_text(
+    atomic_executable(codex,
         f"#!/bin/sh\nexec {shlex.quote(str(home / 'venv/bin/python'))} "
         f"{shlex.quote(str(home / 'model_host_launcher.py'))} \"$@\"\n",
-        encoding="utf-8",
     )
-    codex.chmod(0o755)
     direct = bin_dir / "codex-direct"
-    direct.write_text(f"#!/bin/sh\nexec {shlex.quote(str(real_codex))} \"$@\"\n", encoding="utf-8")
-    direct.chmod(0o755)
+    atomic_executable(direct, f"#!/bin/sh\nexec {shlex.quote(str(real_codex))} \"$@\"\n")
 
 
 def ensure_managed_route_precedence(path: Path, bin_dir: Path) -> None:
@@ -229,6 +241,8 @@ def install(args: argparse.Namespace) -> None:
     configure_codex(args.codex_home, home)
     (home / "real-codex-path").write_text(str(real_codex) + "\n", encoding="utf-8")
     set_private(home / "real-codex-path")
+    (home / "managed-codex-path").write_text(str((args.bin_dir / "codex").absolute()) + "\n", encoding="utf-8")
+    set_private(home / "managed-codex-path")
     write_wrappers(home, args.bin_dir, real_codex)
     for shell_file in (Path.home() / ".profile", Path.home() / ".bashrc"):
         ensure_managed_route_precedence(shell_file, args.bin_dir)

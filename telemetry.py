@@ -38,6 +38,18 @@ def thread_usage_from(params: dict[str, Any]) -> Any:
     return usage if isinstance(usage, dict) else None
 
 
+def usage_delta(baseline: dict[str, Any], total: dict[str, Any]) -> dict[str, int] | None:
+    fields = ("inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
+              "reasoningOutputTokens", "totalTokens")
+    result: dict[str, int] = {}
+    for field in fields:
+        before, after = baseline.get(field, 0), total.get(field, 0)
+        if not isinstance(before, (int, float)) or not isinstance(after, (int, float)) or after < before:
+            return None
+        result[field] = int(after - before)
+    return result
+
+
 def aggregate_usage(samples: list[dict[str, Any]]) -> dict[str, int] | None:
     """Return one exact per-turn sum from raw upstream completion samples."""
     totals: dict[str, int] = {}

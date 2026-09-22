@@ -22,7 +22,7 @@ from host_control import HOST_URL, _read_token, _rpc
 from model_host_launcher import PROXY_URL, ensure_host, ensure_proxy
 from paths import ROOT, real_codex_binary
 from adaptive_policy import adapt, set_adaptive_mode
-from telemetry import record as record_metric
+from telemetry import aggregate_usage, record as record_metric, usage_from
 
 
 ROUTES = ROOT / "routes.jsonl"
@@ -174,16 +174,46 @@ async def start(prompt: str, cwd: str, override_model: str | None,
         # The first-turn hook must see the launcher choice before turn/start.
         record_route({**choice, "status": "initial_route"})
         # The first inference happens only after both the model and tool config are set.
-        started = await _rpc(ws, "turn/start", {"threadId": thread_id,
-                                                 "input": [{"type": "text", "text": prompt}],
-                                                 "model": choice["model"], "effort": choice["effort"]}, 4)
+        await ws.send(json.dumps({"id": 4, "method": "turn/start", "params": {
+            "threadId": thread_id, "input": [{"type": "text", "text": prompt}],
+            "model": choice["model"], "effort": choice["effort"]}}))
+        queued: list[dict] = []
+        while True:
+            message = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+            if message.get("id") == 4:
+                if "error" in message:
+                    raise ValueError(f"Model host rejected turn/start: {message['error']}")
+                started = message.get("result") or {}
+                break
+            queued.append(message)
         turn_id = (started.get("turn") or {}).get("id")
         if isinstance(turn_id, str):
             record_metric("route_accepted", thread_id=thread_id, turn_id=turn_id,
                           model=choice["model"], effort=choice["effort"],
                           task_class=choice["class"], task_bucket=choice["task_bucket"],
                           adaptive_reason=choice.get("adaptive_reason"))
-            launch_usage_observer(thread_id, turn_id, choice)
+            samples: list[dict] = []
+            while True:
+                message = queued.pop(0) if queued else json.loads(await asyncio.wait_for(ws.recv(), timeout=15 * 60))
+                params = message.get("params") or {}
+                event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
+                if params.get("threadId") != thread_id or event_turn_id != turn_id:
+                    continue
+                if message.get("method") == "rawResponse/completed":
+                    usage = usage_from(params)
+                    if usage:
+                        samples.append(usage)
+                elif message.get("method") == "turn/completed":
+                    turn = params.get("turn") or {}
+                    record_metric("turn_completed", thread_id=thread_id, turn_id=turn_id,
+                                  model=choice["model"], effort=choice["effort"], task_class=choice["class"],
+                                  elapsed_ms=turn.get("durationMs"), status=turn.get("status"), usage=None)
+                    aggregated = aggregate_usage(samples)
+                    if aggregated:
+                        record_metric("turn_usage", thread_id=thread_id, turn_id=turn_id,
+                                      model=choice["model"], effort=choice["effort"], usage=aggregated,
+                                      sample_count=len(samples), source="initial_owner")
+                    break
     return thread_id, choice
 
 

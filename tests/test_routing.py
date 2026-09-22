@@ -6,12 +6,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modellabs import route
-from install import SHELL_PATH_START, ensure_managed_route_precedence, upsert_toml
+from install import SHELL_PATH_START, ensure_managed_route_precedence, upsert_toml, write_wrappers
 from paths import real_codex_binary
 from turn_proxy import selection_is_listed
 from adaptive_policy import adapt, record_outcome
 from health_dashboard import summarize
-from model_host_launcher import _exec_prompt
+from model_host_launcher import _command_index, _exec_prompt
 
 
 class RoutingTests(unittest.TestCase):
@@ -107,6 +107,26 @@ class RoutingTests(unittest.TestCase):
         args = ["exec", "--ephemeral", "--cd", "/tmp", "--skip-git-repo-check", "Reply exactly: OK"]
         self.assertEqual(_exec_prompt(args), "Reply exactly: OK")
         self.assertIsNone(_exec_prompt(["exec", "resume", "thread-id", "continue"]))
+        self.assertEqual(_command_index(["--profile", "p", "exec", "hello"]), 2)
+        self.assertEqual(_exec_prompt(["--profile", "p", "exec", "hello"]), "hello")
+
+    def test_wrapper_install_replaces_symlink_without_touching_target(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real-codex"
+            real.write_text("#!/bin/sh\necho real\n", encoding="utf-8")
+            real.chmod(0o755)
+            original = real.read_bytes()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "codex").symlink_to(real)
+            home = root / "home"
+            (home / "venv/bin").mkdir(parents=True)
+            write_wrappers(home, bin_dir, real)
+            self.assertFalse((bin_dir / "codex").is_symlink())
+            self.assertEqual(real.read_bytes(), original)
+            self.assertIn(str(real), (bin_dir / "codex-direct").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

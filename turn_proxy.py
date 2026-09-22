@@ -14,7 +14,7 @@ import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
 from modellabs import record_route, route
-from telemetry import aggregate_usage, record as record_metric, thread_usage_from, usage_from
+from telemetry import record as record_metric, thread_usage_from, usage_delta, usage_from
 from adaptive_policy import adapt, note_followup
 
 
@@ -175,6 +175,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if (request.get("method") in {"thread/settings/update", "turn/settings/update"}
                             and isinstance(params, dict) and params.get("model") and params.get("threadId")):
                         manual_model_threads.add(params["threadId"])
+                    if (request.get("method") == "thread/resume" and isinstance(params, dict)
+                            and params.get("model") and params.get("threadId")):
+                        manual_model_threads.add(params["threadId"])
                     if request.get("method") == "turn/start" and isinstance(params, dict):
                         prompt = "\n".join(x.get("text", "") for x in params.get("input", [])
                                            if isinstance(x, dict) and x.get("type") == "text")
@@ -231,20 +234,27 @@ async def handler(client: websockets.ServerConnection) -> None:
                     key = (params.get("threadId"), event_turn_id)
                     route_info = active.get(key)
                     if response.get("method") == "thread/tokenUsage/updated" and route_info:
+                        token_usage = params.get("tokenUsage") or {}
                         usage = thread_usage_from(params)
-                        if usage:
-                            route_info.setdefault("usage_samples", []).append(usage)
+                        total = token_usage.get("total")
+                        if usage and isinstance(total, dict):
+                            if "usage_baseline" not in route_info:
+                                route_info["usage_baseline"] = {
+                                    field: int(total.get(field, 0)) - int(usage.get(field, 0))
+                                    for field in total if isinstance(total.get(field), (int, float))
+                                }
+                            route_info["usage_total"] = total
                     if response.get("method") == "turn/completed" and route_info:
                         turn = params.get("turn") or {}
                         record_metric("turn_completed", thread_id=key[0], turn_id=key[1], model=route_info["model"],
                                       effort=route_info["effort"], task_class=route_info["class"],
                                       elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
                                       status=turn.get("status"), usage=usage_from(params))
-                        aggregated = aggregate_usage(route_info.get("usage_samples", []))
+                        aggregated = usage_delta(route_info.get("usage_baseline", {}), route_info.get("usage_total", {}))
                         if aggregated:
                             record_metric("turn_usage", thread_id=key[0], turn_id=key[1], model=route_info["model"],
                                           effort=route_info["effort"], usage=aggregated,
-                                          sample_count=len(route_info["usage_samples"]), source="proxy_thread_usage")
+                                          source="proxy_thread_usage_delta")
                         route_info["delivered"].set()
                         active.pop(key, None)
                 except (TypeError, ValueError, KeyError):

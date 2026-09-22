@@ -18,6 +18,7 @@ def modellabs_home() -> Path:
 ROOT = modellabs_home()
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
 REAL_CODEX_PATH_FILE = ROOT / "real-codex-path"
+MANAGED_CODEX_PATH_FILE = ROOT / "managed-codex-path"
 
 
 def real_codex_binary() -> Path:
@@ -40,12 +41,23 @@ def real_codex_binary() -> Path:
     discovered = shutil.which("codex")
     if discovered:
         candidates.append(Path(discovered))
-    shim = Path.home() / ".local/bin/codex"
+    managed = Path.home() / ".local/bin/codex"
+    try:
+        saved_managed = MANAGED_CODEX_PATH_FILE.read_text(encoding="utf-8").strip()
+        if saved_managed:
+            managed = Path(saved_managed).expanduser().absolute()
+    except OSError:
+        pass
     for candidate in candidates:
         try:
-            if candidate == shim or not candidate.is_file() or not os.access(candidate, os.X_OK):
+            resolved = candidate.resolve(strict=True)
+            if resolved == managed.resolve(strict=False) or not resolved.is_file() or not os.access(resolved, os.X_OK):
                 continue
-            return candidate
+            if managed.exists() and not managed.is_symlink() and os.path.samefile(resolved, managed):
+                continue
+            if b"model_host_launcher.py" in resolved.read_bytes()[:4096]:
+                continue
+            return resolved
         except OSError:
             continue
     raise RuntimeError(
