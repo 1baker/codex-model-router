@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import hashlib
 import json
 import os
 import re
@@ -14,6 +12,7 @@ from typing import Any
 
 import websockets
 from paths import ROOT
+from authority import AuthorityError, acquire_lock, read_locked
 
 
 HOST_URL = "ws://127.0.0.1:45172"
@@ -26,14 +25,10 @@ class ModelHostError(Exception):
 
 
 def _choice_authority(thread_id: str) -> dict[str, Any]:
-    path = ROOT / "thread-authority" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError) as exc:
-        raise ModelHostError("Thread choice authority is unavailable or invalid.") from exc
-    if payload.get("thread_id") != thread_id:
-        raise ModelHostError("Thread choice authority does not match this thread.")
-    return payload
+        return read_locked(thread_id)
+    except AuthorityError as exc:
+        raise ModelHostError(str(exc)) from exc
 
 
 def _read_token() -> str:
@@ -78,17 +73,9 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
         raise ModelHostError("A valid model ID is required.")
     if effort is not None and effort not in {"none", "low", "medium", "high", "xhigh", "max", "ultra"}:
         raise ModelHostError("Unsupported reasoning effort.")
-    authority_path = ROOT / "thread-authority" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
-    authority_path.parent.mkdir(parents=True, exist_ok=True)
-    authority = _choice_authority(thread_id)
-    if authority.get("explicit_model") and authority.get("model") != model:
-        raise ModelHostError("The model is explicitly pinned by this managed thread's user choice.")
-    if (effort is not None and authority.get("explicit_effort")
-            and authority.get("effort") != effort):
-        raise ModelHostError("The reasoning effort is explicitly pinned by this managed thread's user choice.")
-
-    lock_descriptor = os.open(authority_path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+    # This cross-process transaction lock is shared with the owner TUI proxy.
+    # It covers validation, the actual host mutation and confirmed application.
+    lock_descriptor = acquire_lock(thread_id)
     try:
         authority = _choice_authority(thread_id)
         if authority.get("explicit_model") and authority.get("model") != model:

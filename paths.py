@@ -20,14 +20,17 @@ ROOT = modellabs_home()
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
 REAL_CODEX_PATH_FILE = ROOT / "real-codex-path"
 MANAGED_CODEX_PATH_FILE = ROOT / "managed-codex-path"
+RUNTIME_SOURCE = Path(__file__).resolve().parent
 
 
 def proxy_revision() -> str:
     """Identify the exact proxy/accounting implementation loaded at runtime."""
     digest = hashlib.sha256()
-    for name in ("turn_proxy.py", "telemetry.py", "modellabs.py", "adaptive_policy.py"):
+    for name in ("adaptive_policy.py", "authority.py", "host_control.py", "modellabs.py",
+                 "paths.py", "protocol_policy.py", "receipt_journal.py", "telemetry.py",
+                 "thread_owner.py", "turn_proxy.py"):
         digest.update(name.encode())
-        digest.update((ROOT / name).read_bytes())
+        digest.update((RUNTIME_SOURCE / name).read_bytes())
     return digest.hexdigest()[:16]
 
 

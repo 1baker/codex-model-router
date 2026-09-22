@@ -19,13 +19,15 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parent
 PYTHON_FILES = [
-    "adaptive_policy.py", "health_dashboard.py", "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
+    "adaptive_policy.py", "authority.py", "health_dashboard.py", "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
     "modellabs.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
-    "thread_owner.py", "turn_proxy.py", "usage_observer.py", "smoke_bench.py",
+    "protocol_policy.py", "receipt_journal.py", "thread_owner.py", "turn_proxy.py", "usage_observer.py", "smoke_bench.py",
 ]
 SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
 SHELL_PATH_END = "# <<< ModelLabs managed Codex route <<<"
 OWNED_MANIFEST = "owned-files.json"
+PINNED_CODEX_VERSION = "codex-cli 0.155.1"
+AUTHORITY_SCHEMA = "modellabs.thread_authority.v1"
 
 
 def default_home() -> Path:
@@ -40,7 +42,17 @@ def _digest_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _assert_lexical_destination(path: Path, *, allow_final_symlink: bool = False) -> None:
+    lexical = path.expanduser().absolute()
+    ancestor = lexical if not allow_final_symlink else lexical.parent
+    while ancestor != ancestor.parent:
+        if ancestor.is_symlink():
+            raise RuntimeError(f"Refusing symlinked or redirected ModelLabs mutation path {ancestor}.")
+        ancestor = ancestor.parent
+
+
 def _atomic_bytes(path: Path, content: bytes, mode: int = 0o644) -> None:
+    _assert_lexical_destination(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
@@ -49,6 +61,7 @@ def _atomic_bytes(path: Path, content: bytes, mode: int = 0o644) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        _assert_lexical_destination(path)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -94,14 +107,16 @@ def _legacy_owned(path: Path, source_content: bytes) -> bool:
 
 
 def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream: Path,
-                               codex_home: Path | None = None) -> None:
+                               codex_home: Path | None = None, bin_dir: Path | None = None) -> None:
     manifest_path = home / OWNED_MANIFEST
     manifest_valid = True
     has_manifest = manifest_path.exists() or manifest_path.is_symlink()
     try:
         manifest_document = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest = manifest_document.get("files", {})
-        manifest_valid = (manifest_document.get("schema") == "modellabs.owned_files.v1"
+        manifest = manifest_document.get("files") if isinstance(manifest_document, dict) else None
+        manifest_valid = (isinstance(manifest_document, dict)
+                          and set(manifest_document) == {"schema", "files"}
+                          and manifest_document.get("schema") == "modellabs.owned_files.v1"
                           and isinstance(manifest, dict)
                           and all(isinstance(key, str) and isinstance(value, str)
                                   and len(value) == 64
@@ -116,28 +131,73 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
     except (OSError, ValueError, TypeError):
         legacy_install = False
     codex_root = (codex_home or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))).expanduser()
+    selected_bin = (bin_dir or Path.home() / ".local/bin").expanduser().absolute()
+    wrappers = [selected_bin / name for name in
+                ("codex", "codex-direct", "modellabs", "codex-model-host",
+                 "modellabs-health", "modellabs-smoke")]
+    authority_dir = home / "thread-authority"
+    authority_files = list(authority_dir.glob("*.json")) if authority_dir.is_dir() else []
+    mutation_roots = [home, home / "venv", authority_dir, selected_bin, codex_root,
+                      Path.home() / ".config/systemd/user"]
     ancillary = [home / OWNED_MANIFEST, home / "host-token", home / "real-codex-path",
                  home / "managed-codex-path", home / "install-state.json",
                  Path.home() / ".profile", Path.home() / ".bashrc",
-                 codex_root / "config.toml", codex_root / "hooks.json"]
+                 codex_root / "config.toml", codex_root / "hooks.json"] + wrappers
+    for path in mutation_roots + ancillary + authority_files + list(payloads):
+        lexical = path.expanduser().absolute()
+        ancestor = lexical
+        while ancestor != ancestor.parent:
+            if ancestor.is_symlink():
+                if lexical == selected_bin / "codex" and ancestor == lexical:
+                    break
+                raise RuntimeError(f"Refusing symlinked or redirected ModelLabs mutation path {ancestor}.")
+            ancestor = ancestor.parent
     for path in ancillary:
         if not path.exists() and not path.is_symlink():
             continue
-        if path.is_symlink():
+        if path.is_symlink() and path != selected_bin / "codex":
             raise RuntimeError(f"Refusing symlinked ModelLabs mutation destination {path}.")
         try:
+            if path == selected_bin / "codex" and path.is_symlink():
+                if path.resolve(strict=True) == upstream:
+                    continue
             if os.path.samefile(path, upstream):
                 raise RuntimeError(f"Refusing destination aliasing upstream Codex: {path}.")
         except OSError as exc:
             raise RuntimeError(f"Cannot validate ModelLabs mutation destination {path}.") from exc
-    if manifest_path.exists() and (not manifest_valid or not isinstance(manifest, dict)):
+    if has_manifest and (not manifest_valid or not isinstance(manifest, dict)):
         raise RuntimeError(f"Refusing unrelated ownership manifest {manifest_path}.")
+    if has_manifest:
+        for recorded_path, recorded_digest in manifest.items():
+            owned = Path(recorded_path)
+            if not owned.exists() or owned.is_symlink():
+                raise RuntimeError(f"Owned manifest entry is missing or redirected: {owned}.")
+            if _digest_bytes(owned.read_bytes()) != recorded_digest:
+                raise RuntimeError(f"Refusing unrelated modified owned content: {owned}.")
+        for path in payloads:
+            if path.exists() and str(path) not in manifest:
+                raise RuntimeError(f"Owned manifest is missing existing payload {path}.")
+    for path in authority_files:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"Refusing malformed thread authority {path}.") from exc
+        keys = set(value) if isinstance(value, dict) else set()
+        legacy = {"thread_id", "model", "effort", "explicit_model", "explicit_effort"}
+        current = legacy | {"schema"}
+        if frozenset(keys) not in {frozenset(legacy), frozenset(current)}:
+            raise RuntimeError(f"Refusing malformed thread authority {path}.")
+        if (keys == current and value.get("schema") != AUTHORITY_SCHEMA
+                or not isinstance(value.get("thread_id"), str)
+                or not isinstance(value.get("explicit_model"), bool)
+                or not isinstance(value.get("explicit_effort"), bool)
+                or value.get("model") is not None and not isinstance(value.get("model"), str)
+                or value.get("effort") is not None and value.get("effort") not in
+                   {"none", "low", "medium", "high", "xhigh", "max", "ultra"}
+                or value.get("explicit_model") and not value.get("model")
+                or value.get("explicit_effort") and value.get("effort") is None):
+            raise RuntimeError(f"Refusing malformed thread authority {path}.")
     for path, source_content in payloads.items():
-        ancestor = path.parent
-        while ancestor != ancestor.parent:
-            if ancestor.is_symlink():
-                raise RuntimeError(f"Refusing redirected ModelLabs destination ancestor {ancestor}.")
-            ancestor = ancestor.parent
         if not path.exists() and not path.is_symlink():
             continue
         if path.is_symlink():
@@ -187,6 +247,28 @@ def create_venv(venv: Path) -> None:
     raise RuntimeError("Python venv support is unavailable; install uv, virtualenv, or python3-venv.")
 
 
+def verify_upstream_protocol_version(upstream: Path) -> str:
+    result = subprocess.run([str(upstream), "--version"], check=True, capture_output=True,
+                            text=True, timeout=15)
+    version = getattr(result, "stdout", PINNED_CODEX_VERSION).strip()
+    if version != PINNED_CODEX_VERSION:
+        raise RuntimeError(
+            f"ModelLabs protocol policy is pinned to {PINNED_CODEX_VERSION}; found {version or 'unknown'}."
+        )
+    return version
+
+
+def migrate_authority_documents(home: Path) -> None:
+    directory = home / "thread-authority"
+    if not directory.exists():
+        return
+    for path in directory.glob("*.json"):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if "schema" not in value:
+            value = {"schema": AUTHORITY_SCHEMA, **value}
+            _atomic_bytes(path, (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(), 0o600)
+
+
 def upsert_toml(text: str, table: str, values: dict[str, str]) -> str:
     lines = text.splitlines()
     header = f"[{table}]"
@@ -219,7 +301,7 @@ def configure_codex(codex_home: Path, home: Path) -> None:
     text = upsert_toml(text, "mcp_servers.modelControl", {"command": command, "args": args,
                                                             "startup_timeout_sec": "10.0", "tool_timeout_sec": "20.0"})
     text = upsert_toml(text, "features", {"step_model_switching": "true"})
-    config.write_text(text, encoding="utf-8")
+    _atomic_bytes(config, text.encode())
 
     hooks_path = codex_home / "hooks.json"
     hooks = json.loads(hooks_path.read_text(encoding="utf-8")) if hooks_path.exists() else {"hooks": {}}
@@ -231,7 +313,7 @@ def configure_codex(codex_home: Path, home: Path) -> None:
     if not any(item.get("command") == command for item in entries if isinstance(item, dict)):
         entries.append({"command": command, "statusMessage": "Routing prompt with ModelLabs", "timeout": 10,
                         "type": "command"})
-    hooks_path.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
+    _atomic_bytes(hooks_path, (json.dumps(hooks, indent=2) + "\n").encode())
 
 
 def discover_real_codex(home: Path, bin_dir: Path) -> Path:
@@ -282,6 +364,7 @@ def discover_real_codex(home: Path, bin_dir: Path) -> Path:
 
 def write_wrappers(home: Path, bin_dir: Path, real_codex: Path, *, dry_run: bool = False) -> None:
     def atomic_executable(path: Path, content: str) -> None:
+        _assert_lexical_destination(path, allow_final_symlink=path == bin_dir / "codex")
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
         try:
@@ -289,11 +372,11 @@ def write_wrappers(home: Path, bin_dir: Path, real_codex: Path, *, dry_run: bool
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            _assert_lexical_destination(path, allow_final_symlink=path == bin_dir / "codex")
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
 
-    bin_dir.mkdir(parents=True, exist_ok=True)
     upstream = real_codex.expanduser().resolve(strict=True)
     if not upstream.is_file() or not os.access(upstream, os.X_OK):
         raise RuntimeError("The selected upstream Codex executable is not executable.")
@@ -346,6 +429,7 @@ def write_wrappers(home: Path, bin_dir: Path, real_codex: Path, *, dry_run: bool
 
     if dry_run:
         return
+    bin_dir.mkdir(parents=True, exist_ok=True)
     for path, content in contents.items():
         atomic_executable(path, content)
 
@@ -366,7 +450,7 @@ def ensure_managed_route_precedence(path: Path, bin_dir: Path) -> None:
         text = before.rstrip() + "\n\n" + block + after
     else:
         text = text.rstrip() + "\n\n" + block + "\n"
-    path.write_text(text, encoding="utf-8")
+    _atomic_bytes(path, text.encode())
 
 
 def write_service(home: Path) -> Path:
@@ -396,7 +480,9 @@ def enable_service() -> bool:
 
 def installed_proxy_port(home: Path) -> int:
     digest = hashlib.sha256()
-    for name in ("turn_proxy.py", "telemetry.py", "modellabs.py", "adaptive_policy.py"):
+    for name in ("adaptive_policy.py", "authority.py", "host_control.py", "modellabs.py",
+                 "paths.py", "protocol_policy.py", "receipt_journal.py", "telemetry.py",
+                 "thread_owner.py", "turn_proxy.py"):
         digest.update(name.encode())
         digest.update((home / name).read_bytes())
     return 46000 + int(digest.hexdigest()[:8], 16) % 16000
@@ -419,18 +505,20 @@ def retire_old_supervisors(home: Path, current_port: int) -> None:
 
 
 def install(args: argparse.Namespace) -> None:
-    home = args.home.expanduser().resolve()
+    home = args.home.expanduser().absolute()
     real_codex = discover_real_codex(home, args.bin_dir)
-    write_wrappers(home, args.bin_dir, real_codex, dry_run=True)
     payloads = _install_payloads(home, args.codex_home, include_service=not args.no_service)
-    preflight_install_payloads(payloads, home, real_codex, args.codex_home)
+    preflight_install_payloads(payloads, home, real_codex, args.codex_home, args.bin_dir)
+    write_wrappers(home, args.bin_dir, real_codex, dry_run=True)
+    upstream_version = verify_upstream_protocol_version(real_codex)
     home.mkdir(parents=True, exist_ok=True)
+    migrate_authority_documents(home)
     for path, content in payloads.items():
         _atomic_bytes(path, content)
     (home / "systemd").mkdir(exist_ok=True)
     token = home / "host-token"
     if not token.exists():
-        token.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
+        _atomic_bytes(token, (secrets.token_urlsafe(32) + "\n").encode(), 0o600)
     set_private(token)
     venv = home / "venv"
     create_venv(venv)
@@ -443,9 +531,10 @@ def install(args: argparse.Namespace) -> None:
             raise RuntimeError("The created environment has no pip; install uv or recreate it with python3-venv.")
         subprocess.run([uv, "pip", "install", "--quiet", "--python", str(venv / "bin/python"), "-r", str(home / "requirements.txt")], check=True, capture_output=True)
     configure_codex(args.codex_home, home)
-    (home / "real-codex-path").write_text(str(real_codex) + "\n", encoding="utf-8")
+    _atomic_bytes(home / "real-codex-path", (str(real_codex) + "\n").encode(), 0o600)
     set_private(home / "real-codex-path")
-    (home / "managed-codex-path").write_text(str((args.bin_dir / "codex").absolute()) + "\n", encoding="utf-8")
+    _atomic_bytes(home / "managed-codex-path",
+                  (str((args.bin_dir / "codex").absolute()) + "\n").encode(), 0o600)
     set_private(home / "managed-codex-path")
     write_wrappers(home, args.bin_dir, real_codex)
     for shell_file in (Path.home() / ".profile", Path.home() / ".bashrc"):
@@ -456,8 +545,11 @@ def install(args: argparse.Namespace) -> None:
     service_enabled = False if args.no_service else enable_service()
     retire_old_supervisors(home, installed_proxy_port(home))
     state = home / "install-state.json"
-    state.write_text(json.dumps({"home": str(home), "service": str(service), "service_enabled": service_enabled,
-                                 "real_codex": str(real_codex), "managed_codex": str(args.bin_dir / 'codex')}, indent=2) + "\n")
+    _atomic_bytes(state, (json.dumps({"home": str(home), "service": str(service),
+                                      "service_enabled": service_enabled,
+                                      "real_codex": str(real_codex),
+                                      "managed_codex": str(args.bin_dir / 'codex'),
+                                      "upstream_version": upstream_version}, indent=2) + "\n").encode(), 0o600)
     set_private(state)
     print(json.dumps({"home": str(home), "bin_dir": str(args.bin_dir), "codex_home": str(args.codex_home),
                       "real_codex": str(real_codex), "managed_codex": str(args.bin_dir / 'codex'),

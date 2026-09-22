@@ -8,6 +8,7 @@ from pathlib import Path
 
 from host_control import HOST_URL, THREAD_ID_PATTERN
 from paths import CODEX_HOME, ROOT
+from receipt_journal import unresolved_for_thread
 
 
 SESSIONS = CODEX_HOME / "sessions"
@@ -60,12 +61,17 @@ def require_unowned(thread_id: str) -> None:
         )
 
 
-def acquire_thread_ownership(thread_id: str, *, existing_thread: bool = True) -> int:
+def acquire_thread_ownership(thread_id: str, *, existing_thread: bool = True,
+                             allow_unresolved: bool = False) -> int:
     """Atomically reserve one resumed TUI owner until that process exits."""
     if not THREAD_ID_PATTERN.fullmatch(thread_id):
         raise ValueError("Resume requires an exact thread UUID.")
     if existing_thread:
         rollout_for(thread_id)
+    if not allow_unresolved and unresolved_for_thread(thread_id):
+        raise RuntimeError(
+            f"Thread {thread_id} has an unresolved receipt obligation and is quarantined."
+        )
     lock_dir = ROOT / "thread-owner-locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{thread_id}.lock"

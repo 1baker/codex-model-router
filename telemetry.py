@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import math
 import os
 import time
@@ -21,10 +22,37 @@ def record(event: str, **fields: Any) -> None:
     """Append metadata only; callers must never supply prompt text or tokens."""
     payload = {"event": event, "recorded_at_ms": int(time.time() * 1000), **fields}
     METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(METRICS_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.chmod(METRICS_PATH, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as out:
-        out.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    receipt_id = fields.get("receipt_id")
+    lock_descriptor = None
+    duplicate = False
+    if receipt_id is not None:
+        lock_descriptor = os.open(METRICS_PATH.with_suffix(METRICS_PATH.suffix + ".receipt.lock"),
+                                  os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        try:
+            with METRICS_PATH.open(encoding="utf-8") as source:
+                duplicate = any(_has_receipt(line, receipt_id) for line in source)
+        except FileNotFoundError:
+            pass
+    try:
+        if duplicate:
+            return
+        fd = os.open(METRICS_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.chmod(METRICS_PATH, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as out:
+            out.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+    finally:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+
+
+def _has_receipt(line: str, receipt_id: str) -> bool:
+    try:
+        return json.loads(line).get("receipt_id") == receipt_id
+    except (ValueError, TypeError):
+        return False
 
 
 def usage_from(params: dict[str, Any]) -> Any:

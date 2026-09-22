@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import turn_proxy
+import authority
+import receipt_journal
 
 
 class FakeClient:
@@ -178,9 +180,10 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
 
     def test_choice_authority_preserves_per_field_user_pins(self):
         from tempfile import TemporaryDirectory
-        with TemporaryDirectory() as directory, patch.object(turn_proxy, "ROOT", Path(directory)):
+        with TemporaryDirectory() as directory, patch.object(turn_proxy, "ROOT", Path(directory)), \
+             patch.object(authority, "ROOT", Path(directory)):
             turn_proxy.write_choice_authority("thread", "gpt-pinned", None,
-                                              explicit_model=True, explicit_effort=False)
+                                              explicit_model=True, explicit_effort=False, initialize=True)
             turn_proxy.write_choice_authority("thread", None, "high",
                                               explicit_model=False, explicit_effort=True)
             payload = json.loads(turn_proxy._authority_path("thread").read_text(encoding="utf-8"))
@@ -230,7 +233,7 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
             upstream = FakeUpstream([{"id": 2, "result": {"thread": {"id": thread_id}}}])
             client = FakeClient({"id": 2, "method": "thread/start", "params": {"cwd": "/tmp"}},
                                 f"Bearer token.launch-{ticket_id}")
-            with patch.object(turn_proxy, "ROOT", root), \
+            with patch.object(turn_proxy, "ROOT", root), patch.object(authority, "ROOT", root), \
                  patch.object(turn_proxy, "_read_token", return_value="token"), \
                  patch.object(turn_proxy, "acquire_thread_ownership", side_effect=lambda *_args, **_kwargs: os.open("/dev/null", os.O_RDONLY)), \
                  patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)):
@@ -240,6 +243,7 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(forwarded["config"]["mcp_servers"]["modelControl"]["enabled"])
 
     async def test_usage_and_completion_before_admission_are_processed_once(self):
+        from tempfile import TemporaryDirectory
         thread_id, turn_id = "thread-1", "turn-1"
         usage = {"inputTokens": 8, "cachedInputTokens": 0, "cacheWriteInputTokens": 0,
                  "outputTokens": 2, "reasoningOutputTokens": 0, "totalTokens": 10}
@@ -266,14 +270,27 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
                               "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}
 
         upstream.messages.insert(0, json.dumps({"id": 6, "result": {"thread": {"id": thread_id}}}))
-        with patch.object(turn_proxy, "_read_token", return_value="token"), \
-             patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
-             patch.object(turn_proxy, "acquire_thread_ownership", return_value=os.open("/dev/null", os.O_RDONLY)), \
-             patch.object(turn_proxy, "live_catalog", side_effect=catalog), \
-             patch.object(turn_proxy, "record_metric", side_effect=lambda event, **fields: metrics.append((event, fields))), \
-             patch.object(turn_proxy, "record_route"), \
-             patch.object(turn_proxy, "record_completion", new=AsyncMock()):
-            await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+        async def completed(_thread, _turn, _info, _token, finished):
+            finished.set()
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "receipts"
+            with patch.object(turn_proxy, "ROOT", root), patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "ROOT", root), \
+                 patch.object(receipt_journal, "JOURNAL_DIR", journal), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                turn_proxy.write_choice_authority(thread_id, None, None,
+                                                  explicit_model=False, explicit_effort=False,
+                                                  initialize=True)
+                with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                     patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                     patch.object(turn_proxy, "acquire_thread_ownership", return_value=os.open("/dev/null", os.O_RDONLY)), \
+                     patch.object(turn_proxy, "live_catalog", side_effect=catalog), \
+                     patch.object(turn_proxy, "record_metric", side_effect=lambda event, **fields: metrics.append((event, fields))), \
+                     patch.object(turn_proxy, "record_route"), \
+                     patch.object(turn_proxy, "record_completion", side_effect=completed):
+                    await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
 
         usage_records = [fields for event, fields in metrics if event == "turn_usage"]
         unavailable = [fields for event, fields in metrics if event == "turn_usage_unavailable"]
