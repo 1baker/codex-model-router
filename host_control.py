@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -28,9 +29,11 @@ def _choice_authority(thread_id: str) -> dict[str, Any]:
     path = ROOT / "thread-authority" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return {}
-    return payload if payload.get("thread_id") == thread_id else {}
+    except (OSError, ValueError, TypeError) as exc:
+        raise ModelHostError("Thread choice authority is unavailable or invalid.") from exc
+    if payload.get("thread_id") != thread_id:
+        raise ModelHostError("Thread choice authority does not match this thread.")
+    return payload
 
 
 def _read_token() -> str:
@@ -75,6 +78,8 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
         raise ModelHostError("A valid model ID is required.")
     if effort is not None and effort not in {"none", "low", "medium", "high", "xhigh", "max", "ultra"}:
         raise ModelHostError("Unsupported reasoning effort.")
+    authority_path = ROOT / "thread-authority" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
+    authority_path.parent.mkdir(parents=True, exist_ok=True)
     authority = _choice_authority(thread_id)
     if authority.get("explicit_model") and authority.get("model") != model:
         raise ModelHostError("The model is explicitly pinned by this managed thread's user choice.")
@@ -82,8 +87,16 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
             and authority.get("effort") != effort):
         raise ModelHostError("The reasoning effort is explicitly pinned by this managed thread's user choice.")
 
-    token = _read_token()
+    lock_descriptor = os.open(authority_path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
     try:
+        authority = _choice_authority(thread_id)
+        if authority.get("explicit_model") and authority.get("model") != model:
+            raise ModelHostError("The model is explicitly pinned by this managed thread's user choice.")
+        if (effort is not None and authority.get("explicit_effort")
+                and authority.get("effort") != effort):
+            raise ModelHostError("The reasoning effort is explicitly pinned by this managed thread's user choice.")
+        token = _read_token()
         async with websockets.connect(
             HOST_URL,
             additional_headers={"Authorization": f"Bearer {token}"},
@@ -154,3 +167,5 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
             }
     except (OSError, websockets.WebSocketException) as exc:
         raise ModelHostError("The shared Codex model host is unavailable or rejected the connection.") from exc
+    finally:
+        os.close(lock_descriptor)

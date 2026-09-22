@@ -97,11 +97,19 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
                                codex_home: Path | None = None) -> None:
     manifest_path = home / OWNED_MANIFEST
     manifest_valid = True
+    has_manifest = manifest_path.exists() or manifest_path.is_symlink()
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", {})
+        manifest_document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = manifest_document.get("files", {})
+        manifest_valid = (manifest_document.get("schema") == "modellabs.owned_files.v1"
+                          and isinstance(manifest, dict)
+                          and all(isinstance(key, str) and isinstance(value, str)
+                                  and len(value) == 64
+                                  and all(character in "0123456789abcdef" for character in value)
+                                  for key, value in manifest.items()))
     except (OSError, ValueError, TypeError):
         manifest = {}
-        manifest_valid = not manifest_path.exists()
+        manifest_valid = not has_manifest
     try:
         state = json.loads((home / "install-state.json").read_text(encoding="utf-8"))
         legacy_install = Path(state.get("home", "")).expanduser().resolve() == home
@@ -125,6 +133,11 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
     if manifest_path.exists() and (not manifest_valid or not isinstance(manifest, dict)):
         raise RuntimeError(f"Refusing unrelated ownership manifest {manifest_path}.")
     for path, source_content in payloads.items():
+        ancestor = path.parent
+        while ancestor != ancestor.parent:
+            if ancestor.is_symlink():
+                raise RuntimeError(f"Refusing redirected ModelLabs destination ancestor {ancestor}.")
+            ancestor = ancestor.parent
         if not path.exists() and not path.is_symlink():
             continue
         if path.is_symlink():
@@ -137,7 +150,7 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
             raise RuntimeError(f"Cannot validate ModelLabs destination {path}.") from exc
         if manifest.get(str(path)) == actual:
             continue
-        if legacy_install and _legacy_owned(path, source_content):
+        if not has_manifest and legacy_install and _legacy_owned(path, source_content):
             continue
         raise RuntimeError(f"Refusing to replace unrelated ModelLabs destination {path}.")
 

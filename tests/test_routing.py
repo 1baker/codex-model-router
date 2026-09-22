@@ -169,6 +169,13 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(info.get("explicit_model", False))
         self.assertFalse(info.get("explicit_effort", False))
 
+    def test_turn_routing_exception_fails_closed(self):
+        request = json.dumps({"id": 1, "method": "turn/start", "params": {
+            "threadId": "thread", "input": [{"type": "text", "text": "hello"}]}})
+        with patch("turn_proxy.route", side_effect=ValueError("bad adaptive evidence")):
+            with self.assertRaisesRegex(ValueError, "failed closed"):
+                route_request(request)
+
     def test_exec_settings_respect_delimiter_precedence_and_scope_guard(self):
         literal = ["exec", "--", "--model=gpt-literal"]
         self.assertIsNone(_explicit_setting(literal, "model"))
@@ -369,6 +376,32 @@ class RoutingTests(unittest.TestCase):
             unrelated.unlink()
             unrelated.symlink_to(upstream)
             with self.assertRaisesRegex(RuntimeError, "symlinked"):
+                installer.preflight_install_payloads(payloads, home, upstream, codex_home)
+
+    def test_manifest_digest_and_parent_symlink_fail_closed(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, codex_home = root / "home", root / "codex"
+            home.mkdir()
+            upstream = root / "real-codex"
+            upstream.write_text("#!/bin/sh\n", encoding="utf-8")
+            upstream.chmod(0o755)
+            payloads = installer._install_payloads(home, codex_home, include_service=False)
+            target = home / "turn_proxy.py"
+            target.write_bytes(payloads[target])
+            manifest = {"schema": "modellabs.owned_files.v1", "files": {
+                str(target): installer._digest_bytes(payloads[target])}}
+            (home / installer.OWNED_MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+            target.write_bytes(payloads[target] + b"\n# changed\n")
+            with self.assertRaisesRegex(RuntimeError, "unrelated"):
+                installer.preflight_install_payloads(payloads, home, upstream, codex_home)
+            target.unlink()
+            (home / installer.OWNED_MANIFEST).unlink()
+            redirected = root / "redirected"
+            redirected.mkdir()
+            (home / "benchmarks").symlink_to(redirected, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "redirected"):
                 installer.preflight_install_payloads(payloads, home, upstream, codex_home)
 
 

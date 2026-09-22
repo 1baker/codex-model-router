@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -47,12 +48,22 @@ def _authority_path(thread_id: str) -> Any:
     return ROOT / "thread-authority" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
 
 
+def read_choice_authority(thread_id: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(_authority_path(thread_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if payload.get("thread_id") == thread_id else {}
+
+
 def write_choice_authority(thread_id: str, model: str | None, effort: str | None, *,
                            explicit_model: bool, explicit_effort: bool) -> None:
     """Persist prompt-free explicit-choice provenance for every mutation path."""
     path = _authority_path(thread_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
+    lock_descriptor = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
     existing: dict[str, Any] = {}
     try:
         candidate = json.loads(path.read_text(encoding="utf-8"))
@@ -79,6 +90,7 @@ def write_choice_authority(thread_id: str, model: str | None, effort: str | None
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+        os.close(lock_descriptor)
 
 
 def apply_launch_choice(raw: str, choice: dict[str, Any] | None) -> str:
@@ -184,7 +196,12 @@ def route_request(raw: str, context_prompt: str | None = None,
                 + ". Use other tools available in this thread if the task requires them; this shortlist does not grant access."}
         info = {**choice, "thread_id": params.get("threadId"), "status": "submitted_to_host"}
         return json.dumps(message), info
-    except (TypeError, ValueError, KeyError):
+    except (TypeError, ValueError, KeyError) as exc:
+        try:
+            if json.loads(raw).get("method") == "turn/start":
+                raise ValueError("turn routing failed closed") from exc
+        except json.JSONDecodeError:
+            pass
         return raw, None
 
 
@@ -344,6 +361,7 @@ async def handler(client: websockets.ServerConnection) -> None:
         provisional: dict[str, list[dict[str, Any]]] = {}
         ownership_pending: set[object] = set()
         admission_events: dict[object, asyncio.Event] = {}
+        authority_pending: dict[object, tuple[str, str | None, str | None]] = {}
         owner_descriptors: dict[str, int] = {}
         catalog: dict[str, Any] | None = None
         catalog_at = 0.0
@@ -415,6 +433,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     resume_thread, params.get("model"), params.get("effort"),
                                     explicit_model=preserve_cli_model,
                                     explicit_effort=preserve_cli_effort)
+                                if request_id is not None:
+                                    mark_admission_pending(request_id)
                             except Exception as exc:
                                 if request_id is not None:
                                     await client.send(json.dumps({"id": request_id, "error": {
@@ -424,7 +444,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                         ownership_pending.add(request_id)
                         mark_admission_pending(request_id)
                     mutating_methods = {"turn/start", "turn/steer", "turn/interrupt",
-                                        "thread/settings/update", "turn/settings/update"}
+                                        "thread/settings/update", "turn/settings/update",
+                                        "thread/archive", "thread/rollback", "thread/inject_items"}
                     if request.get("method") in mutating_methods:
                         mutation_thread = params.get("threadId") if isinstance(params, dict) else None
                         if not mutation_thread or mutation_thread not in owner_descriptors:
@@ -436,14 +457,18 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if (request.get("method") in {"thread/settings/update", "turn/settings/update"}
                             and isinstance(params, dict) and params.get("threadId")
                             and (params.get("model") is not None or params.get("effort") is not None)):
-                        if params.get("model") is not None:
-                            manual_model_threads.add(params["threadId"])
-                        if params.get("effort") is not None:
-                            manual_effort_threads.add(params["threadId"])
-                        write_choice_authority(params["threadId"], params.get("model"), params.get("effort"),
-                                               explicit_model=params.get("model") is not None,
-                                               explicit_effort=params.get("effort") is not None)
+                        if request_id is not None:
+                            authority_pending[request_id] = (params["threadId"], params.get("model"),
+                                                             params.get("effort"))
                     if request.get("method") == "turn/start" and isinstance(params, dict):
+                        authority = read_choice_authority(params.get("threadId", ""))
+                        if authority.get("explicit_model"):
+                            params["model"] = authority.get("model")
+                            manual_model_threads.add(params["threadId"])
+                        if authority.get("explicit_effort"):
+                            params["effort"] = authority.get("effort")
+                            manual_effort_threads.add(params["threadId"])
+                        raw = json.dumps(request)
                         prompt = "\n".join(x.get("text", "") for x in params.get("input", [])
                                            if isinstance(x, dict) and x.get("type") == "text")
                         if prompt.lower().strip().rstrip(".!?") in CONTINUATIONS:
@@ -454,11 +479,27 @@ async def handler(client: websockets.ServerConnection) -> None:
                 manual_model = thread_id in manual_model_threads
                 manual_effort = thread_id in manual_effort_threads
                 automatic_initial = initial_preselection_available
-                routed, info = route_request(raw, context,
-                                             automatic_initial or preserve_cli_model or ticket_explicit_model or manual_model,
-                                             automatic_initial or preserve_cli_effort or ticket_explicit_effort or manual_effort,
-                                             preserve_cli_model or ticket_explicit_model or manual_model,
-                                             preserve_cli_effort or ticket_explicit_effort or manual_effort)
+                try:
+                    routed, info = route_request(raw, context,
+                                                 automatic_initial or preserve_cli_model or ticket_explicit_model or manual_model,
+                                                 automatic_initial or preserve_cli_effort or ticket_explicit_effort or manual_effort,
+                                                 preserve_cli_model or ticket_explicit_model or manual_model,
+                                                 preserve_cli_effort or ticket_explicit_effort or manual_effort)
+                except Exception as exc:
+                    if request_id is not None:
+                        await client.send(json.dumps({"id": request_id, "error": {
+                            "code": -32001, "message": f"ModelLabs routing failed closed: {type(exc).__name__}"}}))
+                    continue
+                if request.get("method") == "review/start":
+                    if request_id is not None:
+                        await client.send(json.dumps({"id": request_id, "error": {
+                            "code": -32004, "message": "ModelLabs does not support review inference admission."}}))
+                    continue
+                if request.get("method") == "turn/start" and info is None:
+                    if request_id is not None:
+                        await client.send(json.dumps({"id": request_id, "error": {
+                            "code": -32001, "message": "ModelLabs could not build a complete route."}}))
+                    continue
                 if info:
                     if automatic_initial:
                         initial_preselection_available = False
@@ -504,11 +545,22 @@ async def handler(client: websockets.ServerConnection) -> None:
                 active.pop(key, None)
 
         async def outbound() -> None:
+            global ACCOUNTING_BLOCKED
             async for raw in upstream:
                 try:
                     response = json.loads(raw)
                     response_id = response.get("id")
                     rpc_response = is_rpc_response(response)
+                    authority_update = authority_pending.pop(response_id, None) if rpc_response else None
+                    if authority_update and "error" not in response:
+                        authority_thread, authority_model, authority_effort = authority_update
+                        if authority_model is not None:
+                            manual_model_threads.add(authority_thread)
+                        if authority_effort is not None:
+                            manual_effort_threads.add(authority_thread)
+                        write_choice_authority(authority_thread, authority_model, authority_effort,
+                                               explicit_model=authority_model is not None,
+                                               explicit_effort=authority_effort is not None)
                     if rpc_response and response_id in ownership_pending:
                         ownership_pending.discard(response_id)
                         thread_id = ((response.get("result") or {}).get("thread") or {}).get("id")
@@ -530,7 +582,6 @@ async def handler(client: websockets.ServerConnection) -> None:
                         result = response.get("result") or {}
                         info["status"] = "accepted_by_host" if "error" not in response else "rejected_by_host"
                         info["turn_id"] = (result.get("turn") or {}).get("id")
-                        record_route(info)
                         if info["status"] == "accepted_by_host" and info.get("thread_id") and info.get("turn_id"):
                             terminal_recorded = asyncio.Event()
                             route_info = {**info, "started_at": time.monotonic(),
@@ -545,11 +596,17 @@ async def handler(client: websockets.ServerConnection) -> None:
                                           adaptive_reason=info.get("adaptive_reason"))
                             task = asyncio.create_task(record_completion(
                                 info["thread_id"], info["turn_id"], route_info, token,
-                                route_info["terminal_recorded"]))
+                                route_info["finished"]))
                             track_background(task)
                             buffered = provisional.pop(info["thread_id"], [])
                             for event in buffered:
                                 await account_event(event)
+                        try:
+                            record_route(info)
+                        except Exception:
+                            ACCOUNTING_BLOCKED = True
+                        settle_admission(response_id)
+                    elif rpc_response and response_id in admission_events:
                         settle_admission(response_id)
                     params = response.get("params") or {}
                     event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
@@ -570,8 +627,8 @@ async def handler(client: websockets.ServerConnection) -> None:
 
         tasks = [asyncio.create_task(inbound()), asyncio.create_task(outbound())]
         done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        if tasks[0] in done and (ownership_pending or pending):
-            while (ownership_pending or pending) and not tasks[1].done():
+        if tasks[0] in done and (ownership_pending or pending or admission_events):
+            while (ownership_pending or pending or admission_events) and not tasks[1].done():
                 await asyncio.sleep(0.05)
         for request_id in list(ownership_pending):
             record_metric("route_admission_unresolved", request_id=str(request_id),
@@ -583,6 +640,8 @@ async def handler(client: websockets.ServerConnection) -> None:
         for task in pending_tasks:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks[0] in done and active:
+            await asyncio.gather(*(info["finished"].wait() for info in active.values()))
         for descriptor in owner_descriptors.values():
             os.close(descriptor)
         for result in results:
