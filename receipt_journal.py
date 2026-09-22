@@ -15,6 +15,7 @@ from paths import ROOT
 SCHEMA = "modellabs.receipt_obligation.v1"
 JOURNAL_DIR = ROOT / "receipt-obligations"
 QUARANTINE_DIR = ROOT / "lifecycle-quarantine"
+RETIREMENT_SCHEMA = "modellabs.receipt_retirement.v1"
 
 
 def _key(thread_id: str, turn_id: str) -> str:
@@ -143,6 +144,14 @@ def bind_quarantine(path: Path, *, route: dict[str, Any] | None = None,
 
 def load_quarantine(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
+    if (isinstance(value, dict)
+            and value.get("schema") == "modellabs.lifecycle_quarantine.v1"
+            and set(value) == {"schema", "thread_id", "request_digest", "method"}
+            and all(isinstance(value.get(key), str) and value[key]
+                    for key in ("thread_id", "request_digest", "method"))):
+        # A v1 record cannot prove a dispatched turn or reconstruct its route.
+        # Keep it as an unresolved thread fence throughout a rolling upgrade.
+        return {**value, "legacy": True, "route": None, "turn_id": None}
     if (not isinstance(value, dict)
             or value.get("schema") != "modellabs.lifecycle_quarantine.v2"
             or not isinstance(value.get("thread_id"), str)
@@ -170,6 +179,59 @@ def clear_quarantine(path: Path) -> None:
             os.close(directory)
 
 
+def retirement_path_for(path: Path) -> Path:
+    return JOURNAL_DIR.parent / "receipt-retirements" / path.name
+
+
+def _sync_directories(*paths: Path) -> None:
+    for directory_path in paths:
+        if not directory_path.exists():
+            continue
+        directory = os.open(directory_path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def _begin_retirement(path: Path, value: dict[str, Any]) -> Path:
+    marker = retirement_path_for(path)
+    _atomic(marker, {"schema": RETIREMENT_SCHEMA, "state": "pending",
+                     "obligation": path.name, "thread_id": value["thread_id"],
+                     "turn_id": value["turn_id"]})
+    return marker
+
+
+def _finish_retirement(path: Path, value: dict[str, Any]) -> None:
+    marker = _begin_retirement(path, value)
+    path.unlink(missing_ok=True)
+    _sync_directories(path.parent, path.parent.parent)
+    _atomic(marker, {"schema": RETIREMENT_SCHEMA, "state": "complete",
+                     "obligation": path.name, "thread_id": value["thread_id"],
+                     "turn_id": value["turn_id"]})
+
+
+def list_retirements() -> list[tuple[Path, dict[str, Any]]]:
+    retirement_dir = JOURNAL_DIR.parent / "receipt-retirements"
+    if not retirement_dir.exists():
+        return []
+    result = []
+    for marker in sorted(retirement_dir.glob("*.json")):
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        if (not isinstance(value, dict)
+                or set(value) != {"schema", "state", "obligation", "thread_id", "turn_id"}
+                or value.get("schema") != RETIREMENT_SCHEMA
+                or value.get("state") not in {"pending", "complete"}
+                or not all(isinstance(value.get(key), str) and value[key]
+                           for key in ("obligation", "thread_id", "turn_id"))
+                or Path(value["obligation"]).name != value["obligation"]):
+            raise RuntimeError(f"Invalid receipt retirement {marker}.")
+        # Complete tombstones are intentionally retained and re-barriered on
+        # every startup; a crash can occur after replace but before its fsync.
+        result.append((marker, value))
+    return result
+
+
 def mark(path: Path, stage: str) -> dict[str, Any]:
     if stage not in {"accepted", "terminal", "usage"}:
         raise ValueError("Invalid receipt stage.")
@@ -177,35 +239,34 @@ def mark(path: Path, stage: str) -> dict[str, Any]:
     value[stage] = True
     _atomic(path, value)
     if value["accepted"] and value["terminal"] and value["usage"]:
-        path.unlink()
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _finish_retirement(path, value)
     return value
 
 
 def retire_if_complete(path: Path) -> bool:
+    if not path.exists():
+        marker = retirement_path_for(path)
+        if marker.exists():
+            confirm_retired(path)
+            return True
+        return False
     value = load(path)
     if not (value["accepted"] and value["terminal"] and value["usage"]):
         return False
-    path.unlink(missing_ok=True)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    _finish_retirement(path, value)
     return True
 
 
 def confirm_retired(path: Path) -> None:
     if path.exists():
         raise RuntimeError("Receipt obligation is not retired.")
-    if path.parent.exists():
-        for directory_path in (path.parent, path.parent.parent):
-            directory = os.open(directory_path, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+    _sync_directories(path.parent, path.parent.parent)
+    marker = retirement_path_for(path)
+    if marker.exists():
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        if (not isinstance(value, dict) or value.get("schema") != RETIREMENT_SCHEMA
+                or value.get("obligation") != path.name
+                or not isinstance(value.get("thread_id"), str)
+                or not isinstance(value.get("turn_id"), str)):
+            raise RuntimeError(f"Invalid receipt retirement {marker}.")
+        _atomic(marker, {**value, "state": "complete"})

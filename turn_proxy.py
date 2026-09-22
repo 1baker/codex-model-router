@@ -40,15 +40,44 @@ CATALOG_TTL_SECONDS = 60.0
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 UNRESOLVED_FILE = ROOT / f"proxy-unresolved-{PROXY_PORT}.state"
 ACCOUNTING_BLOCKED = False
+ACCOUNTING_FAILURES: set[str] = set()
 
 
-def record_metric(event: str, **fields: Any) -> None:
+def record_metric(event: str, *, _accounting_claim: str | None = None, **fields: Any) -> None:
     global ACCOUNTING_BLOCKED
+    claim = _accounting_claim or f"event:{event}"
     try:
         _record_metric(event, **fields)
     except Exception:
+        ACCOUNTING_FAILURES.add(claim)
         ACCOUNTING_BLOCKED = True
         raise
+    ACCOUNTING_FAILURES.discard(claim)
+    ACCOUNTING_BLOCKED = bool(ACCOUNTING_FAILURES)
+
+
+def effective_request_settings(params: dict[str, Any]) -> tuple[Any, Any]:
+    """Resolve settings exactly as the pinned host: collaboration settings win."""
+    collaboration = params.get("collaborationMode")
+    settings = None
+    if collaboration is not None:
+        if not isinstance(collaboration, dict):
+            raise ValueError("collaborationMode must be an object")
+        settings = collaboration.get("settings")
+        if not isinstance(settings, dict):
+            raise ValueError("collaborationMode.settings must be an object")
+    model = params.get("model")
+    effort = params.get("effort")
+    if settings is not None:
+        if "model" in settings:
+            model = settings.get("model")
+        if "reasoning_effort" in settings:
+            effort = settings.get("reasoning_effort")
+    if model is not None and not isinstance(model, str):
+        raise ValueError("model must be a string or null")
+    if effort is not None and not isinstance(effort, str):
+        raise ValueError("effort must be a string or null")
+    return model, effort
 
 
 def _authority_path(thread_id: str) -> Any:
@@ -144,16 +173,8 @@ def route_request(raw: str, context_prompt: str | None = None,
         if not prompt.strip():
             return raw, None
         collaboration = params.get("collaborationMode")
-        settings = None
-        if isinstance(collaboration, dict):
-            settings = collaboration.get("settings")
-            if not isinstance(settings, dict):
-                raise ValueError("collaborationMode.settings must be an object")
-        incoming_model = params.get("model")
-        incoming_effort = params.get("effort")
-        if settings is not None:
-            incoming_model = incoming_model or settings.get("model")
-            incoming_effort = incoming_effort or settings.get("reasoning_effort")
+        settings = collaboration.get("settings") if isinstance(collaboration, dict) else None
+        incoming_model, incoming_effort = effective_request_settings(params)
         note_followup(params.get("threadId"), prompt)
         baseline = route(context_prompt or prompt)
         # A model selected through Codex's settings UI is an explicit user
@@ -218,10 +239,12 @@ def reconcile_receipt_stage(thread_id: str, turn_id: str, route_info: dict[str, 
     receipt_id = f"{thread_id}:{turn_id}:{stage}"
     payload = canonical_receipt(receipt_id)
     if payload is None:
-        record_metric(event, receipt_id=receipt_id, thread_id=thread_id, turn_id=turn_id,
+        record_metric(event, _accounting_claim=receipt_id,
+                      receipt_id=receipt_id, thread_id=thread_id, turn_id=turn_id,
                       **fields)
     else:
-        record_metric(payload["event"], **{key: value for key, value in payload.items()
+        record_metric(payload["event"], _accounting_claim=receipt_id,
+                      **{key: value for key, value in payload.items()
                                            if key != "event"})
     journal_path = route_info.get("journal_path")
     if journal_path is None:
@@ -368,18 +391,25 @@ async def recover_receipt_obligations(token: str) -> None:
     """Recover crash-left receipts before this generation begins admission."""
     grouped: dict[str, dict[str, list]] = {}
     for path, obligation in receipt_journal.list_obligations():
-        grouped.setdefault(obligation["thread_id"], {"obligations": [], "quarantines": []})[
+        grouped.setdefault(obligation["thread_id"], {"obligations": [], "quarantines": [], "retirements": []})[
             "obligations"].append((path, obligation))
     for path, quarantine in receipt_journal.list_quarantines():
         if quarantine["method"] == "turn/start" and quarantine.get("route") is not None:
-            grouped.setdefault(quarantine["thread_id"], {"obligations": [], "quarantines": []})[
+            grouped.setdefault(quarantine["thread_id"], {"obligations": [], "quarantines": [], "retirements": []})[
                 "quarantines"].append((path, quarantine))
+        # Legacy v1 quarantines intentionally remain as unresolved ownership
+        # fences. They lack route/turn evidence and must never be fabricated.
+    for marker, retirement in receipt_journal.list_retirements():
+        grouped.setdefault(retirement["thread_id"], {"obligations": [], "quarantines": [], "retirements": []})[
+            "retirements"].append((marker, retirement))
 
     async def recover_thread(thread_id: str, state: dict[str, list]) -> None:
         obligations = state["obligations"]
         quarantines = state["quarantines"]
+        retirements = state["retirements"]
         while (any(path.exists() for path, _value in obligations)
-               or any(path.exists() for path, _value in quarantines)):
+               or any(path.exists() for path, _value in quarantines)
+               or bool(retirements)):
             descriptor = None
             try:
                 descriptor = acquire_thread_ownership(thread_id, existing_thread=False,
@@ -391,6 +421,10 @@ async def recover_receipt_obligations(token: str) -> None:
                 continue
             completion_tasks: list[asyncio.Task] = []
             try:
+                for marker, retirement in list(retirements):
+                    receipt_journal.confirm_retired(
+                        receipt_journal.JOURNAL_DIR / retirement["obligation"])
+                    retirements.remove((marker, retirement))
                 for quarantine_path, _quarantine in quarantines:
                     if not quarantine_path.exists():
                         continue
@@ -547,11 +581,16 @@ async def handler(client: websockets.ServerConnection) -> None:
 
             track_background(asyncio.create_task(wait_for_receipt()))
 
-        def settle_admission(request_id: object) -> None:
-            quarantine_path = lifecycle_pending.pop(request_id, None)
-            if quarantine_path is not None:
-                receipt_journal.clear_quarantine(quarantine_path)
-            event = admission_events.pop(request_id, None)
+        async def settle_admission(lifecycle_id: object) -> None:
+            quarantine_path = lifecycle_pending.get(lifecycle_id)
+            while quarantine_path is not None:
+                try:
+                    receipt_journal.clear_quarantine(quarantine_path)
+                    lifecycle_pending.pop(lifecycle_id, None)
+                    break
+                except Exception:
+                    await asyncio.sleep(1)
+            event = admission_events.pop(lifecycle_id, None)
             if event is not None:
                 event.set()
 
@@ -567,13 +606,26 @@ async def handler(client: websockets.ServerConnection) -> None:
                 thread_id, lifecycle_id, method)
             return lifecycle_id
 
-        def settle_request(request_id: object) -> None:
-            lifecycle_id = request_lifecycles.pop(request_id, None)
-            if lifecycle_id is not None:
-                settle_admission(lifecycle_id)
+        def maybe_release_request_id(request_id: object) -> None:
+            entry = request_ledger.get(request_id)
+            if (entry is not None and entry.get("forwarded")
+                    and request_id not in request_lifecycles
+                    and request_id not in authority_pending
+                    and request_id not in ownership_pending
+                    and request_id not in pending
+                    and not any(waiting_id == request_id
+                                for waiting_id, _update in authority_waiting.values())):
+                request_ledger.pop(request_id, None)
 
-        def abandon_request(request_id: object, method: str | None,
-                            params: dict[str, Any]) -> None:
+        async def settle_request(request_id: object) -> None:
+            lifecycle_id = request_lifecycles.get(request_id)
+            if lifecycle_id is not None:
+                await settle_admission(lifecycle_id)
+                request_lifecycles.pop(request_id, None)
+            maybe_release_request_id(request_id)
+
+        async def abandon_request(request_id: object, method: str | None,
+                                  params: dict[str, Any]) -> None:
             pending.pop(request_id, None)
             ownership_pending.discard(request_id)
             update = authority_pending.pop(request_id, None)
@@ -584,9 +636,17 @@ async def handler(client: websockets.ServerConnection) -> None:
                 descriptor = reserved_descriptors.pop(thread_id, None)
                 if descriptor is not None:
                     os.close(descriptor)
-            settle_request(request_id)
+            await settle_request(request_id)
 
-        def reconcile_authority_notification(thread_id: str) -> None:
+        async def reject_and_abandon(request_id: object, method: str | None,
+                                     params: dict[str, Any], code: int, message: str) -> None:
+            try:
+                await client.send(json.dumps({"id": request_id, "error": {
+                    "code": code, "message": message}}))
+            finally:
+                await abandon_request(request_id, method, params)
+
+        async def reconcile_authority_notification(thread_id: str) -> None:
             waiting = authority_waiting.get(thread_id)
             notification = authority_notifications.get(thread_id)
             if not waiting or not notification:
@@ -609,7 +669,7 @@ async def handler(client: websockets.ServerConnection) -> None:
             os.close(update["descriptor"])
             authority_waiting.pop(thread_id, None)
             authority_notifications.pop(thread_id, None)
-            settle_admission(waiting_id)
+            await settle_request(waiting_id)
 
         async def inbound() -> None:
             nonlocal catalog, catalog_at, initial_preselection_available, launch_scope_available
@@ -740,9 +800,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                             begin_admission(request_id, mutation_thread, method)
                     if (method in {"thread/settings/update", "turn/settings/update"}
                             and isinstance(params, dict) and params.get("threadId")):
-                        nested = ((params.get("collaborationMode") or {}).get("settings") or {})
-                        requested_model = params.get("model", nested.get("model"))
-                        requested_effort = params.get("effort", nested.get("reasoning_effort"))
+                        requested_model, requested_effort = effective_request_settings(params)
                         if requested_model is not None or requested_effort is not None:
                             if request_id is not None:
                                 descriptor = await acquire_authority_lock(params["threadId"])
@@ -777,9 +835,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                             context = await previous_task(params.get("threadId", ""), token)
                 except (TypeError, ValueError, AttributeError, AuthorityError) as exc:
                     if request_id is not None:
-                        await client.send(json.dumps({"id": request_id, "error": {
-                            "code": -32003, "message": str(exc)}}))
-                        abandon_request(request_id, method, params)
+                        await reject_and_abandon(request_id, method, params, -32003, str(exc))
                     continue
                 thread_id = params.get("threadId") if isinstance(params, dict) else None
                 manual_model = thread_id in manual_model_threads
@@ -793,15 +849,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                                                  preserve_cli_effort or ticket_explicit_effort or manual_effort)
                 except Exception as exc:
                     if request_id is not None:
-                        await client.send(json.dumps({"id": request_id, "error": {
-                            "code": -32001, "message": f"ModelLabs routing failed closed: {type(exc).__name__}"}}))
-                        abandon_request(request_id, method, params)
+                        await reject_and_abandon(
+                            request_id, method, params, -32001,
+                            f"ModelLabs routing failed closed: {type(exc).__name__}")
                     continue
                 if method == "turn/start" and info is None:
                     if request_id is not None:
-                        await client.send(json.dumps({"id": request_id, "error": {
-                            "code": -32001, "message": "ModelLabs could not build a complete route."}}))
-                        abandon_request(request_id, method, params)
+                        await reject_and_abandon(
+                            request_id, method, params, -32001,
+                            "ModelLabs could not build a complete route.")
                     continue
                 if info:
                     if automatic_initial:
@@ -815,9 +871,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                     except Exception as exc:
                         request_id = json.loads(routed).get("id")
                         if request_id is not None:
-                            await client.send(json.dumps({"id": request_id, "error": {
-                                "code": -32001, "message": f"ModelLabs rejected turn before inference: {exc}"}}))
-                        abandon_request(request_id, method, params)
+                            await reject_and_abandon(
+                                request_id, method, params, -32001,
+                                f"ModelLabs rejected turn before inference: {exc}")
                         record_metric("route_rejected", thread_id=info.get("thread_id"), model=info.get("model"),
                                       effort=info.get("effort"), reason=type(exc).__name__)
                         continue
@@ -829,10 +885,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 info["thread_id"], token)
                             receipt_journal.bind_quarantine(quarantine_path, route=info)
                         except Exception as exc:
-                            await client.send(json.dumps({"id": request_id, "error": {
-                                "code": -32001,
-                                "message": f"ModelLabs could not persist admission intent: {type(exc).__name__}"}}))
-                            abandon_request(request_id, method, params)
+                            await reject_and_abandon(
+                                request_id, method, params, -32001,
+                                f"ModelLabs could not persist admission intent: {type(exc).__name__}")
                             continue
                     try:
                         request_id = json.loads(routed).get("id")
@@ -844,7 +899,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                         pass
                 if request_id is not None:
                     request_ledger[request_id] = {"method": method,
-                                                  "thread_id": params.get("threadId") if isinstance(params, dict) else None}
+                                                  "thread_id": params.get("threadId") if isinstance(params, dict) else None,
+                                                  "forwarded": False}
                 await upstream.send(routed)
 
         async def account_event(response: dict[str, Any]) -> None:
@@ -866,10 +922,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                                        elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
                                        terminal_source="live_event", usage_complete=True)
                     except Exception:
-                        ACCOUNTING_BLOCKED = True
                         await asyncio.sleep(1)
                         continue
-                    ACCOUNTING_BLOCKED = False
                     break
                 active.pop(key, None)
 
@@ -912,19 +966,18 @@ async def handler(client: websockets.ServerConnection) -> None:
                         else:
                             shape_valid = shape_valid or isinstance(response.get("result"), dict)
                         if not shape_valid:
+                            ACCOUNTING_FAILURES.add(f"protocol-shape:{response_id!r}")
                             ACCOUNTING_BLOCKED = True
                             continue
-                        request_ledger.pop(response_id, None)
                     authority_update = authority_pending.get(response_id) if rpc_response else None
                     if authority_update:
                         authority_method = authority_update["method"]
                         if (authority_method == "thread/settings/update"
                                 and "error" not in response and response.get("result") == {}):
                             authority_pending.pop(response_id, None)
-                            request_lifecycles.pop(response_id, None)
                             authority_waiting[authority_update["thread"]] = (
-                                authority_update["lifecycle_id"], authority_update)
-                            reconcile_authority_notification(authority_update["thread"])
+                                response_id, authority_update)
+                            await reconcile_authority_notification(authority_update["thread"])
                         else:
                             authority_pending.pop(response_id, None)
                             try:
@@ -951,7 +1004,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 os.close(authority_update["descriptor"])
                             if (authority_method == "thread/settings/update"
                                     and "error" in response):
-                                settle_request(response_id)
+                                await settle_request(response_id)
                     if rpc_response and response_id in ownership_pending:
                         ownership_pending.discard(response_id)
                         thread_id = ((response.get("result") or {}).get("thread") or {}).get("id")
@@ -973,7 +1026,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 response = {"id": response_id, "error": {"code": -32003, "message": str(exc)}}
                                 raw = json.dumps(response)
                         if ownership_settled:
-                            settle_request(response_id)
+                            await settle_request(response_id)
                     if (rpc_response and ledger_entry
                             and ledger_entry["method"] == "thread/resume"):
                         resume_thread = ledger_entry["thread_id"]
@@ -997,6 +1050,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                                           "usage_tracker": UsageTracker()}
                             lifecycle_id = request_lifecycles.get(response_id)
                             quarantine_path = lifecycle_pending.get(lifecycle_id)
+                            admission_claim = f"admission:{info['thread_id']}:{info['turn_id']}"
                             while True:
                                 try:
                                     if quarantine_path is None:
@@ -1009,35 +1063,39 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     route_info["journal_path"] = receipt_journal.path_for(
                                         info["thread_id"], info["turn_id"])
                                     record_accepted_receipt(info["thread_id"], info["turn_id"], route_info)
-                                    ACCOUNTING_BLOCKED = False
+                                    ACCOUNTING_FAILURES.discard(admission_claim)
+                                    ACCOUNTING_BLOCKED = bool(ACCOUNTING_FAILURES)
                                     break
                                 except Exception:
+                                    ACCOUNTING_FAILURES.add(admission_claim)
                                     ACCOUNTING_BLOCKED = True
                                     await asyncio.sleep(1)
                             active[(info["thread_id"], info["turn_id"])] = route_info
                             task = asyncio.create_task(reconcile_and_retire(
                                 info["thread_id"], info["turn_id"], route_info))
                             track_background(task)
-                            settle_request(response_id)
+                            await settle_request(response_id)
                             buffered = provisional.pop(info["thread_id"], [])
                             for event in buffered:
                                 await account_event(event)
                         try:
                             record_route(info)
                         except Exception:
+                            ACCOUNTING_FAILURES.add(
+                                f"route-record:{info.get('thread_id')}:{info.get('turn_id')}")
                             ACCOUNTING_BLOCKED = True
                         if info["status"] != "accepted_by_host":
-                            settle_request(response_id)
+                            await settle_request(response_id)
                     elif (rpc_response and response_id in request_lifecycles
                           and not (authority_update and authority_update["method"] == "thread/settings/update"
                                    and "error" not in response)):
-                        settle_request(response_id)
+                        await settle_request(response_id)
                     if response.get("method") == "thread/settings/updated":
                         notification = response.get("params") or {}
                         notification_thread = notification.get("threadId")
                         if isinstance(notification_thread, str):
                             authority_notifications[notification_thread] = notification
-                            reconcile_authority_notification(notification_thread)
+                            await reconcile_authority_notification(notification_thread)
                     if response.get("method") is not None and response_id is not None:
                         server_request_ids.add(response_id)
                     params = response.get("params") or {}
@@ -1056,6 +1114,11 @@ async def handler(client: websockets.ServerConnection) -> None:
                     # The proxy still owns admission/accounting even after the
                     # presentation socket disappears. Keep consuming upstream.
                     pass
+                if rpc_response and ledger_entry is not None:
+                    current = request_ledger.get(response_id)
+                    if current is not None:
+                        current["forwarded"] = True
+                    maybe_release_request_id(response_id)
 
         tasks = [asyncio.create_task(inbound()), asyncio.create_task(outbound())]
         done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

@@ -21,6 +21,135 @@ from test_turn_proxy import ConnectContext, FakeClient, FakeUpstream, TwoRequest
 
 
 class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        turn_proxy.ACCOUNTING_FAILURES.clear()
+        turn_proxy.ACCOUNTING_BLOCKED = False
+
+    def test_effective_settings_follow_pinned_host_precedence(self):
+        cases = [
+            ({"model": None, "effort": None, "collaborationMode": {"settings": {
+                "model": "gpt-5.6-terra", "reasoning_effort": "high"}}},
+             ("gpt-5.6-terra", "high")),
+            ({"model": "gpt-5.6-sol", "effort": "low", "collaborationMode": {"settings": {
+                "model": "gpt-5.6-terra", "reasoning_effort": "high"}}},
+             ("gpt-5.6-terra", "high")),
+            ({"model": "gpt-5.6-sol", "effort": "medium"},
+             ("gpt-5.6-sol", "medium")),
+        ]
+        for params, expected in cases:
+            self.assertEqual(turn_proxy.effective_request_settings(params), expected)
+
+    def test_accounting_health_retires_only_the_reconciled_claim(self):
+        claim = "thread:turn:accepted"
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(receipt_journal, "JOURNAL_DIR", Path(directory) / "journal"):
+            route = {"model": "gpt", "effort": "low", "class": "routine"}
+            receipt_journal.create("thread", "turn", route)
+            info = {**route, "journal_path": receipt_journal.path_for("thread", "turn")}
+            with patch.object(turn_proxy, "_record_metric", side_effect=[OSError("once"), None]):
+                with self.assertRaises(OSError):
+                    turn_proxy.reconcile_receipt_stage(
+                        "thread", "turn", info, "accepted", "route_accepted", {})
+                self.assertIn(claim, turn_proxy.ACCOUNTING_FAILURES)
+                turn_proxy.ACCOUNTING_FAILURES.add("other:unresolved")
+                turn_proxy.reconcile_receipt_stage(
+                    "thread", "turn", info, "accepted", "route_accepted", {})
+            self.assertNotIn(claim, turn_proxy.ACCOUNTING_FAILURES)
+            self.assertIn("other:unresolved", turn_proxy.ACCOUNTING_FAILURES)
+            self.assertTrue(turn_proxy.ACCOUNTING_BLOCKED)
+
+    async def test_rolling_upgrade_keeps_v1_quarantine_as_thread_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            quarantine_dir = root / "quarantine"
+            quarantine_dir.mkdir()
+            legacy = quarantine_dir / "legacy.json"
+            legacy.write_text(json.dumps({
+                "schema": "modellabs.lifecycle_quarantine.v1", "thread_id": "legacy-thread",
+                "request_digest": "a" * 64, "method": "turn/start"}), encoding="utf-8")
+            tasks = []
+            with patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", quarantine_dir), \
+                 patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+                listed = receipt_journal.list_quarantines()
+                self.assertTrue(listed[0][1]["legacy"])
+                await turn_proxy.recover_receipt_obligations("token")
+            self.assertEqual(tasks, [])
+            self.assertTrue(legacy.exists())
+
+    async def test_retirement_barrier_survives_unlink_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "journal"
+            with patch.object(receipt_journal, "JOURNAL_DIR", journal):
+                route = {"model": "gpt", "effort": "low", "class": "routine"}
+                receipt_journal.create("thread", "turn", route)
+                path = receipt_journal.path_for("thread", "turn")
+                receipt_journal.mark(path, "accepted")
+                receipt_journal.mark(path, "terminal")
+                original_sync = receipt_journal._sync_directories
+                attempts = 0
+
+                def fail_after_unlink(*paths):
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        raise OSError("post-unlink barrier")
+                    return original_sync(*paths)
+
+                with patch.object(receipt_journal, "_sync_directories", side_effect=fail_after_unlink):
+                    with self.assertRaises(OSError):
+                        receipt_journal.mark(path, "usage")
+                self.assertFalse(path.exists())
+                self.assertTrue(receipt_journal.retirement_path_for(path).exists())
+                tasks = []
+                with patch.object(turn_proxy, "acquire_thread_ownership",
+                                  return_value=os.open("/dev/null", os.O_RDONLY)), \
+                     patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+                    await turn_proxy.recover_receipt_obligations("token")
+                    await asyncio.gather(*tasks)
+                marker = receipt_journal.retirement_path_for(path)
+                self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["state"], "complete")
+
+    def test_quarantine_cleanup_is_retryable_before_and_after_unlink(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(receipt_journal, "QUARANTINE_DIR", Path(directory) / "quarantine"):
+            path = receipt_journal.quarantine("thread", "lifecycle", "turn/start")
+            original_unlink = Path.unlink
+            calls = 0
+
+            def fail_unlink_once(target, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1 and target == path:
+                    raise OSError("before unlink")
+                return original_unlink(target, *args, **kwargs)
+
+            with patch.object(Path, "unlink", side_effect=fail_unlink_once, autospec=True):
+                with self.assertRaises(OSError):
+                    receipt_journal.clear_quarantine(path)
+                self.assertTrue(path.exists())
+                receipt_journal.clear_quarantine(path)
+            self.assertFalse(path.exists())
+
+            path = receipt_journal.quarantine("thread", "lifecycle-2", "turn/start")
+            original_fsync = receipt_journal.os.fsync
+            fsync_calls = 0
+
+            def fail_fsync_once(descriptor):
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 1:
+                    raise OSError("after unlink")
+                return original_fsync(descriptor)
+
+            with patch.object(receipt_journal.os, "fsync", side_effect=fail_fsync_once):
+                with self.assertRaises(OSError):
+                    receipt_journal.clear_quarantine(path)
+                self.assertFalse(path.exists())
+                receipt_journal.clear_quarantine(path)
+            self.assertFalse(path.exists())
+
     async def test_unmaterialized_thread_has_no_prior_turn_but_other_host_errors_propagate(self):
         unmaterialized = turn_proxy.ModelHostError(
             "thread id is not materialized yet; thread/turns/list is unavailable before first user message")
@@ -57,9 +186,9 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 json.dumps(request), preserve_model=True, preserve_effort=True,
                 explicit_model=True, explicit_effort=True)
         params = json.loads(routed)["params"]
-        self.assertEqual((params["model"], params["effort"]), ("stale-top", "low"))
+        self.assertEqual((params["model"], params["effort"]), ("gpt-5.6-terra", "high"))
         self.assertEqual(params["collaborationMode"]["settings"], {
-            "model": "stale-top", "reasoning_effort": "low"})
+            "model": "gpt-5.6-terra", "reasoning_effort": "high"})
 
     def test_protocol_policy_rejects_known_unmanaged_and_unknown_methods(self):
         self.assertEqual(classify("thread/name/set"), "owner_mutation")
@@ -808,6 +937,42 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(OSError):
                         os.fstat(owner)
 
+    async def test_local_rejection_cleanup_survives_client_disconnect(self):
+        thread_id = "00000000-0000-4000-8000-000000000085"
+
+        class DisconnectingClient(FakeClient):
+            async def send(self, raw):
+                value = json.loads(raw)
+                if value.get("id") == 2:
+                    self.done.set()
+                    raise ConnectionError("presentation socket closed")
+                await super().send(raw)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                descriptor = authority.acquire_lock(thread_id)
+                try:
+                    authority.initialize_locked(thread_id, None, None,
+                                                explicit_model=False, explicit_effort=False)
+                finally:
+                    os.close(descriptor)
+                client = DisconnectingClient([
+                    {"id": 1, "method": "thread/resume", "params": {"threadId": thread_id}},
+                    {"id": 2, "method": "thread/settings/update", "params": {
+                        "threadId": thread_id, "collaborationMode": "invalid"}},
+                ])
+                upstream = FakeUpstream([{"id": 1, "result": {"thread": {"id": thread_id}}}])
+                owner = os.open("/dev/null", os.O_RDONLY)
+                with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                     patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                     patch.object(turn_proxy, "acquire_thread_ownership", return_value=owner):
+                    await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+                self.assertEqual(list((root / "quarantine").glob("*.json")), [])
+                with self.assertRaises(OSError):
+                    os.fstat(owner)
+
     async def test_reused_rpc_id_cannot_settle_waiting_settings_lifecycle(self):
         thread_id = "00000000-0000-4000-8000-000000000083"
 
@@ -819,6 +984,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 self.resume = asyncio.Event()
                 self.settings_response = asyncio.Event()
                 self.notification = asyncio.Event()
+                self.duplicate_issued = asyncio.Event()
                 self.id2_responses = 0
                 self.sent = []
                 self.notification_count = 0
@@ -839,6 +1005,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 if self.stage == 2:
                     await self.settings_response.wait()
                     self.stage += 1
+                    self.duplicate_issued.set()
                     return json.dumps({"id": 2, "method": "thread/settings/update", "params": {
                         "threadId": thread_id, "collaborationMode": {"settings": {
                             "model": "gpt-5.6-sol", "reasoning_effort": "medium"}}}})
@@ -856,7 +1023,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                         self.settings_response.set()
                 elif value.get("method") == "thread/settings/updated":
                     self.notification_count += 1
-                    if self.notification_count == 2:
+                    if self.notification_count == 1:
                         self.notification.set()
 
             async def close(self, **_kwargs): self.notification.set()
@@ -869,21 +1036,16 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                     {"method": "thread/settings/updated", "params": {
                         "threadId": thread_id, "threadSettings": {
                             "model": "gpt-5.6-terra", "reasoning_effort": "low"}}},
-                    {"id": 2, "result": {}},
-                    {"method": "thread/settings/updated", "params": {
-                        "threadId": thread_id, "threadSettings": {
-                            "model": "gpt-5.6-sol", "reasoning_effort": "medium"}}},
                 ])
                 self.yielded = 0
                 self.notification_sent = 0
-                self.second_quarantine = asyncio.Event()
 
             async def __anext__(self):
-                if self.yielded >= 5:
+                if self.yielded >= 3:
                     await asyncio.Future()
                 if self.yielded == 2:
-                    await self.second_quarantine.wait()
-                required = (1, 2, 2, 3, 3)[self.yielded]
+                    await client.duplicate_issued.wait()
+                required = (1, 2, 2)[self.yielded]
                 while len(self.sent) < required:
                     await asyncio.sleep(0)
                 value = self.messages.pop(0)
@@ -900,14 +1062,10 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
         def quarantine(*args, **kwargs):
             path = original_quarantine(*args, **kwargs)
             quarantine_paths.append(path)
-            if len(quarantine_paths) == 3:
-                upstream.second_quarantine.set()
             return path
 
         def clear(path):
             cleared_after_notification.append(upstream.notification_sent)
-            if len(quarantine_paths) >= 3 and path == quarantine_paths[1]:
-                self.assertTrue(quarantine_paths[2].exists())
             original_clear(path)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -928,8 +1086,11 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                      patch.object(receipt_journal, "clear_quarantine", side_effect=clear):
                     await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
                 value = authority.read_locked(thread_id)
-        self.assertEqual(cleared_after_notification, [0, 1, 2])
-        self.assertEqual((value["model"], value["effort"]), ("gpt-5.6-sol", "medium"))
+        self.assertEqual(cleared_after_notification, [0, 1])
+        self.assertEqual((value["model"], value["effort"]), ("gpt-5.6-terra", "low"))
+        self.assertEqual(len(upstream.sent), 2)
+        self.assertTrue(any(message.get("id") == 2 and message.get("error", {}).get("code") == -32600
+                            for message in client.sent))
 
     async def test_duplicate_outstanding_client_id_is_rejected_before_forwarding(self):
         class DuplicateClient:
