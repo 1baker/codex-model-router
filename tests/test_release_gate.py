@@ -39,6 +39,53 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
         for params, expected in cases:
             self.assertEqual(turn_proxy.effective_request_settings(params), expected)
 
+    async def test_persisted_explicit_authority_overrides_stale_nested_turn_settings(self):
+        nested_cases = [
+            {"model": "gpt-5.6-terra", "reasoning_effort": "high"},
+            {"model": None, "reasoning_effort": None},
+            None,
+        ]
+        for index, nested in enumerate(nested_cases):
+            with self.subTest(nested=nested), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                thread_id = f"00000000-0000-4000-8000-0000000001{index:02d}"
+                params = {"threadId": thread_id,
+                          "input": [{"type": "text", "text": "Keep the explicit route."}]}
+                if nested is not None:
+                    params["collaborationMode"] = {"settings": nested}
+                client = FakeClient([
+                    {"id": 1, "method": "thread/resume", "params": {"threadId": thread_id}},
+                    {"id": 2, "method": "turn/start", "params": params},
+                ])
+                upstream = TwoRequestUpstream([
+                    {"id": 1, "result": {"thread": {"id": thread_id}}},
+                    {"id": 2, "error": {"code": -1, "message": "probe complete"}},
+                ])
+                with patch.object(authority, "ROOT", root), \
+                     patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"), \
+                     patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                    descriptor = authority.acquire_lock(thread_id)
+                    try:
+                        authority.initialize_locked(thread_id, "gpt-5.6-sol", "low",
+                                                    explicit_model=True, explicit_effort=True)
+                    finally:
+                        os.close(descriptor)
+                    with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                         patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                         patch.object(turn_proxy, "acquire_thread_ownership",
+                                      return_value=os.open("/dev/null", os.O_RDONLY)), \
+                         patch.object(turn_proxy, "latest_host_turn_id", new=AsyncMock(return_value=None)), \
+                         patch.object(turn_proxy, "live_catalog", new=AsyncMock(return_value={"data": [{
+                             "id": "gpt-5.6-sol", "hidden": False,
+                             "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]})):
+                        await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+                forwarded = upstream.sent[1]["params"]
+                self.assertEqual((forwarded["model"], forwarded["effort"]),
+                                 ("gpt-5.6-sol", "low"))
+                if nested is not None:
+                    self.assertEqual(forwarded["collaborationMode"]["settings"], {
+                        "model": "gpt-5.6-sol", "reasoning_effort": "low"})
+
     def test_accounting_health_retires_only_the_reconciled_claim(self):
         claim = "thread:turn:accepted"
         with tempfile.TemporaryDirectory() as directory, \
@@ -109,19 +156,112 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                     await turn_proxy.recover_receipt_obligations("token")
                     await asyncio.gather(*tasks)
                 marker = receipt_journal.retirement_path_for(path)
-                self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["state"], "complete")
+                self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["state"], "confirmed")
+
+    async def test_recovery_finishes_pending_marker_with_present_obligation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                route = {"model": "gpt", "effort": "low", "class": "routine"}
+                receipt_journal.create("thread", "turn", route)
+                path = receipt_journal.path_for("thread", "turn")
+                complete = receipt_journal.load(path)
+                complete.update({"accepted": True, "terminal": True, "usage": True})
+                receipt_journal._atomic(path, complete)
+                marker = receipt_journal._begin_retirement(path, complete)
+                self.assertTrue(receipt_journal.unresolved_for_thread("thread"))
+                tasks = []
+                with patch.object(turn_proxy, "acquire_thread_ownership",
+                                  return_value=os.open("/dev/null", os.O_RDONLY)), \
+                     patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+                    await turn_proxy.recover_receipt_obligations("token")
+                    await asyncio.gather(*tasks)
+                self.assertFalse(path.exists())
+                self.assertEqual(json.loads(marker.read_text())["state"], "confirmed")
+                self.assertFalse(receipt_journal.unresolved_for_thread("thread"))
+
+    async def test_recovery_registers_marker_created_during_failed_retirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                route = {"model": "gpt", "effort": "low", "class": "routine"}
+                receipt_journal.create("thread", "turn", route)
+                path = receipt_journal.path_for("thread", "turn")
+                complete = receipt_journal.load(path)
+                complete.update({"accepted": True, "terminal": True, "usage": True})
+                receipt_journal._atomic(path, complete)
+                original_sync = receipt_journal._sync_directories
+                failed = False
+
+                def fail_once(*paths):
+                    nonlocal failed
+                    if not failed:
+                        failed = True
+                        raise OSError("unlink barrier")
+                    return original_sync(*paths)
+
+                tasks = []
+                descriptor = os.open("/dev/null", os.O_RDONLY)
+                with patch.object(receipt_journal, "_sync_directories", side_effect=fail_once), \
+                     patch.object(turn_proxy, "acquire_thread_ownership", return_value=descriptor), \
+                     patch.object(turn_proxy.asyncio, "sleep", new=AsyncMock()), \
+                     patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+                    await turn_proxy.recover_receipt_obligations("token")
+                    await asyncio.gather(*tasks)
+                marker = receipt_journal.retirement_path_for(path)
+                self.assertEqual(json.loads(marker.read_text())["state"], "confirmed")
+                self.assertFalse(receipt_journal.unresolved_for_thread("thread"))
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    async def test_confirm_marker_failure_rolls_back_to_recoverable_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                route = {"model": "gpt", "effort": "low", "class": "routine"}
+                receipt_journal.create("thread", "turn", route)
+                path = receipt_journal.path_for("thread", "turn")
+                receipt_journal.mark(path, "accepted")
+                receipt_journal.mark(path, "terminal")
+                original_atomic = receipt_journal._atomic
+                failed = False
+
+                def fail_confirm_after_replace(target, value):
+                    nonlocal failed
+                    original_atomic(target, value)
+                    if value.get("state") == "confirmed" and not failed:
+                        failed = True
+                        raise OSError("confirmed marker directory barrier")
+
+                with patch.object(receipt_journal, "_atomic", side_effect=fail_confirm_after_replace):
+                    with self.assertRaises(OSError):
+                        receipt_journal.mark(path, "usage")
+                marker = receipt_journal.retirement_path_for(path)
+                self.assertEqual(json.loads(marker.read_text())["state"], "retired")
+                self.assertTrue(receipt_journal.unresolved_for_thread("thread"))
+                tasks = []
+                with patch.object(turn_proxy, "acquire_thread_ownership",
+                                  return_value=os.open("/dev/null", os.O_RDONLY)), \
+                     patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+                    await turn_proxy.recover_receipt_obligations("token")
+                    await asyncio.gather(*tasks)
+                self.assertEqual(json.loads(marker.read_text())["state"], "confirmed")
+                self.assertFalse(receipt_journal.unresolved_for_thread("thread"))
 
     def test_quarantine_cleanup_is_retryable_before_and_after_unlink(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(receipt_journal, "QUARANTINE_DIR", Path(directory) / "quarantine"):
             path = receipt_journal.quarantine("thread", "lifecycle", "turn/start")
             original_unlink = Path.unlink
-            calls = 0
+            failed = False
 
             def fail_unlink_once(target, *args, **kwargs):
-                nonlocal calls
-                calls += 1
-                if calls == 1 and target == path:
+                nonlocal failed
+                if not failed and target == path:
+                    failed = True
                     raise OSError("before unlink")
                 return original_unlink(target, *args, **kwargs)
 
@@ -133,17 +273,17 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(path.exists())
 
             path = receipt_journal.quarantine("thread", "lifecycle-2", "turn/start")
-            original_fsync = receipt_journal.os.fsync
-            fsync_calls = 0
+            original_sync = receipt_journal._sync_directories
+            sync_calls = 0
 
-            def fail_fsync_once(descriptor):
-                nonlocal fsync_calls
-                fsync_calls += 1
-                if fsync_calls == 1:
+            def fail_fsync_once(*paths):
+                nonlocal sync_calls
+                sync_calls += 1
+                if sync_calls == 1:
                     raise OSError("after unlink")
-                return original_fsync(descriptor)
+                return original_sync(*paths)
 
-            with patch.object(receipt_journal.os, "fsync", side_effect=fail_fsync_once):
+            with patch.object(receipt_journal, "_sync_directories", side_effect=fail_fsync_once):
                 with self.assertRaises(OSError):
                     receipt_journal.clear_quarantine(path)
                 self.assertFalse(path.exists())
@@ -307,7 +447,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 rows = [json.loads(line) for line in metrics.read_text().splitlines()]
                 self.assertEqual(len(rows), 3)
 
-    async def test_recovery_setup_failure_releases_owner_before_retry(self):
+    async def test_recovery_setup_failure_retains_owner_until_retry_finishes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "obligation.json"
             path.write_text("{}", encoding="utf-8")
@@ -315,7 +455,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                           "turn_id": "turn", "model": "gpt", "effort": "low",
                           "task_class": "routine", "accepted": True,
                           "terminal": True, "usage": True}
-            descriptors = [os.open("/dev/null", os.O_RDONLY) for _ in range(2)]
+            descriptor = os.open("/dev/null", os.O_RDONLY)
             calls = 0
 
             def load(_path):
@@ -323,6 +463,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 calls += 1
                 if calls == 1:
                     raise OSError("simulated setup failure")
+                os.fstat(descriptor)
                 return obligation.copy()
 
             def retire(target):
@@ -332,18 +473,19 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
             tasks = []
             with patch.object(receipt_journal, "list_obligations", return_value=[(path, obligation)]), \
                  patch.object(receipt_journal, "list_quarantines", return_value=[]), \
+                 patch.object(receipt_journal, "list_retirements", return_value=[]), \
+                 patch.object(receipt_journal, "list_quarantine_cleanups", return_value=[]), \
                  patch.object(receipt_journal, "load", side_effect=load), \
                  patch.object(receipt_journal, "retire_if_complete", side_effect=retire), \
-                 patch.object(turn_proxy, "acquire_thread_ownership", side_effect=descriptors), \
+                 patch.object(turn_proxy, "acquire_thread_ownership", return_value=descriptor), \
                  patch.object(turn_proxy.asyncio, "sleep", new=AsyncMock()), \
                  patch.object(turn_proxy, "track_background", side_effect=tasks.append):
                 await turn_proxy.recover_receipt_obligations("token")
                 await asyncio.gather(*tasks)
-        for descriptor in descriptors:
-            with self.assertRaises(OSError):
-                os.fstat(descriptor)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
 
-    async def test_recovery_child_failure_releases_owner_and_retries(self):
+    async def test_recovery_child_failure_retains_owner_and_retries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             journal = root / "journal"
@@ -352,7 +494,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 receipt_journal.create("thread", "turn", route)
                 path = receipt_journal.path_for("thread", "turn")
                 receipt_journal.mark(path, "accepted")
-                descriptors = [os.open("/dev/null", os.O_RDONLY) for _ in range(2)]
+                descriptor = os.open("/dev/null", os.O_RDONLY)
                 attempts = 0
 
                 async def complete(_thread, _turn, _info, _token, finished):
@@ -360,21 +502,21 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                     attempts += 1
                     if attempts == 1:
                         raise OSError("child failed after launch")
+                    os.fstat(descriptor)
                     path.unlink()
                     finished.set()
 
                 tasks = []
                 with patch.object(receipt_journal, "list_quarantines", return_value=[]), \
-                     patch.object(turn_proxy, "acquire_thread_ownership", side_effect=descriptors), \
+                     patch.object(turn_proxy, "acquire_thread_ownership", return_value=descriptor), \
                      patch.object(turn_proxy, "record_completion", side_effect=complete), \
                      patch.object(turn_proxy.asyncio, "sleep", new=AsyncMock()), \
                      patch.object(turn_proxy, "track_background", side_effect=tasks.append):
                     await turn_proxy.recover_receipt_obligations("token")
                     await asyncio.gather(*tasks)
                 self.assertEqual(attempts, 2)
-                for descriptor in descriptors:
-                    with self.assertRaises(OSError):
-                        os.fstat(descriptor)
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
 
     async def test_quarantine_only_admission_recovers_authoritative_turn(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -970,6 +1112,79 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                      patch.object(turn_proxy, "acquire_thread_ownership", return_value=owner):
                     await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
                 self.assertEqual(list((root / "quarantine").glob("*.json")), [])
+                with self.assertRaises(OSError):
+                    os.fstat(owner)
+
+    async def test_local_rejection_cleanup_survives_relay_cancellation_and_barrier_retry(self):
+        thread_id = "00000000-0000-4000-8000-000000000086"
+
+        class DisconnectingClient(FakeClient):
+            def __init__(self, requests):
+                super().__init__(requests)
+                self.rejection_attempted = asyncio.Event()
+
+            async def send(self, raw):
+                value = json.loads(raw)
+                if value.get("id") == 2:
+                    self.rejection_attempted.set()
+                    raise ConnectionError("presentation socket closed")
+                await super().send(raw)
+
+        class EndingUpstream(FakeUpstream):
+            def __init__(self, messages, client):
+                super().__init__(messages)
+                self.client = client
+
+            async def __anext__(self):
+                while not self.sent:
+                    await asyncio.sleep(0)
+                if self.messages:
+                    return self.messages.pop(0)
+                await self.client.rejection_attempted.wait()
+                raise StopAsyncIteration
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                descriptor = authority.acquire_lock(thread_id)
+                try:
+                    authority.initialize_locked(thread_id, None, None,
+                                                explicit_model=False, explicit_effort=False)
+                finally:
+                    os.close(descriptor)
+                client = DisconnectingClient([
+                    {"id": 1, "method": "thread/resume", "params": {"threadId": thread_id}},
+                    {"id": 2, "method": "thread/settings/update", "params": {
+                        "threadId": thread_id, "collaborationMode": "invalid"}},
+                ])
+                upstream = EndingUpstream(
+                    [{"id": 1, "result": {"thread": {"id": thread_id}}}], client)
+                owner = os.open("/dev/null", os.O_RDONLY)
+                original_sync = receipt_journal._sync_directories
+                failed = False
+
+                def fail_once(*paths):
+                    nonlocal failed
+                    if not failed and paths and paths[0] == root / "quarantine":
+                        failed = True
+                        raise OSError("post-unlink cleanup barrier")
+                    return original_sync(*paths)
+
+                with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                     patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                     patch.object(turn_proxy, "acquire_thread_ownership", return_value=owner), \
+                     patch.object(receipt_journal, "_sync_directories", side_effect=fail_once), \
+                     patch.object(turn_proxy.asyncio, "sleep", new=AsyncMock()):
+                    await asyncio.wait_for(turn_proxy.handler(client), timeout=3)
+                self.assertTrue(failed)
+                self.assertEqual(list((root / "quarantine").glob("*.json")), [])
+                cleanups = list((root / "quarantine-cleanups").glob("*.json"))
+                self.assertTrue(cleanups)
+                self.assertTrue(all(json.loads(path.read_text())["state"] == "confirmed"
+                                    for path in cleanups))
+                self.assertFalse(receipt_journal.unresolved_for_thread(thread_id))
                 with self.assertRaises(OSError):
                     os.fstat(owner)
 

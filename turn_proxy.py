@@ -391,26 +391,41 @@ async def recover_receipt_obligations(token: str) -> None:
     """Recover crash-left receipts before this generation begins admission."""
     grouped: dict[str, dict[str, list]] = {}
     for path, obligation in receipt_journal.list_obligations():
-        grouped.setdefault(obligation["thread_id"], {"obligations": [], "quarantines": [], "retirements": []})[
+        grouped.setdefault(obligation["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
             "obligations"].append((path, obligation))
     for path, quarantine in receipt_journal.list_quarantines():
         if quarantine["method"] == "turn/start" and quarantine.get("route") is not None:
-            grouped.setdefault(quarantine["thread_id"], {"obligations": [], "quarantines": [], "retirements": []})[
+            grouped.setdefault(quarantine["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
                 "quarantines"].append((path, quarantine))
         # Legacy v1 quarantines intentionally remain as unresolved ownership
         # fences. They lack route/turn evidence and must never be fabricated.
     for marker, retirement in receipt_journal.list_retirements():
-        grouped.setdefault(retirement["thread_id"], {"obligations": [], "quarantines": [], "retirements": []})[
+        grouped.setdefault(retirement["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
             "retirements"].append((marker, retirement))
+    for marker, cleanup in receipt_journal.list_quarantine_cleanups():
+        grouped.setdefault(cleanup["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
+            "cleanups"].append((marker, cleanup))
 
     async def recover_thread(thread_id: str, state: dict[str, list]) -> None:
         obligations = state["obligations"]
         quarantines = state["quarantines"]
         retirements = state["retirements"]
-        while (any(path.exists() for path, _value in obligations)
-               or any(path.exists() for path, _value in quarantines)
-               or bool(retirements)):
-            descriptor = None
+        cleanups = state["cleanups"]
+
+        def refresh_retirements() -> None:
+            known = {marker for marker, _value in retirements}
+            for marker, retirement in receipt_journal.list_retirements():
+                if retirement["thread_id"] == thread_id and marker not in known:
+                    retirements.append((marker, retirement))
+
+        def refresh_cleanups() -> None:
+            known = {marker for marker, _value in cleanups}
+            for marker, cleanup in receipt_journal.list_quarantine_cleanups():
+                if cleanup["thread_id"] == thread_id and marker not in known:
+                    cleanups.append((marker, cleanup))
+
+        descriptor = None
+        while descriptor is None:
             try:
                 descriptor = acquire_thread_ownership(thread_id, existing_thread=False,
                                                       allow_unresolved=True)
@@ -418,93 +433,107 @@ async def recover_receipt_obligations(token: str) -> None:
                 # A healthy predecessor owns this thread. Serve unrelated
                 # threads and retry without stealing until its journal drains.
                 await asyncio.sleep(1)
-                continue
-            completion_tasks: list[asyncio.Task] = []
-            try:
-                for marker, retirement in list(retirements):
-                    receipt_journal.confirm_retired(
-                        receipt_journal.JOURNAL_DIR / retirement["obligation"])
-                    retirements.remove((marker, retirement))
-                for quarantine_path, _quarantine in quarantines:
-                    if not quarantine_path.exists():
-                        continue
-                    quarantine = receipt_journal.load_quarantine(quarantine_path)
-                    route = quarantine["route"]
-                    turn_id = quarantine.get("turn_id")
-                    if turn_id is None:
-                        latest = await latest_host_turn_id(thread_id, token)
-                        if latest is None or latest == route.get("baseline_turn_id"):
-                            raise RuntimeError("Dispatched admission has no authoritative turn yet.")
-                        turn_id = latest
-                        receipt_journal.bind_quarantine(quarantine_path, turn_id=turn_id)
-                    journal_path = receipt_journal.path_for(thread_id, turn_id)
-                    receipt_journal.create(thread_id, turn_id, route)
-                    info = {**route, "journal_path": journal_path}
-                    record_accepted_receipt(thread_id, turn_id, info)
-                    if not any(path == journal_path for path, _value in obligations):
-                        obligations.append((journal_path, receipt_journal.load(journal_path)))
-                    receipt_journal.clear_quarantine(quarantine_path)
-                for path, obligation in obligations:
-                    if not path.exists():
-                        continue
-                    obligation = receipt_journal.load(path)
-                    if receipt_journal.retire_if_complete(path):
-                        continue
-                    for stage in ("accepted", "terminal", "usage"):
-                        if obligation[stage]:
+        try:
+            while True:
+                refresh_retirements()
+                refresh_cleanups()
+                if (not any(path.exists() for path, _value in obligations)
+                        and not any(path.exists() for path, _value in quarantines)
+                        and not retirements and not cleanups):
+                    return
+                completion_tasks: list[asyncio.Task] = []
+                try:
+                    for marker, retirement in list(retirements):
+                        receipt_journal.confirm_retired(
+                            receipt_journal.JOURNAL_DIR / retirement["obligation"])
+                        retirements.remove((marker, retirement))
+                    for marker, cleanup in list(cleanups):
+                        receipt_journal.confirm_quarantine_cleanup(marker)
+                        cleanups.remove((marker, cleanup))
+                    for quarantine_path, _quarantine in quarantines:
+                        if not quarantine_path.exists():
                             continue
-                        receipt_id = f"{thread_id}:{obligation['turn_id']}:{stage}"
-                        payload = canonical_receipt(receipt_id)
-                        if payload is not None:
-                            info = {"journal_path": path}
-                            reconcile_receipt_stage(
-                                thread_id, obligation["turn_id"], info, stage, payload["event"],
-                                {key: value for key, value in payload.items()
-                                 if key not in {"event", "receipt_id", "thread_id", "turn_id"}})
-                    if not path.exists():
-                        continue
-                    obligation = receipt_journal.load(path)
-                    terminal, usage, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
-                    if obligation["terminal"]:
-                        terminal.set()
-                    if obligation["usage"]:
-                        usage.set()
-                    info = {"model": obligation["model"], "effort": obligation["effort"],
-                            "class": obligation["task_class"], "started_at": time.monotonic(),
-                            "delivered": finished, "terminal_recorded": terminal,
-                            "usage_recorded": usage, "finished": finished,
-                            "usage_tracker": UsageTracker(), "journal_path": path}
-                    if not obligation["accepted"]:
-                        record_accepted_receipt(thread_id, obligation["turn_id"], info)
-                    task = asyncio.create_task(record_completion(thread_id, obligation["turn_id"],
-                                                                 info, token, finished))
-                    completion_tasks.append(task)
-                if completion_tasks:
-                    done, pending_tasks = await asyncio.wait(
-                        completion_tasks, return_when=asyncio.FIRST_EXCEPTION)
-                    failure = next((task.exception() for task in done
-                                    if not task.cancelled() and task.exception() is not None), None)
-                    if failure is not None:
-                        for task in pending_tasks:
-                            task.cancel()
-                        await asyncio.gather(*completion_tasks, return_exceptions=True)
-                        raise failure
-                    await asyncio.gather(*pending_tasks)
-                return
-            except asyncio.CancelledError:
-                for task in completion_tasks:
-                    task.cancel()
-                await asyncio.gather(*completion_tasks, return_exceptions=True)
-                raise
-            except Exception:
-                # Setup is transactional with respect to ownership. Cancel any
-                # partially started recovery before releasing and retrying.
-                for task in completion_tasks:
-                    task.cancel()
-                await asyncio.gather(*completion_tasks, return_exceptions=True)
-            finally:
-                os.close(descriptor)
-            await asyncio.sleep(1)
+                        quarantine = receipt_journal.load_quarantine(quarantine_path)
+                        route = quarantine["route"]
+                        turn_id = quarantine.get("turn_id")
+                        if turn_id is None:
+                            latest = await latest_host_turn_id(thread_id, token)
+                            if latest is None or latest == route.get("baseline_turn_id"):
+                                raise RuntimeError("Dispatched admission has no authoritative turn yet.")
+                            turn_id = latest
+                            receipt_journal.bind_quarantine(quarantine_path, turn_id=turn_id)
+                        journal_path = receipt_journal.path_for(thread_id, turn_id)
+                        receipt_journal.create(thread_id, turn_id, route)
+                        info = {**route, "journal_path": journal_path}
+                        record_accepted_receipt(thread_id, turn_id, info)
+                        if not any(path == journal_path for path, _value in obligations):
+                            obligations.append((journal_path, receipt_journal.load(journal_path)))
+                        receipt_journal.clear_quarantine(quarantine_path)
+                    for path, obligation in obligations:
+                        if not path.exists():
+                            continue
+                        obligation = receipt_journal.load(path)
+                        if receipt_journal.retire_if_complete(path):
+                            continue
+                        for stage in ("accepted", "terminal", "usage"):
+                            if obligation[stage]:
+                                continue
+                            receipt_id = f"{thread_id}:{obligation['turn_id']}:{stage}"
+                            payload = canonical_receipt(receipt_id)
+                            if payload is not None:
+                                info = {"journal_path": path}
+                                reconcile_receipt_stage(
+                                    thread_id, obligation["turn_id"], info, stage, payload["event"],
+                                    {key: value for key, value in payload.items()
+                                     if key not in {"event", "receipt_id", "thread_id", "turn_id"}})
+                        if not path.exists():
+                            continue
+                        obligation = receipt_journal.load(path)
+                        terminal, usage, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                        if obligation["terminal"]:
+                            terminal.set()
+                        if obligation["usage"]:
+                            usage.set()
+                        info = {"model": obligation["model"], "effort": obligation["effort"],
+                                "class": obligation["task_class"], "started_at": time.monotonic(),
+                                "delivered": finished, "terminal_recorded": terminal,
+                                "usage_recorded": usage, "finished": finished,
+                                "usage_tracker": UsageTracker(), "journal_path": path}
+                        if not obligation["accepted"]:
+                            record_accepted_receipt(thread_id, obligation["turn_id"], info)
+                        task = asyncio.create_task(record_completion(
+                            thread_id, obligation["turn_id"], info, token, finished))
+                        completion_tasks.append(task)
+                    if completion_tasks:
+                        done, pending_tasks = await asyncio.wait(
+                            completion_tasks, return_when=asyncio.FIRST_EXCEPTION)
+                        failure = next((task.exception() for task in done
+                                        if not task.cancelled() and task.exception() is not None), None)
+                        if failure is not None:
+                            for task in pending_tasks:
+                                task.cancel()
+                            await asyncio.gather(*completion_tasks, return_exceptions=True)
+                            raise failure
+                        await asyncio.gather(*pending_tasks)
+                        refresh_retirements()
+                        refresh_cleanups()
+                        if not retirements and not cleanups:
+                            return
+                except asyncio.CancelledError:
+                    for task in completion_tasks:
+                        task.cancel()
+                    await asyncio.gather(*completion_tasks, return_exceptions=True)
+                    raise
+                except Exception:
+                    # Retain ownership and refresh marker work before retrying.
+                    for task in completion_tasks:
+                        task.cancel()
+                    await asyncio.gather(*completion_tasks, return_exceptions=True)
+                    refresh_retirements()
+                    refresh_cleanups()
+                    await asyncio.sleep(1)
+        finally:
+            os.close(descriptor)
 
     for thread_id, state in grouped.items():
         track_background(asyncio.create_task(recover_thread(thread_id, state)))
@@ -565,6 +594,7 @@ async def handler(client: websockets.ServerConnection) -> None:
         request_lifecycles: dict[object, str] = {}
         server_request_ids: set[object] = set()
         request_ledger: dict[object, dict[str, Any]] = {}
+        cleanup_tasks: dict[object, asyncio.Task] = {}
         owner_descriptors: dict[str, int] = {}
         reserved_descriptors: dict[str, int] = {}
         catalog: dict[str, Any] | None = None
@@ -644,7 +674,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                 await client.send(json.dumps({"id": request_id, "error": {
                     "code": code, "message": message}}))
             finally:
-                await abandon_request(request_id, method, params)
+                task = cleanup_tasks.get(request_id)
+                if task is None:
+                    task = asyncio.create_task(abandon_request(request_id, method, params))
+                    cleanup_tasks[request_id] = task
+                    task.add_done_callback(lambda completed, rid=request_id:
+                        cleanup_tasks.pop(rid, None)
+                        if cleanup_tasks.get(rid) is completed else None)
+                    track_background(task)
+                await asyncio.shield(task)
 
         async def reconcile_authority_notification(thread_id: str) -> None:
             waiting = authority_waiting.get(thread_id)
@@ -824,9 +862,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                             os.close(descriptor)
                         if authority.get("explicit_model"):
                             params["model"] = authority.get("model")
+                            collaboration = params.get("collaborationMode")
+                            if isinstance(collaboration, dict) and isinstance(collaboration.get("settings"), dict):
+                                collaboration["settings"]["model"] = authority.get("model")
                             manual_model_threads.add(params["threadId"])
                         if authority.get("explicit_effort"):
                             params["effort"] = authority.get("effort")
+                            collaboration = params.get("collaborationMode")
+                            if isinstance(collaboration, dict) and isinstance(collaboration.get("settings"), dict):
+                                collaboration["settings"]["reasoning_effort"] = authority.get("effort")
                             manual_effort_threads.add(params["threadId"])
                         raw = json.dumps(request)
                         prompt = "\n".join(x.get("text", "") for x in params.get("input", [])
@@ -1139,6 +1183,8 @@ async def handler(client: websockets.ServerConnection) -> None:
         for task in pending_tasks:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks.values())
         if active:
             await asyncio.gather(*(info["finished"].wait() for info in active.values()))
         for update in authority_pending.values():
