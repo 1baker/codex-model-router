@@ -15,7 +15,7 @@ import websockets
 
 from host_control import HOST_URL, _read_token, _rpc
 from modellabs import config_for, record_route, route
-from telemetry import UsageTracker, record as record_metric, usage_from
+from telemetry import UsageTracker, record as _record_metric, usage_from
 from adaptive_policy import adapt, note_followup
 from paths import ROOT, proxy_port, proxy_revision
 from thread_owner import acquire_thread_ownership
@@ -31,6 +31,54 @@ CONTINUATIONS = {"ok go", "go ahead", "continue", "yes", "do it"}
 CATALOG_TTL_SECONDS = 60.0
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 UNRESOLVED_FILE = ROOT / f"proxy-unresolved-{PROXY_PORT}.state"
+ACCOUNTING_BLOCKED = False
+
+
+def record_metric(event: str, **fields: Any) -> None:
+    global ACCOUNTING_BLOCKED
+    try:
+        _record_metric(event, **fields)
+    except Exception:
+        ACCOUNTING_BLOCKED = True
+        raise
+
+
+def _authority_path(thread_id: str) -> Any:
+    return ROOT / "thread-authority" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
+
+
+def write_choice_authority(thread_id: str, model: str | None, effort: str | None, *,
+                           explicit_model: bool, explicit_effort: bool) -> None:
+    """Persist prompt-free explicit-choice provenance for every mutation path."""
+    path = _authority_path(thread_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    existing: dict[str, Any] = {}
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        if candidate.get("thread_id") == thread_id:
+            existing = candidate
+    except (OSError, ValueError, TypeError):
+        pass
+    payload = {"thread_id": thread_id,
+               "model": model if explicit_model else existing.get("model"),
+               "effort": effort if explicit_effort else existing.get("effort"),
+               "explicit_model": explicit_model or bool(existing.get("explicit_model")),
+               "explicit_effort": explicit_effort or bool(existing.get("explicit_effort"))}
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def apply_launch_choice(raw: str, choice: dict[str, Any] | None) -> str:
@@ -150,6 +198,12 @@ def selection_is_listed(catalog: dict[str, Any], choice: dict[str, Any]) -> bool
     return False
 
 
+def is_rpc_response(message: dict[str, Any]) -> bool:
+    """Distinguish replies from server requests that use an independent ID space."""
+    return ("method" not in message and message.get("id") is not None
+            and ("result" in message or "error" in message))
+
+
 async def live_catalog(token: str) -> dict[str, Any]:
     async with websockets.connect(HOST_URL, additional_headers={"Authorization": f"Bearer {token}"},
                                   open_timeout=2, close_timeout=1, max_size=MAX_MESSAGE_BYTES) as ws:
@@ -160,17 +214,20 @@ async def live_catalog(token: str) -> dict[str, Any]:
 
 
 def finalize_route(thread_id: str, turn_id: str, route_info: dict[str, Any], *,
-                   status: str, elapsed_ms: int | None, terminal_source: str) -> None:
+                   status: str, elapsed_ms: int | None, terminal_source: str,
+                   usage_complete: bool) -> None:
     """Emit exactly one terminal and one exact-or-unavailable usage receipt."""
     if not route_info["terminal_recorded"].is_set():
-        route_info["terminal_recorded"].set()
         record_metric("turn_completed", thread_id=thread_id, turn_id=turn_id,
                       model=route_info["model"], effort=route_info["effort"],
                       task_class=route_info["class"], elapsed_ms=elapsed_ms,
                       status=status, source=terminal_source, usage=None)
+        route_info["terminal_recorded"].set()
     if not route_info["usage_recorded"].is_set():
-        route_info["usage_recorded"].set()
-        usage, unavailable_reason = route_info["usage_tracker"].outcome()
+        if usage_complete:
+            usage, unavailable_reason = route_info["usage_tracker"].outcome()
+        else:
+            usage, unavailable_reason = None, "terminal_usage_boundary_unobserved"
         if usage is not None:
             record_metric("turn_usage", thread_id=thread_id, turn_id=turn_id,
                           model=route_info["model"], effort=route_info["effort"], usage=usage,
@@ -179,6 +236,7 @@ def finalize_route(thread_id: str, turn_id: str, route_info: dict[str, Any], *,
             record_metric("turn_usage_unavailable", thread_id=thread_id, turn_id=turn_id,
                           model=route_info["model"], effort=route_info["effort"],
                           reason=unavailable_reason)
+        route_info["usage_recorded"].set()
     route_info["finished"].set()
 
 
@@ -188,6 +246,17 @@ def track_background(task: asyncio.Task) -> None:
     os.chmod(UNRESOLVED_FILE, 0o600)
 
     def done(completed: asyncio.Task) -> None:
+        failed = completed.cancelled()
+        if not failed:
+            try:
+                failed = completed.exception() is not None
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                failed = True
+        if failed:
+            # Retain the completed task as an unresolved generation claim. A
+            # failed persistence/reconciliation attempt must never look settled.
+            UNRESOLVED_FILE.write_text(f"{os.getpid()} {len(BACKGROUND_TASKS)}\n", encoding="utf-8")
+            return
         BACKGROUND_TASKS.discard(completed)
         if BACKGROUND_TASKS:
             UNRESOLVED_FILE.write_text(f"{os.getpid()} {len(BACKGROUND_TASKS)}\n", encoding="utf-8")
@@ -217,13 +286,14 @@ async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, 
                 if delivered.is_set():
                     return
                 finalize_route(thread_id, turn_id, route_info, status=turn.get("status", "unknown"),
-                               elapsed_ms=turn.get("durationMs"), terminal_source="durable_poll")
+                               elapsed_ms=turn.get("durationMs"), terminal_source="durable_poll",
+                               usage_complete=False)
                 return
         except Exception:
             pass
         await asyncio.sleep(1)
     finalize_route(thread_id, turn_id, route_info, status="completion_unavailable",
-                   elapsed_ms=None, terminal_source="durable_poll_timeout")
+                   elapsed_ms=None, terminal_source="durable_poll_timeout", usage_complete=False)
 
 
 async def handler(client: websockets.ServerConnection) -> None:
@@ -269,12 +339,30 @@ async def handler(client: websockets.ServerConnection) -> None:
         ticket_explicit_model = bool((launch_choice or {}).get("explicit_model"))
         ticket_explicit_effort = bool((launch_choice or {}).get("explicit_effort"))
         manual_model_threads: set[str] = set()
+        manual_effort_threads: set[str] = set()
         active: dict[tuple[str, str], dict[str, Any]] = {}
         provisional: dict[str, list[dict[str, Any]]] = {}
         ownership_pending: set[object] = set()
+        admission_events: dict[object, asyncio.Event] = {}
         owner_descriptors: dict[str, int] = {}
         catalog: dict[str, Any] | None = None
         catalog_at = 0.0
+
+        def mark_admission_pending(request_id: object) -> None:
+            if request_id in admission_events:
+                return
+            event = asyncio.Event()
+            admission_events[request_id] = event
+
+            async def wait_for_receipt() -> None:
+                await event.wait()
+
+            track_background(asyncio.create_task(wait_for_receipt()))
+
+        def settle_admission(request_id: object) -> None:
+            event = admission_events.pop(request_id, None)
+            if event is not None:
+                event.set()
 
         async def inbound() -> None:
             nonlocal catalog, catalog_at, initial_preselection_available, launch_scope_available
@@ -304,6 +392,12 @@ async def handler(client: websockets.ServerConnection) -> None:
                     request = json.loads(raw)
                     params = request.get("params", {})
                     request_id = request.get("id")
+                    if ACCOUNTING_BLOCKED and request.get("method") in {"thread/start", "thread/resume", "turn/start"}:
+                        if request_id is not None:
+                            await client.send(json.dumps({"id": request_id, "error": {
+                                "code": -32006,
+                                "message": "ModelLabs accounting persistence is unhealthy; admission is fail-closed."}}))
+                        continue
                     if request.get("method") == "thread/start":
                         launch_scope_available = False
                     if request.get("method") in {"thread/fork", "thread/compact/start"}:
@@ -317,6 +411,10 @@ async def handler(client: websockets.ServerConnection) -> None:
                         if resume_thread and resume_thread not in owner_descriptors:
                             try:
                                 owner_descriptors[resume_thread] = acquire_thread_ownership(resume_thread)
+                                write_choice_authority(
+                                    resume_thread, params.get("model"), params.get("effort"),
+                                    explicit_model=preserve_cli_model,
+                                    explicit_effort=preserve_cli_effort)
                             except Exception as exc:
                                 if request_id is not None:
                                     await client.send(json.dumps({"id": request_id, "error": {
@@ -324,9 +422,27 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 continue
                     if request.get("method") == "thread/start" and request_id is not None:
                         ownership_pending.add(request_id)
+                        mark_admission_pending(request_id)
+                    mutating_methods = {"turn/start", "turn/steer", "turn/interrupt",
+                                        "thread/settings/update", "turn/settings/update"}
+                    if request.get("method") in mutating_methods:
+                        mutation_thread = params.get("threadId") if isinstance(params, dict) else None
+                        if not mutation_thread or mutation_thread not in owner_descriptors:
+                            if request_id is not None:
+                                await client.send(json.dumps({"id": request_id, "error": {
+                                    "code": -32003,
+                                    "message": "ModelLabs rejected a thread mutation from a non-owner connection."}}))
+                            continue
                     if (request.get("method") in {"thread/settings/update", "turn/settings/update"}
-                            and isinstance(params, dict) and params.get("model") and params.get("threadId")):
-                        manual_model_threads.add(params["threadId"])
+                            and isinstance(params, dict) and params.get("threadId")
+                            and (params.get("model") is not None or params.get("effort") is not None)):
+                        if params.get("model") is not None:
+                            manual_model_threads.add(params["threadId"])
+                        if params.get("effort") is not None:
+                            manual_effort_threads.add(params["threadId"])
+                        write_choice_authority(params["threadId"], params.get("model"), params.get("effort"),
+                                               explicit_model=params.get("model") is not None,
+                                               explicit_effort=params.get("effort") is not None)
                     if request.get("method") == "turn/start" and isinstance(params, dict):
                         prompt = "\n".join(x.get("text", "") for x in params.get("input", [])
                                            if isinstance(x, dict) and x.get("type") == "text")
@@ -335,13 +451,14 @@ async def handler(client: websockets.ServerConnection) -> None:
                 except (TypeError, ValueError, AttributeError):
                     pass
                 thread_id = params.get("threadId") if isinstance(params, dict) else None
-                manual = thread_id in manual_model_threads
+                manual_model = thread_id in manual_model_threads
+                manual_effort = thread_id in manual_effort_threads
                 automatic_initial = initial_preselection_available
                 routed, info = route_request(raw, context,
-                                             automatic_initial or preserve_cli_model or ticket_explicit_model or manual,
-                                             automatic_initial or preserve_cli_effort or ticket_explicit_effort or manual,
-                                             preserve_cli_model or ticket_explicit_model or manual,
-                                             preserve_cli_effort or ticket_explicit_effort or manual)
+                                             automatic_initial or preserve_cli_model or ticket_explicit_model or manual_model,
+                                             automatic_initial or preserve_cli_effort or ticket_explicit_effort or manual_effort,
+                                             preserve_cli_model or ticket_explicit_model or manual_model,
+                                             preserve_cli_effort or ticket_explicit_effort or manual_effort)
                 if info:
                     if automatic_initial:
                         initial_preselection_available = False
@@ -363,6 +480,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                         request_id = json.loads(routed).get("id")
                         if request_id is not None:
                             pending[request_id] = info
+                            mark_admission_pending(request_id)
                             if info.get("thread_id"):
                                 provisional.setdefault(info["thread_id"], [])
                     except ValueError:
@@ -382,7 +500,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                 turn = params.get("turn") or {}
                 finalize_route(key[0], key[1], route_info, status=turn.get("status", "unknown"),
                                elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
-                               terminal_source="live_event")
+                               terminal_source="live_event", usage_complete=True)
                 active.pop(key, None)
 
         async def outbound() -> None:
@@ -390,17 +508,24 @@ async def handler(client: websockets.ServerConnection) -> None:
                 try:
                     response = json.loads(raw)
                     response_id = response.get("id")
-                    if response_id in ownership_pending:
+                    rpc_response = is_rpc_response(response)
+                    if rpc_response and response_id in ownership_pending:
                         ownership_pending.discard(response_id)
                         thread_id = ((response.get("result") or {}).get("thread") or {}).get("id")
                         if thread_id:
                             try:
                                 owner_descriptors[thread_id] = acquire_thread_ownership(
                                     thread_id, existing_thread=False)
+                                write_choice_authority(
+                                    thread_id, (launch_choice or {}).get("model"),
+                                    (launch_choice or {}).get("effort"),
+                                    explicit_model=ticket_explicit_model,
+                                    explicit_effort=ticket_explicit_effort)
                             except Exception as exc:
                                 response = {"id": response_id, "error": {"code": -32003, "message": str(exc)}}
                                 raw = json.dumps(response)
-                    info = pending.pop(response.get("id"), None)
+                        settle_admission(response_id)
+                    info = pending.pop(response_id, None) if rpc_response else None
                     if info:
                         result = response.get("result") or {}
                         info["status"] = "accepted_by_host" if "error" not in response else "rejected_by_host"
@@ -425,6 +550,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                             buffered = provisional.pop(info["thread_id"], [])
                             for event in buffered:
                                 await account_event(event)
+                        settle_admission(response_id)
                     params = response.get("params") or {}
                     event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
                     if (response.get("method") in {"thread/tokenUsage/updated", "turn/completed"}
@@ -435,23 +561,25 @@ async def handler(client: websockets.ServerConnection) -> None:
                         await account_event(response)
                 except (TypeError, ValueError, KeyError):
                     pass
-                await client.send(raw)
+                try:
+                    await client.send(raw)
+                except Exception:
+                    # The proxy still owns admission/accounting even after the
+                    # presentation socket disappears. Keep consuming upstream.
+                    pass
 
         tasks = [asyncio.create_task(inbound()), asyncio.create_task(outbound())]
         done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         if tasks[0] in done and (ownership_pending or pending):
-            deadline = time.monotonic() + 15
-            while (ownership_pending or pending) and not tasks[1].done() and time.monotonic() < deadline:
+            while (ownership_pending or pending) and not tasks[1].done():
                 await asyncio.sleep(0.05)
         for request_id in list(ownership_pending):
             record_metric("route_admission_unresolved", request_id=str(request_id),
                           reason="client_disconnected_before_admission_receipt")
-            ownership_pending.discard(request_id)
         for request_id, info in list(pending.items()):
             record_metric("route_admission_unresolved", request_id=str(request_id),
                           thread_id=info.get("thread_id"), model=info.get("model"),
                           effort=info.get("effort"), reason="admission_receipt_timeout")
-            pending.pop(request_id, None)
         for task in pending_tasks:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)

@@ -25,6 +25,7 @@ PYTHON_FILES = [
 ]
 SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
 SHELL_PATH_END = "# <<< ModelLabs managed Codex route <<<"
+OWNED_MANIFEST = "owned-files.json"
 
 
 def default_home() -> Path:
@@ -33,6 +34,120 @@ def default_home() -> Path:
 
 def set_private(path: Path) -> None:
     path.chmod(0o600)
+
+
+def _digest_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _atomic_bytes(path: Path, content: bytes, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _service_bytes(home: Path) -> bytes:
+    unit = (SOURCE / "systemd/modellabs-proxy.service.in").read_text(encoding="utf-8")
+    unit = unit.replace("@HOME@", str(Path.home())).replace("@MODELLABS_HOME@", str(home))
+    unit = unit.replace("@PYTHON@", str(home / "venv/bin/python"))
+    return unit.encode()
+
+
+def _install_payloads(home: Path, codex_home: Path, *, include_service: bool = True) -> dict[Path, bytes]:
+    payloads = {home / name: (SOURCE / name).read_bytes()
+                for name in PYTHON_FILES + ["requirements.txt"]}
+    for source in (SOURCE / "benchmarks").rglob("*"):
+        if source.is_file():
+            payloads[home / "benchmarks" / source.relative_to(SOURCE / "benchmarks")] = source.read_bytes()
+    payloads[codex_home / "skills/model-selector/SKILL.md"] = (SOURCE / "SKILL.md").read_bytes()
+    payloads[codex_home / "skills/model-selector/agents/openai.yaml"] = (SOURCE / "openai.yaml").read_bytes()
+    if include_service:
+        payloads[Path.home() / ".config/systemd/user/modellabs-proxy.service"] = _service_bytes(home)
+    return payloads
+
+
+def _legacy_owned(path: Path, source_content: bytes) -> bool:
+    """Recognize only narrow artifacts written by pre-manifest ModelLabs."""
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return False
+    if path.name in PYTHON_FILES:
+        return content.splitlines()[:1] == source_content.splitlines()[:1]
+    markers = {
+        "requirements.txt": b"websockets",
+        "SKILL.md": b"name: model-selector",
+        "openai.yaml": b"Model Selector",
+        "modellabs-proxy.service": b"Description=ModelLabs",
+        "smoke.json": b'"schema"',
+    }
+    marker = markers.get(path.name)
+    return marker is not None and marker in content
+
+
+def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream: Path,
+                               codex_home: Path | None = None) -> None:
+    manifest_path = home / OWNED_MANIFEST
+    manifest_valid = True
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", {})
+    except (OSError, ValueError, TypeError):
+        manifest = {}
+        manifest_valid = not manifest_path.exists()
+    try:
+        state = json.loads((home / "install-state.json").read_text(encoding="utf-8"))
+        legacy_install = Path(state.get("home", "")).expanduser().resolve() == home
+    except (OSError, ValueError, TypeError):
+        legacy_install = False
+    codex_root = (codex_home or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))).expanduser()
+    ancillary = [home / OWNED_MANIFEST, home / "host-token", home / "real-codex-path",
+                 home / "managed-codex-path", home / "install-state.json",
+                 Path.home() / ".profile", Path.home() / ".bashrc",
+                 codex_root / "config.toml", codex_root / "hooks.json"]
+    for path in ancillary:
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked ModelLabs mutation destination {path}.")
+        try:
+            if os.path.samefile(path, upstream):
+                raise RuntimeError(f"Refusing destination aliasing upstream Codex: {path}.")
+        except OSError as exc:
+            raise RuntimeError(f"Cannot validate ModelLabs mutation destination {path}.") from exc
+    if manifest_path.exists() and (not manifest_valid or not isinstance(manifest, dict)):
+        raise RuntimeError(f"Refusing unrelated ownership manifest {manifest_path}.")
+    for path, source_content in payloads.items():
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing to replace symlinked ModelLabs destination {path}.")
+        try:
+            if os.path.samefile(path, upstream):
+                raise RuntimeError(f"Refusing to replace destination aliasing upstream Codex: {path}.")
+            actual = _digest_bytes(path.read_bytes())
+        except OSError as exc:
+            raise RuntimeError(f"Cannot validate ModelLabs destination {path}.") from exc
+        if manifest.get(str(path)) == actual:
+            continue
+        if legacy_install and _legacy_owned(path, source_content):
+            continue
+        raise RuntimeError(f"Refusing to replace unrelated ModelLabs destination {path}.")
+
+
+def write_owned_manifest(home: Path, payloads: dict[Path, bytes]) -> None:
+    content = json.dumps({"schema": "modellabs.owned_files.v1",
+                          "files": {str(path): _digest_bytes(value)
+                                    for path, value in sorted(payloads.items(), key=lambda item: str(item[0]))}},
+                         indent=2, sort_keys=True).encode() + b"\n"
+    _atomic_bytes(home / OWNED_MANIFEST, content, 0o600)
 
 
 def create_venv(venv: Path) -> None:
@@ -242,12 +357,8 @@ def ensure_managed_route_precedence(path: Path, bin_dir: Path) -> None:
 
 
 def write_service(home: Path) -> Path:
-    unit = (SOURCE / "systemd/modellabs-proxy.service.in").read_text(encoding="utf-8")
-    unit = unit.replace("@HOME@", str(Path.home())).replace("@MODELLABS_HOME@", str(home))
-    unit = unit.replace("@PYTHON@", str(home / "venv/bin/python"))
     path = Path.home() / ".config/systemd/user/modellabs-proxy.service"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(unit, encoding="utf-8")
+    _atomic_bytes(path, _service_bytes(home))
     return path
 
 
@@ -298,10 +409,11 @@ def install(args: argparse.Namespace) -> None:
     home = args.home.expanduser().resolve()
     real_codex = discover_real_codex(home, args.bin_dir)
     write_wrappers(home, args.bin_dir, real_codex, dry_run=True)
+    payloads = _install_payloads(home, args.codex_home, include_service=not args.no_service)
+    preflight_install_payloads(payloads, home, real_codex, args.codex_home)
     home.mkdir(parents=True, exist_ok=True)
-    for name in PYTHON_FILES + ["requirements.txt"]:
-        shutil.copy2(SOURCE / name, home / name)
-    shutil.copytree(SOURCE / "benchmarks", home / "benchmarks", dirs_exist_ok=True)
+    for path, content in payloads.items():
+        _atomic_bytes(path, content)
     (home / "systemd").mkdir(exist_ok=True)
     token = home / "host-token"
     if not token.exists():
@@ -317,11 +429,6 @@ def install(args: argparse.Namespace) -> None:
         if not uv:
             raise RuntimeError("The created environment has no pip; install uv or recreate it with python3-venv.")
         subprocess.run([uv, "pip", "install", "--quiet", "--python", str(venv / "bin/python"), "-r", str(home / "requirements.txt")], check=True, capture_output=True)
-    skill = args.codex_home / "skills/model-selector"
-    skill.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(SOURCE / "SKILL.md", skill / "SKILL.md")
-    (skill / "agents").mkdir(exist_ok=True)
-    shutil.copy2(SOURCE / "openai.yaml", skill / "agents/openai.yaml")
     configure_codex(args.codex_home, home)
     (home / "real-codex-path").write_text(str(real_codex) + "\n", encoding="utf-8")
     set_private(home / "real-codex-path")
@@ -330,7 +437,9 @@ def install(args: argparse.Namespace) -> None:
     write_wrappers(home, args.bin_dir, real_codex)
     for shell_file in (Path.home() / ".profile", Path.home() / ".bashrc"):
         ensure_managed_route_precedence(shell_file, args.bin_dir)
-    service = write_service(home)
+    service = (Path.home() / ".config/systemd/user/modellabs-proxy.service"
+               if args.no_service else write_service(home))
+    write_owned_manifest(home, payloads)
     service_enabled = False if args.no_service else enable_service()
     retire_old_supervisors(home, installed_proxy_port(home))
     state = home / "install-state.json"

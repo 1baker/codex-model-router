@@ -15,9 +15,12 @@ import turn_proxy
 class FakeClient:
     def __init__(self, request, authorization="Bearer token"):
         self.request = SimpleNamespace(headers={"Authorization": authorization}, path="/")
-        self._request = json.dumps(request)
-        self._done_id = request.get("id")
-        self._sent_request = False
+        requests = request if isinstance(request, list) else [request]
+        self._requests = [json.dumps(item) for item in requests]
+        self._request_ids = [item.get("id") for item in requests]
+        self._done_id = requests[-1].get("id")
+        self._request_index = 0
+        self._response_events = [asyncio.Event() for _ in requests]
         self.done = asyncio.Event()
         self.sent = []
 
@@ -25,14 +28,21 @@ class FakeClient:
         return self
 
     async def __anext__(self):
-        if not self._sent_request:
-            self._sent_request = True
-            return self._request
+        if self._request_index < len(self._requests):
+            if self._request_index:
+                await self._response_events[self._request_index - 1].wait()
+            raw = self._requests[self._request_index]
+            self._request_index += 1
+            return raw
         await self.done.wait()
         raise StopAsyncIteration
 
     async def send(self, raw):
         self.sent.append(json.loads(raw))
+        response_id = self.sent[-1].get("id")
+        for index, request_id in enumerate(self._request_ids):
+            if response_id == request_id:
+                self._response_events[index].set()
         if self.sent[-1].get("id") == self._done_id:
             self.done.set()
 
@@ -57,6 +67,20 @@ class FakeUpstream:
         if self.messages:
             return self.messages.pop(0)
         await asyncio.Future()
+
+
+class TwoRequestUpstream(FakeUpstream):
+    async def __anext__(self):
+        while not self.sent or (self._yielded >= 1 and len(self.sent) < 2):
+            await asyncio.sleep(0)
+        if self.messages:
+            self._yielded += 1
+            return self.messages.pop(0)
+        await asyncio.Future()
+
+    def __init__(self, messages):
+        super().__init__(messages)
+        self._yielded = 0
 
 
 class ConnectContext:
@@ -118,6 +142,64 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(metrics, [])
 
+    async def test_durable_completion_never_promotes_partial_usage_to_exact(self):
+        delivered = asyncio.Event()
+        metrics = []
+        info = self.route_info(delivered)
+        sample = {"inputTokens": 8, "cachedInputTokens": 0, "cacheWriteInputTokens": 0,
+                  "outputTokens": 2, "reasoningOutputTokens": 0, "totalTokens": 10}
+        info["usage_tracker"].observe({"tokenUsage": {"last": sample, "total": sample}})
+
+        async def rpc(_ws, method, _params, _request_id):
+            return {"data": [{"id": "turn", "status": "completed"}]} if method == "thread/turns/list" else {}
+
+        with patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(FakeUpstream([]))), \
+             patch.object(turn_proxy, "_rpc", side_effect=rpc), \
+             patch.object(turn_proxy, "record_metric", side_effect=lambda event, **fields: metrics.append((event, fields))):
+            await turn_proxy.record_completion("thread", "turn", info, "token", delivered)
+        self.assertEqual([event for event, _ in metrics], ["turn_completed", "turn_usage_unavailable"])
+        self.assertEqual(metrics[-1][1]["reason"], "terminal_usage_boundary_unobserved")
+
+    def test_receipt_flags_are_committed_only_after_persistence(self):
+        info = self.route_info(asyncio.Event())
+        with patch.object(turn_proxy, "record_metric", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                turn_proxy.finalize_route("thread", "turn", info, status="completed",
+                                          elapsed_ms=1, terminal_source="live_event",
+                                          usage_complete=True)
+        self.assertFalse(info["terminal_recorded"].is_set())
+        self.assertFalse(info["usage_recorded"].is_set())
+        self.assertFalse(info["finished"].is_set())
+
+    def test_server_request_id_never_resolves_pending_rpc(self):
+        self.assertFalse(turn_proxy.is_rpc_response({"id": 7, "method": "item/tool/requestUserInput",
+                                                     "params": {}}))
+        self.assertTrue(turn_proxy.is_rpc_response({"id": 7, "result": {"turn": {"id": "t"}}}))
+
+    def test_choice_authority_preserves_per_field_user_pins(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory, patch.object(turn_proxy, "ROOT", Path(directory)):
+            turn_proxy.write_choice_authority("thread", "gpt-pinned", None,
+                                              explicit_model=True, explicit_effort=False)
+            turn_proxy.write_choice_authority("thread", None, "high",
+                                              explicit_model=False, explicit_effort=True)
+            payload = json.loads(turn_proxy._authority_path("thread").read_text(encoding="utf-8"))
+        self.assertEqual(payload["model"], "gpt-pinned")
+        self.assertEqual(payload["effort"], "high")
+        self.assertTrue(payload["explicit_model"])
+        self.assertTrue(payload["explicit_effort"])
+
+    async def test_foreign_thread_mutation_is_rejected_before_forwarding(self):
+        request = {"id": 9, "method": "turn/start", "params": {
+            "threadId": "foreign", "input": [{"type": "text", "text": "hello"}]}}
+        client = FakeClient(request)
+        upstream = FakeUpstream([])
+        with patch.object(turn_proxy, "_read_token", return_value="token"), \
+             patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)):
+            await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+        self.assertEqual(upstream.sent, [])
+        self.assertEqual(client.sent[0]["error"]["code"], -32003)
+
     def test_launch_choice_scopes_thread_before_creation(self):
         raw = json.dumps({"id": 2, "method": "thread/start", "params": {
             "cwd": "/tmp", "config": {"model_reasoning_effort": "high",
@@ -163,7 +245,7 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
                  "outputTokens": 2, "reasoningOutputTokens": 0, "totalTokens": 10}
         total = {"inputTokens": 108, "cachedInputTokens": 0, "cacheWriteInputTokens": 0,
                  "outputTokens": 2, "reasoningOutputTokens": 0, "totalTokens": 110}
-        upstream = FakeUpstream([
+        upstream = TwoRequestUpstream([
             {"method": "thread/tokenUsage/updated", "params": {
                 "threadId": thread_id, "turnId": turn_id,
                 "tokenUsage": {"last": usage, "total": total}}},
@@ -175,15 +257,18 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
             "threadId": thread_id,
             "input": [{"type": "text", "text": "Format values as CSV."}],
         }}
-        client = FakeClient(request)
+        resume = {"id": 6, "method": "thread/resume", "params": {"threadId": thread_id}}
+        client = FakeClient([resume, request])
         metrics = []
 
         async def catalog(_token):
             return {"data": [{"id": "gpt-5.6-luna", "hidden": False,
                               "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}
 
+        upstream.messages.insert(0, json.dumps({"id": 6, "result": {"thread": {"id": thread_id}}}))
         with patch.object(turn_proxy, "_read_token", return_value="token"), \
              patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+             patch.object(turn_proxy, "acquire_thread_ownership", return_value=os.open("/dev/null", os.O_RDONLY)), \
              patch.object(turn_proxy, "live_catalog", side_effect=catalog), \
              patch.object(turn_proxy, "record_metric", side_effect=lambda event, **fields: metrics.append((event, fields))), \
              patch.object(turn_proxy, "record_route"), \
@@ -192,7 +277,7 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
 
         usage_records = [fields for event, fields in metrics if event == "turn_usage"]
         unavailable = [fields for event, fields in metrics if event == "turn_usage_unavailable"]
-        self.assertEqual(len(usage_records), 1)
+        self.assertEqual(len(usage_records), 1, metrics)
         self.assertEqual(usage_records[0]["usage"]["totalTokens"], 10)
         self.assertEqual(unavailable, [])
 

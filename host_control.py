@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,15 @@ THREAD_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 
 class ModelHostError(Exception):
     """An expected control-plane or validation failure."""
+
+
+def _choice_authority(thread_id: str) -> dict[str, Any]:
+    path = ROOT / "thread-authority" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if payload.get("thread_id") == thread_id else {}
 
 
 def _read_token() -> str:
@@ -65,6 +75,12 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
         raise ModelHostError("A valid model ID is required.")
     if effort is not None and effort not in {"none", "low", "medium", "high", "xhigh", "max", "ultra"}:
         raise ModelHostError("Unsupported reasoning effort.")
+    authority = _choice_authority(thread_id)
+    if authority.get("explicit_model") and authority.get("model") != model:
+        raise ModelHostError("The model is explicitly pinned by this managed thread's user choice.")
+    if (effort is not None and authority.get("explicit_effort")
+            and authority.get("effort") != effort):
+        raise ModelHostError("The reasoning effort is explicitly pinned by this managed thread's user choice.")
 
     token = _read_token()
     try:

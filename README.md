@@ -143,7 +143,10 @@ In plain English: This is now the normal way to start Codex. The installed
 wrapper sends the TUI through the local authenticated proxy, which reads the
 first `turn/start` before any model responds and chooses a suitable model and
 reasoning effort. The TUI remains the owner of approvals, user input, and
-interrupts. `codex-model-host start` remains
+interrupts. Every thread mutation must come from the connection holding that
+thread's ownership lock, and server-to-client requests use a separate RPC
+namespace so approval or input request IDs cannot consume admission state.
+`codex-model-host start` remains
 as a compatibility alias, while `codex-direct` bypasses routing for maintenance
 or recovery. Starting a chat only starts local processes and does not modify
 your project files.
@@ -162,7 +165,8 @@ open, preventing two processes from writing to the same chat.
 Noninteractive inference through `codex exec` currently fails closed. Use the
 interactive TUI until ModelLabs can bind that branch to admission, terminal,
 cancellation, and exact-or-unavailable usage receipts. Help and version queries
-remain available and `codex-direct` remains the explicit maintenance bypass.
+remain available only as genuine exec options; flag-shaped literal prompts
+remain refused. `codex-direct` remains the explicit maintenance bypass.
 
 ## Verification
 

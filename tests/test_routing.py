@@ -17,6 +17,7 @@ from turn_proxy import route_request, selection_is_listed
 from adaptive_policy import adapt, record_outcome
 from health_dashboard import summarize
 import model_host_launcher
+import host_control
 from model_host_launcher import (_command_index, _exec_prompt, _explicit_setting,
                                  _exec_subcommand, _create_launch_ticket, _routed_exec_command,
                                  _routed_interactive_args, run_routed_exec)
@@ -184,6 +185,10 @@ class RoutingTests(unittest.TestCase):
             _routed_exec_command(Path("/real/codex"),
                                  ["exec", "-c", "mcp_servers.cloudflare.enabled=true", "hello"],
                                  choice)
+        with self.assertRaisesRegex(ValueError, "MCP scope overrides"):
+            _routed_exec_command(Path("/real/codex"),
+                                 ["exec", "-cmcp_servers.cloudflare.enabled=true", "hello"],
+                                 choice)
 
     def test_review_and_resume_delimiter_prompts_are_classified_correctly(self):
         self.assertEqual(_exec_prompt(["exec", "review", "focus on races"]), "focus on races")
@@ -199,6 +204,21 @@ class RoutingTests(unittest.TestCase):
         with patch.object(sys, "stdin", SimpleNamespace(isatty=lambda: True)):
             with self.assertRaisesRegex(ValueError, "exec resume"):
                 run_routed_exec(["exec", "--json", "resume", "thread-id", "continue"])
+        with patch.object(sys, "stdin", SimpleNamespace(isatty=lambda: True)), \
+             patch.object(model_host_launcher, "real_codex_binary", return_value=Path("/real/codex")):
+            with self.assertRaisesRegex(ValueError, "exact-or-unavailable usage receipts"):
+                run_routed_exec(["exec", "--", "--help"])
+
+    def test_explicit_authority_blocks_agent_model_override(self):
+        import asyncio
+        thread_id = "00000000-0000-4000-8000-000000000004"
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": thread_id}), \
+             patch.object(host_control, "_choice_authority", return_value={
+                "explicit_model": True, "model": "gpt-pinned",
+                "explicit_effort": True, "effort": "high"}):
+            with self.assertRaisesRegex(host_control.ModelHostError, "explicitly pinned"):
+                asyncio.run(host_control.switch_current_turn_model(
+                    thread_id, "gpt-other", "high"))
 
     def test_global_option_operands_do_not_become_commands(self):
         args = ["--enable", "search", "--remote", "ws://example", "-a", "never",
@@ -331,6 +351,25 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(real.read_bytes(), original)
             self.assertFalse((bin_dir / "codex").is_symlink())
             self.assertIn(str(real), (bin_dir / "codex-direct").read_text(encoding="utf-8"))
+
+    def test_install_payload_preflight_refuses_unrelated_and_upstream_aliases(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, codex_home = root / "home", root / "codex"
+            home.mkdir()
+            upstream = root / "real-codex"
+            upstream.write_text("#!/bin/sh\n", encoding="utf-8")
+            upstream.chmod(0o755)
+            payloads = installer._install_payloads(home, codex_home, include_service=False)
+            unrelated = home / "adaptive_policy.py"
+            unrelated.write_text("user file\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unrelated"):
+                installer.preflight_install_payloads(payloads, home, upstream, codex_home)
+            unrelated.unlink()
+            unrelated.symlink_to(upstream)
+            with self.assertRaisesRegex(RuntimeError, "symlinked"):
+                installer.preflight_install_payloads(payloads, home, upstream, codex_home)
 
 
 if __name__ == "__main__":

@@ -278,6 +278,8 @@ def _explicit_mcp_scope(args: list[str]) -> list[str]:
     for index, item in enumerate(args[:delimiter]):
         if item in {"-c", "--config"} and index + 1 < delimiter:
             config = args[index + 1]
+        elif item.startswith("-c") and not item.startswith("--") and len(item) > 2:
+            config = item[2:]
         elif item.startswith("--config="):
             config = item.split("=", 1)[1]
         else:
@@ -405,7 +407,9 @@ def run_routed_exec(args: list[str]) -> int:
             "cannot be guaranteed; use interactive codex resume THREAD_ID instead."
         )
     binary = real_codex_binary()
-    if any(item in {"-h", "--help", "-V", "--version"} for item in args):
+    delimiter = args.index("--") if "--" in args else len(args)
+    if prompt is None and any(item in {"-h", "--help", "-V", "--version"}
+                              for item in args[:delimiter]):
         command = [str(binary), *args]
         if stdin_text is None:
             os.execve(binary, command, os.environ.copy())
