@@ -113,9 +113,11 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
             return {}
 
         upstream = FakeUpstream([])
+        def reconcile(_thread, _turn, _info, _stage, event, fields):
+            metrics.append((event, fields))
         with patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
              patch.object(turn_proxy, "_rpc", side_effect=rpc), \
-             patch.object(turn_proxy, "record_metric", side_effect=lambda event, **fields: metrics.append((event, fields))):
+             patch.object(turn_proxy, "reconcile_receipt_stage", side_effect=reconcile):
             await turn_proxy.record_completion(
                 "thread", "turn", self.route_info(delivered),
                 "token", delivered)
@@ -155,16 +157,18 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
         async def rpc(_ws, method, _params, _request_id):
             return {"data": [{"id": "turn", "status": "completed"}]} if method == "thread/turns/list" else {}
 
+        def reconcile(_thread, _turn, _info, _stage, event, fields):
+            metrics.append((event, fields))
         with patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(FakeUpstream([]))), \
              patch.object(turn_proxy, "_rpc", side_effect=rpc), \
-             patch.object(turn_proxy, "record_metric", side_effect=lambda event, **fields: metrics.append((event, fields))):
+             patch.object(turn_proxy, "reconcile_receipt_stage", side_effect=reconcile):
             await turn_proxy.record_completion("thread", "turn", info, "token", delivered)
         self.assertEqual([event for event, _ in metrics], ["turn_completed", "turn_usage_unavailable"])
         self.assertEqual(metrics[-1][1]["reason"], "terminal_usage_boundary_unobserved")
 
     def test_receipt_flags_are_committed_only_after_persistence(self):
         info = self.route_info(asyncio.Event())
-        with patch.object(turn_proxy, "record_metric", side_effect=OSError("disk full")):
+        with patch.object(turn_proxy, "reconcile_receipt_stage", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 turn_proxy.finalize_route("thread", "turn", info, status="completed",
                                           elapsed_ms=1, terminal_source="live_event",
@@ -287,6 +291,7 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
                      patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
                      patch.object(turn_proxy, "acquire_thread_ownership", return_value=os.open("/dev/null", os.O_RDONLY)), \
                      patch.object(turn_proxy, "live_catalog", side_effect=catalog), \
+                     patch.object(turn_proxy, "latest_host_turn_id", new=AsyncMock(return_value=None)), \
                      patch.object(turn_proxy, "record_metric", side_effect=lambda event, **fields: metrics.append((event, fields))), \
                      patch.object(turn_proxy, "record_route"), \
                      patch.object(turn_proxy, "record_completion", side_effect=completed):

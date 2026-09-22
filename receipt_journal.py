@@ -51,10 +51,30 @@ def _atomic(path: Path, value: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _barrier(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    for directory_path in (path.parent, path.parent.parent):
+        directory = os.open(directory_path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 def create(thread_id: str, turn_id: str, route: dict[str, Any]) -> dict[str, Any]:
     path = path_for(thread_id, turn_id)
     if path.exists():
-        return load(path)
+        value = load(path)
+        if (value["thread_id"] != thread_id or value["turn_id"] != turn_id
+                or value["model"] != route["model"] or value["effort"] != route["effort"]
+                or value["task_class"] != route["class"]):
+            raise RuntimeError("Receipt obligation identity collision.")
+        _barrier(path)
+        return value
     value = {
         "schema": SCHEMA, "thread_id": thread_id, "turn_id": turn_id,
         "model": route["model"], "effort": route["effort"], "task_class": route["class"],
@@ -96,13 +116,48 @@ def unresolved_for_thread(thread_id: str) -> bool:
     return False
 
 
-def quarantine(thread_id: str, request_id: object, method: str) -> Path:
-    request_digest = hashlib.sha256(str(request_id).encode()).hexdigest()
-    key = hashlib.sha256(f"{thread_id}\0{request_digest}\0{method}".encode()).hexdigest()
+def quarantine(thread_id: str, lifecycle_id: str, method: str) -> Path:
+    if not isinstance(lifecycle_id, str) or not lifecycle_id:
+        raise ValueError("lifecycle identity must be a nonempty string")
+    lifecycle_digest = hashlib.sha256(lifecycle_id.encode()).hexdigest()
+    key = hashlib.sha256(f"{thread_id}\0{lifecycle_digest}\0{method}".encode()).hexdigest()
     path = QUARANTINE_DIR / f"{key}.json"
-    _atomic(path, {"schema": "modellabs.lifecycle_quarantine.v1", "thread_id": thread_id,
-                   "request_digest": request_digest, "method": method})
+    _atomic(path, {"schema": "modellabs.lifecycle_quarantine.v2", "thread_id": thread_id,
+                   "lifecycle_digest": lifecycle_digest, "method": method,
+                   "route": None, "turn_id": None})
     return path
+
+
+def bind_quarantine(path: Path, *, route: dict[str, Any] | None = None,
+                    turn_id: str | None = None) -> dict[str, Any]:
+    value = load_quarantine(path)
+    if route is not None:
+        value["route"] = {key: route.get(key) for key in
+                          ("model", "effort", "class", "task_bucket", "adaptive_reason",
+                           "prompt_sha256", "baseline_turn_id")}
+    if turn_id is not None:
+        value["turn_id"] = turn_id
+    _atomic(path, value)
+    return value
+
+
+def load_quarantine(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(value, dict)
+            or value.get("schema") != "modellabs.lifecycle_quarantine.v2"
+            or not isinstance(value.get("thread_id"), str)
+            or not isinstance(value.get("lifecycle_digest"), str)
+            or not isinstance(value.get("method"), str)
+            or value.get("route") is not None and not isinstance(value.get("route"), dict)
+            or value.get("turn_id") is not None and not isinstance(value.get("turn_id"), str)):
+        raise RuntimeError(f"Invalid lifecycle quarantine {path}.")
+    return value
+
+
+def list_quarantines() -> list[tuple[Path, dict[str, Any]]]:
+    if not QUARANTINE_DIR.exists():
+        return []
+    return [(path, load_quarantine(path)) for path in sorted(QUARANTINE_DIR.glob("*.json"))]
 
 
 def clear_quarantine(path: Path) -> None:
@@ -142,3 +197,15 @@ def retire_if_complete(path: Path) -> bool:
     finally:
         os.close(directory)
     return True
+
+
+def confirm_retired(path: Path) -> None:
+    if path.exists():
+        raise RuntimeError("Receipt obligation is not retired.")
+    if path.parent.exists():
+        for directory_path in (path.parent, path.parent.parent):
+            directory = os.open(directory_path, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)

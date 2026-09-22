@@ -212,6 +212,32 @@ def is_rpc_response(message: dict[str, Any]) -> bool:
             and ("result" in message or "error" in message))
 
 
+def reconcile_receipt_stage(thread_id: str, turn_id: str, route_info: dict[str, Any],
+                            stage: str, event: str, fields: dict[str, Any]) -> None:
+    """Persist or replay one canonical stage, then close its journal barrier."""
+    receipt_id = f"{thread_id}:{turn_id}:{stage}"
+    payload = canonical_receipt(receipt_id)
+    if payload is None:
+        record_metric(event, receipt_id=receipt_id, thread_id=thread_id, turn_id=turn_id,
+                      **fields)
+    else:
+        record_metric(payload["event"], **{key: value for key, value in payload.items()
+                                           if key != "event"})
+    journal_path = route_info.get("journal_path")
+    if journal_path is None:
+        raise RuntimeError("Receipt stage has no durable obligation.")
+    if journal_path.exists():
+        receipt_journal.mark(journal_path, stage)
+    else:
+        # A final mark may have unlinked the complete obligation before its
+        # directory barrier failed. Only all three canonical receipts prove
+        # this is retirement rather than a never-created journal.
+        for required in ("accepted", "terminal", "usage"):
+            if canonical_receipt(f"{thread_id}:{turn_id}:{required}") is None:
+                raise RuntimeError("Receipt obligation disappeared before completion.")
+        receipt_journal.confirm_retired(journal_path)
+
+
 async def live_catalog(token: str) -> dict[str, Any]:
     async with websockets.connect(HOST_URL, additional_headers={"Authorization": f"Bearer {token}"},
                                   open_timeout=2, close_timeout=1, max_size=MAX_MESSAGE_BYTES) as ws:
@@ -221,46 +247,57 @@ async def live_catalog(token: str) -> dict[str, Any]:
         return await _rpc(ws, "model/list", {}, 2)
 
 
+async def latest_host_turn_id(thread_id: str, token: str) -> str | None:
+    async with websockets.connect(HOST_URL, additional_headers={"Authorization": f"Bearer {token}"},
+                                  open_timeout=2, close_timeout=1, max_size=MAX_MESSAGE_BYTES) as ws:
+        await _rpc(ws, "initialize", {"clientInfo": {"name": "modellabs-recovery", "version": "0.1"},
+                                      "capabilities": {"experimentalApi": True}}, 1)
+        await ws.send(json.dumps({"method": "initialized", "params": {}}))
+        turns = await _rpc(ws, "thread/turns/list", {"threadId": thread_id, "limit": 1,
+                                                     "itemsView": "full",
+                                                     "sortDirection": "desc"}, 2)
+    turn = next(iter(turns.get("data", [])), None)
+    return turn.get("id") if isinstance(turn, dict) and isinstance(turn.get("id"), str) else None
+
+
 def finalize_route(thread_id: str, turn_id: str, route_info: dict[str, Any], *,
                    status: str, elapsed_ms: int | None, terminal_source: str,
                    usage_complete: bool) -> None:
     """Emit exactly one terminal and one exact-or-unavailable usage receipt."""
-    journal_path = route_info.get("journal_path")
     if not route_info["terminal_recorded"].is_set():
-        record_metric("turn_completed", receipt_id=f"{thread_id}:{turn_id}:terminal",
-                      thread_id=thread_id, turn_id=turn_id, model=route_info["model"],
-                      effort=route_info["effort"], task_class=route_info["class"],
-                      elapsed_ms=elapsed_ms, status=status, source=terminal_source, usage=None)
-        if journal_path is not None:
-            receipt_journal.mark(journal_path, "terminal")
+        reconcile_receipt_stage(thread_id, turn_id, route_info, "terminal", "turn_completed", {
+            "model": route_info["model"], "effort": route_info["effort"],
+            "task_class": route_info["class"], "elapsed_ms": elapsed_ms, "status": status,
+            "source": terminal_source, "usage": None})
         route_info["terminal_recorded"].set()
     if not route_info["usage_recorded"].is_set():
-        if usage_complete:
-            usage, unavailable_reason = route_info["usage_tracker"].outcome()
+        existing = canonical_receipt(f"{thread_id}:{turn_id}:usage")
+        if existing is not None:
+            event, fields = existing["event"], {key: value for key, value in existing.items()
+                                                  if key not in {"event", "receipt_id",
+                                                                 "thread_id", "turn_id"}}
         else:
-            usage, unavailable_reason = None, "terminal_usage_boundary_unobserved"
-        if usage is not None:
-            record_metric("turn_usage", receipt_id=f"{thread_id}:{turn_id}:usage",
-                          thread_id=thread_id, turn_id=turn_id, model=route_info["model"],
-                          effort=route_info["effort"], usage=usage,
-                          source="proxy_thread_usage_delta")
-        else:
-            record_metric("turn_usage_unavailable", receipt_id=f"{thread_id}:{turn_id}:usage",
-                          thread_id=thread_id, turn_id=turn_id, model=route_info["model"],
-                          effort=route_info["effort"], reason=unavailable_reason)
-        if journal_path is not None:
-            receipt_journal.mark(journal_path, "usage")
+            if usage_complete:
+                usage, unavailable_reason = route_info["usage_tracker"].outcome()
+            else:
+                usage, unavailable_reason = None, "terminal_usage_boundary_unobserved"
+            if usage is not None:
+                event, fields = "turn_usage", {"model": route_info["model"],
+                    "effort": route_info["effort"], "usage": usage,
+                    "source": "proxy_thread_usage_delta"}
+            else:
+                event, fields = "turn_usage_unavailable", {"model": route_info["model"],
+                    "effort": route_info["effort"], "reason": unavailable_reason}
+        reconcile_receipt_stage(thread_id, turn_id, route_info, "usage", event, fields)
         route_info["usage_recorded"].set()
     route_info["finished"].set()
 
 
 def record_accepted_receipt(thread_id: str, turn_id: str, route_info: dict[str, Any]) -> None:
-    record_metric("route_accepted", receipt_id=f"{thread_id}:{turn_id}:accepted",
-                  thread_id=thread_id, turn_id=turn_id, model=route_info["model"],
-                  effort=route_info["effort"], task_class=route_info["class"],
-                  task_bucket=route_info.get("task_bucket"),
-                  adaptive_reason=route_info.get("adaptive_reason"))
-    receipt_journal.mark(route_info["journal_path"], "accepted")
+    reconcile_receipt_stage(thread_id, turn_id, route_info, "accepted", "route_accepted", {
+        "model": route_info["model"], "effort": route_info["effort"],
+        "task_class": route_info["class"], "task_bucket": route_info.get("task_bucket"),
+        "adaptive_reason": route_info.get("adaptive_reason")})
 
 
 def track_background(task: asyncio.Task) -> None:
@@ -323,11 +360,20 @@ async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, 
 
 async def recover_receipt_obligations(token: str) -> None:
     """Recover crash-left receipts before this generation begins admission."""
-    grouped: dict[str, list[tuple[Any, dict[str, Any]]]] = {}
+    grouped: dict[str, dict[str, list]] = {}
     for path, obligation in receipt_journal.list_obligations():
-        grouped.setdefault(obligation["thread_id"], []).append((path, obligation))
-    async def recover_thread(thread_id: str, obligations: list[tuple[Any, dict[str, Any]]]) -> None:
-        while any(path.exists() for path, _obligation in obligations):
+        grouped.setdefault(obligation["thread_id"], {"obligations": [], "quarantines": []})[
+            "obligations"].append((path, obligation))
+    for path, quarantine in receipt_journal.list_quarantines():
+        if quarantine["method"] == "turn/start" and quarantine.get("route") is not None:
+            grouped.setdefault(quarantine["thread_id"], {"obligations": [], "quarantines": []})[
+                "quarantines"].append((path, quarantine))
+
+    async def recover_thread(thread_id: str, state: dict[str, list]) -> None:
+        obligations = state["obligations"]
+        quarantines = state["quarantines"]
+        while (any(path.exists() for path, _value in obligations)
+               or any(path.exists() for path, _value in quarantines)):
             descriptor = None
             try:
                 descriptor = acquire_thread_ownership(thread_id, existing_thread=False,
@@ -339,7 +385,25 @@ async def recover_receipt_obligations(token: str) -> None:
                 continue
             completion_tasks: list[asyncio.Task] = []
             try:
-                finished_events: list[asyncio.Event] = []
+                for quarantine_path, _quarantine in quarantines:
+                    if not quarantine_path.exists():
+                        continue
+                    quarantine = receipt_journal.load_quarantine(quarantine_path)
+                    route = quarantine["route"]
+                    turn_id = quarantine.get("turn_id")
+                    if turn_id is None:
+                        latest = await latest_host_turn_id(thread_id, token)
+                        if latest is None or latest == route.get("baseline_turn_id"):
+                            raise RuntimeError("Dispatched admission has no authoritative turn yet.")
+                        turn_id = latest
+                        receipt_journal.bind_quarantine(quarantine_path, turn_id=turn_id)
+                    journal_path = receipt_journal.path_for(thread_id, turn_id)
+                    receipt_journal.create(thread_id, turn_id, route)
+                    info = {**route, "journal_path": journal_path}
+                    record_accepted_receipt(thread_id, turn_id, info)
+                    if not any(path == journal_path for path, _value in obligations):
+                        obligations.append((journal_path, receipt_journal.load(journal_path)))
+                    receipt_journal.clear_quarantine(quarantine_path)
                 for path, obligation in obligations:
                     if not path.exists():
                         continue
@@ -352,12 +416,14 @@ async def recover_receipt_obligations(token: str) -> None:
                         receipt_id = f"{thread_id}:{obligation['turn_id']}:{stage}"
                         payload = canonical_receipt(receipt_id)
                         if payload is not None:
-                            record_metric(payload["event"], **{key: value for key, value in payload.items()
-                                                                if key != "event"})
-                            receipt_journal.mark(path, stage)
-                            obligation[stage] = True
+                            info = {"journal_path": path}
+                            reconcile_receipt_stage(
+                                thread_id, obligation["turn_id"], info, stage, payload["event"],
+                                {key: value for key, value in payload.items()
+                                 if key not in {"event", "receipt_id", "thread_id", "turn_id"}})
                     if not path.exists():
                         continue
+                    obligation = receipt_journal.load(path)
                     terminal, usage, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
                     if obligation["terminal"]:
                         terminal.set()
@@ -373,10 +439,17 @@ async def recover_receipt_obligations(token: str) -> None:
                     task = asyncio.create_task(record_completion(thread_id, obligation["turn_id"],
                                                                  info, token, finished))
                     completion_tasks.append(task)
-                    finished_events.append(finished)
-                for task in completion_tasks:
-                    track_background(task)
-                await asyncio.gather(*(event.wait() for event in finished_events))
+                if completion_tasks:
+                    done, pending_tasks = await asyncio.wait(
+                        completion_tasks, return_when=asyncio.FIRST_EXCEPTION)
+                    failure = next((task.exception() for task in done
+                                    if not task.cancelled() and task.exception() is not None), None)
+                    if failure is not None:
+                        for task in pending_tasks:
+                            task.cancel()
+                        await asyncio.gather(*completion_tasks, return_exceptions=True)
+                        raise failure
+                    await asyncio.gather(*pending_tasks)
                 return
             except asyncio.CancelledError:
                 for task in completion_tasks:
@@ -393,8 +466,8 @@ async def recover_receipt_obligations(token: str) -> None:
                 os.close(descriptor)
             await asyncio.sleep(1)
 
-    for thread_id, obligations in grouped.items():
-        track_background(asyncio.create_task(recover_thread(thread_id, obligations)))
+    for thread_id, state in grouped.items():
+        track_background(asyncio.create_task(recover_thread(thread_id, state)))
 
 
 async def handler(client: websockets.ServerConnection) -> None:
@@ -449,6 +522,7 @@ async def handler(client: websockets.ServerConnection) -> None:
         authority_waiting: dict[str, tuple[object, dict[str, Any]]] = {}
         authority_notifications: dict[str, dict[str, Any]] = {}
         lifecycle_pending: dict[object, Any] = {}
+        request_lifecycles: dict[object, str] = {}
         server_request_ids: set[object] = set()
         request_ledger: dict[object, dict[str, Any]] = {}
         owner_descriptors: dict[str, int] = {}
@@ -474,6 +548,37 @@ async def handler(client: websockets.ServerConnection) -> None:
             event = admission_events.pop(request_id, None)
             if event is not None:
                 event.set()
+
+        def begin_lifecycle(request_id: object, method: str) -> str:
+            lifecycle_id = f"{method}:{secrets.token_hex(16)}"
+            mark_admission_pending(lifecycle_id)
+            request_lifecycles[request_id] = lifecycle_id
+            return lifecycle_id
+
+        def begin_admission(request_id: object, thread_id: str, method: str) -> str:
+            lifecycle_id = begin_lifecycle(request_id, method)
+            lifecycle_pending[lifecycle_id] = receipt_journal.quarantine(
+                thread_id, lifecycle_id, method)
+            return lifecycle_id
+
+        def settle_request(request_id: object) -> None:
+            lifecycle_id = request_lifecycles.pop(request_id, None)
+            if lifecycle_id is not None:
+                settle_admission(lifecycle_id)
+
+        def abandon_request(request_id: object, method: str | None,
+                            params: dict[str, Any]) -> None:
+            pending.pop(request_id, None)
+            ownership_pending.discard(request_id)
+            update = authority_pending.pop(request_id, None)
+            if update is not None:
+                os.close(update["descriptor"])
+            if method == "thread/resume":
+                thread_id = params.get("threadId")
+                descriptor = reserved_descriptors.pop(thread_id, None)
+                if descriptor is not None:
+                    os.close(descriptor)
+            settle_request(request_id)
 
         def reconcile_authority_notification(thread_id: str) -> None:
             waiting = authority_waiting.get(thread_id)
@@ -524,6 +629,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                     continue
                 context = None
                 params: dict[str, Any] = {}
+                request_id = None
+                method = None
                 try:
                     request = json.loads(raw)
                     if not isinstance(request, dict):
@@ -601,12 +708,11 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     "code": -32003, "message": str(exc)}}))
                             continue
                         if request_id is not None:
-                            mark_admission_pending(request_id)
-                            lifecycle_pending[request_id] = receipt_journal.quarantine(
-                                resume_thread, request_id, method)
+                            begin_admission(request_id, resume_thread, method)
                     if method == "thread/start" and request_id is not None:
                         ownership_pending.add(request_id)
-                        mark_admission_pending(request_id)
+                        # The created thread ID is unknown until the response.
+                        begin_lifecycle(request_id, method)
                     if policy == "owner_mutation" or method == "turn/start":
                         mutation_thread = params.get("threadId") if isinstance(params, dict) else None
                         if not mutation_thread or mutation_thread not in owner_descriptors:
@@ -624,10 +730,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                             continue
                         if request_id is None:
                             continue
-                        if request_id not in lifecycle_pending:
-                            lifecycle_pending[request_id] = receipt_journal.quarantine(
-                                mutation_thread, request_id, method)
-                        mark_admission_pending(request_id)
+                        if request_id not in request_lifecycles:
+                            begin_admission(request_id, mutation_thread, method)
                     if (method in {"thread/settings/update", "turn/settings/update"}
                             and isinstance(params, dict) and params.get("threadId")):
                         nested = ((params.get("collaborationMode") or {}).get("settings") or {})
@@ -646,10 +750,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     "model": requested_model, "effort": requested_effort,
                                     "descriptor": descriptor}
                                 if method == "thread/settings/update":
-                                    lifecycle_id = f"settings:{secrets.token_hex(16)}"
+                                    lifecycle_id = request_lifecycles[request_id]
                                     authority_pending[request_id]["lifecycle_id"] = lifecycle_id
-                                    admission_events[lifecycle_id] = admission_events.pop(request_id)
-                                    lifecycle_pending[lifecycle_id] = lifecycle_pending.pop(request_id)
                     if method == "turn/start" and isinstance(params, dict):
                         descriptor = await acquire_authority_lock(params["threadId"])
                         try:
@@ -671,6 +773,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if request_id is not None:
                         await client.send(json.dumps({"id": request_id, "error": {
                             "code": -32003, "message": str(exc)}}))
+                        abandon_request(request_id, method, params)
                     continue
                 thread_id = params.get("threadId") if isinstance(params, dict) else None
                 manual_model = thread_id in manual_model_threads
@@ -686,12 +789,13 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if request_id is not None:
                         await client.send(json.dumps({"id": request_id, "error": {
                             "code": -32001, "message": f"ModelLabs routing failed closed: {type(exc).__name__}"}}))
-                        settle_admission(request_id)
+                        abandon_request(request_id, method, params)
                     continue
                 if method == "turn/start" and info is None:
                     if request_id is not None:
                         await client.send(json.dumps({"id": request_id, "error": {
                             "code": -32001, "message": "ModelLabs could not build a complete route."}}))
+                        abandon_request(request_id, method, params)
                     continue
                 if info:
                     if automatic_initial:
@@ -707,15 +811,27 @@ async def handler(client: websockets.ServerConnection) -> None:
                         if request_id is not None:
                             await client.send(json.dumps({"id": request_id, "error": {
                                 "code": -32001, "message": f"ModelLabs rejected turn before inference: {exc}"}}))
+                        abandon_request(request_id, method, params)
                         record_metric("route_rejected", thread_id=info.get("thread_id"), model=info.get("model"),
                                       effort=info.get("effort"), reason=type(exc).__name__)
-                        settle_admission(request_id)
                         continue
+                    lifecycle_id = request_lifecycles.get(request_id)
+                    quarantine_path = lifecycle_pending.get(lifecycle_id)
+                    if quarantine_path is not None:
+                        try:
+                            info["baseline_turn_id"] = await latest_host_turn_id(
+                                info["thread_id"], token)
+                            receipt_journal.bind_quarantine(quarantine_path, route=info)
+                        except Exception as exc:
+                            await client.send(json.dumps({"id": request_id, "error": {
+                                "code": -32001,
+                                "message": f"ModelLabs could not persist admission intent: {type(exc).__name__}"}}))
+                            abandon_request(request_id, method, params)
+                            continue
                     try:
                         request_id = json.loads(routed).get("id")
                         if request_id is not None:
                             pending[request_id] = info
-                            mark_admission_pending(request_id)
                             if info.get("thread_id"):
                                 provisional.setdefault(info["thread_id"], [])
                     except ValueError:
@@ -726,6 +842,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                 await upstream.send(routed)
 
         async def account_event(response: dict[str, Any]) -> None:
+            global ACCOUNTING_BLOCKED
             params = response.get("params") or {}
             event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
             key = (params.get("threadId"), event_turn_id)
@@ -736,9 +853,18 @@ async def handler(client: websockets.ServerConnection) -> None:
                 route_info["usage_tracker"].observe(params)
             if response.get("method") == "turn/completed":
                 turn = params.get("turn") or {}
-                finalize_route(key[0], key[1], route_info, status=turn.get("status", "unknown"),
-                               elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
-                               terminal_source="live_event", usage_complete=True)
+                while not route_info["finished"].is_set():
+                    try:
+                        finalize_route(key[0], key[1], route_info,
+                                       status=turn.get("status", "unknown"),
+                                       elapsed_ms=round((time.monotonic() - route_info["started_at"]) * 1000),
+                                       terminal_source="live_event", usage_complete=True)
+                    except Exception:
+                        ACCOUNTING_BLOCKED = True
+                        await asyncio.sleep(1)
+                        continue
+                    ACCOUNTING_BLOCKED = False
+                    break
                 active.pop(key, None)
 
         async def reconcile_and_retire(thread_id: str, turn_id: str,
@@ -789,6 +915,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                         if (authority_method == "thread/settings/update"
                                 and "error" not in response and response.get("result") == {}):
                             authority_pending.pop(response_id, None)
+                            request_lifecycles.pop(response_id, None)
                             authority_waiting[authority_update["thread"]] = (
                                 authority_update["lifecycle_id"], authority_update)
                             reconcile_authority_notification(authority_update["thread"])
@@ -818,13 +945,16 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 os.close(authority_update["descriptor"])
                             if (authority_method == "thread/settings/update"
                                     and "error" in response):
-                                settle_admission(authority_update["lifecycle_id"])
+                                settle_request(response_id)
                     if rpc_response and response_id in ownership_pending:
                         ownership_pending.discard(response_id)
                         thread_id = ((response.get("result") or {}).get("thread") or {}).get("id")
                         ownership_settled = False
                         if thread_id:
                             try:
+                                lifecycle_id = request_lifecycles[response_id]
+                                lifecycle_pending[lifecycle_id] = receipt_journal.quarantine(
+                                    thread_id, lifecycle_id, "thread/start-authority")
                                 owner_descriptors[thread_id] = acquire_thread_ownership(
                                     thread_id, existing_thread=False)
                                 write_choice_authority(
@@ -834,12 +964,10 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     explicit_effort=ticket_explicit_effort, initialize=True)
                                 ownership_settled = True
                             except Exception as exc:
-                                lifecycle_pending[response_id] = receipt_journal.quarantine(
-                                    thread_id, response_id, "thread/start-authority")
                                 response = {"id": response_id, "error": {"code": -32003, "message": str(exc)}}
                                 raw = json.dumps(response)
                         if ownership_settled:
-                            settle_admission(response_id)
+                            settle_request(response_id)
                     if (rpc_response and ledger_entry
                             and ledger_entry["method"] == "thread/resume"):
                         resume_thread = ledger_entry["thread_id"]
@@ -861,28 +989,30 @@ async def handler(client: websockets.ServerConnection) -> None:
                                           "terminal_recorded": terminal_recorded,
                                           "usage_recorded": asyncio.Event(), "finished": asyncio.Event(),
                                           "usage_tracker": UsageTracker()}
-                            active[(info["thread_id"], info["turn_id"])] = route_info
-                            try:
-                                receipt_journal.create(info["thread_id"], info["turn_id"], route_info)
-                                route_info["journal_path"] = receipt_journal.path_for(
-                                    info["thread_id"], info["turn_id"])
-                                task = asyncio.create_task(reconcile_and_retire(
-                                    info["thread_id"], info["turn_id"], route_info))
-                                track_background(task)
-                                settle_admission(response_id)
+                            lifecycle_id = request_lifecycles.get(response_id)
+                            quarantine_path = lifecycle_pending.get(lifecycle_id)
+                            while True:
                                 try:
+                                    if quarantine_path is None:
+                                        raise RuntimeError("Accepted turn lost its admission intent.")
+                                    if quarantine_path.exists():
+                                        receipt_journal.bind_quarantine(
+                                            quarantine_path, route=route_info,
+                                            turn_id=info["turn_id"])
+                                    receipt_journal.create(info["thread_id"], info["turn_id"], route_info)
+                                    route_info["journal_path"] = receipt_journal.path_for(
+                                        info["thread_id"], info["turn_id"])
                                     record_accepted_receipt(info["thread_id"], info["turn_id"], route_info)
+                                    ACCOUNTING_BLOCKED = False
+                                    break
                                 except Exception:
                                     ACCOUNTING_BLOCKED = True
-                            except Exception:
-                                ACCOUNTING_BLOCKED = True
-                                # Keep the lifecycle quarantine and ownership lock.
-                                # This in-process claim remains until persistence recovers.
-                                route_info["journal_path"] = receipt_journal.path_for(
-                                    info["thread_id"], info["turn_id"])
-                                task = asyncio.create_task(reconcile_and_retire(
-                                    info["thread_id"], info["turn_id"], route_info))
-                                track_background(task)
+                                    await asyncio.sleep(1)
+                            active[(info["thread_id"], info["turn_id"])] = route_info
+                            task = asyncio.create_task(reconcile_and_retire(
+                                info["thread_id"], info["turn_id"], route_info))
+                            track_background(task)
+                            settle_request(response_id)
                             buffered = provisional.pop(info["thread_id"], [])
                             for event in buffered:
                                 await account_event(event)
@@ -891,11 +1021,11 @@ async def handler(client: websockets.ServerConnection) -> None:
                         except Exception:
                             ACCOUNTING_BLOCKED = True
                         if info["status"] != "accepted_by_host":
-                            settle_admission(response_id)
-                    elif (rpc_response and response_id in admission_events
+                            settle_request(response_id)
+                    elif (rpc_response and response_id in request_lifecycles
                           and not (authority_update and authority_update["method"] == "thread/settings/update"
                                    and "error" not in response)):
-                        settle_admission(response_id)
+                        settle_request(response_id)
                     if response.get("method") == "thread/settings/updated":
                         notification = response.get("params") or {}
                         notification_thread = notification.get("threadId")
