@@ -14,7 +14,7 @@ from typing import Any
 
 import websockets
 
-from host_control import HOST_URL, _read_token, _rpc
+from host_control import HOST_URL, ModelHostError, _read_token, _rpc
 from modellabs import config_for, record_route, route
 from telemetry import UsageTracker, canonical_receipt, record as _record_metric, usage_from
 from adaptive_policy import adapt, note_followup
@@ -253,9 +253,15 @@ async def latest_host_turn_id(thread_id: str, token: str) -> str | None:
         await _rpc(ws, "initialize", {"clientInfo": {"name": "modellabs-recovery", "version": "0.1"},
                                       "capabilities": {"experimentalApi": True}}, 1)
         await ws.send(json.dumps({"method": "initialized", "params": {}}))
-        turns = await _rpc(ws, "thread/turns/list", {"threadId": thread_id, "limit": 1,
-                                                     "itemsView": "full",
-                                                     "sortDirection": "desc"}, 2)
+        try:
+            turns = await _rpc(ws, "thread/turns/list", {"threadId": thread_id, "limit": 1,
+                                                         "itemsView": "full",
+                                                         "sortDirection": "desc"}, 2)
+        except ModelHostError as exc:
+            message = str(exc)
+            if "is not materialized yet" in message and "before first user message" in message:
+                return None
+            raise
     turn = next(iter(turns.get("data", [])), None)
     return turn.get("id") if isinstance(turn, dict) and isinstance(turn.get("id"), str) else None
 

@@ -21,6 +21,19 @@ from test_turn_proxy import ConnectContext, FakeClient, FakeUpstream, TwoRequest
 
 
 class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unmaterialized_thread_has_no_prior_turn_but_other_host_errors_propagate(self):
+        unmaterialized = turn_proxy.ModelHostError(
+            "thread id is not materialized yet; thread/turns/list is unavailable before first user message")
+        upstream = FakeUpstream([])
+        with patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+             patch.object(turn_proxy, "_rpc", new=AsyncMock(side_effect=[{}, unmaterialized])):
+            self.assertIsNone(await turn_proxy.latest_host_turn_id("thread", "token"))
+        with patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+             patch.object(turn_proxy, "_rpc", new=AsyncMock(side_effect=[{},
+                          turn_proxy.ModelHostError("authorization failed")])):
+            with self.assertRaisesRegex(turn_proxy.ModelHostError, "authorization"):
+                await turn_proxy.latest_host_turn_id("thread", "token")
+
     def test_turn_route_normalizes_nested_effective_settings(self):
         request = {"id": 1, "method": "turn/start", "params": {
             "threadId": "thread", "model": "stale-top", "effort": "low",
