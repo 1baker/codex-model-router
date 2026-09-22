@@ -953,8 +953,6 @@ async def handler(client: websockets.ServerConnection) -> None:
                         if thread_id:
                             try:
                                 lifecycle_id = request_lifecycles[response_id]
-                                lifecycle_pending[lifecycle_id] = receipt_journal.quarantine(
-                                    thread_id, lifecycle_id, "thread/start-authority")
                                 owner_descriptors[thread_id] = acquire_thread_ownership(
                                     thread_id, existing_thread=False)
                                 write_choice_authority(
@@ -964,6 +962,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     explicit_effort=ticket_explicit_effort, initialize=True)
                                 ownership_settled = True
                             except Exception as exc:
+                                lifecycle_pending[lifecycle_id] = receipt_journal.quarantine(
+                                    thread_id, lifecycle_id, "thread/start-authority")
                                 response = {"id": response_id, "error": {"code": -32003, "message": str(exc)}}
                                 raw = json.dumps(response)
                         if ownership_settled:

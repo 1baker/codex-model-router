@@ -237,9 +237,13 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
             upstream = FakeUpstream([{"id": 2, "result": {"thread": {"id": thread_id}}}])
             client = FakeClient({"id": 2, "method": "thread/start", "params": {"cwd": "/tmp"}},
                                 f"Bearer token.launch-{ticket_id}")
+            def acquire(*_args, **_kwargs):
+                self.assertEqual(list((root / "quarantine").glob("*.json")), [])
+                return os.open("/dev/null", os.O_RDONLY)
             with patch.object(turn_proxy, "ROOT", root), patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"), \
                  patch.object(turn_proxy, "_read_token", return_value="token"), \
-                 patch.object(turn_proxy, "acquire_thread_ownership", side_effect=lambda *_args, **_kwargs: os.open("/dev/null", os.O_RDONLY)), \
+                 patch.object(turn_proxy, "acquire_thread_ownership", side_effect=acquire), \
                  patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)):
                 await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
             forwarded = upstream.sent[0]["params"]
