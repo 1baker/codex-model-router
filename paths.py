@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -19,6 +20,20 @@ ROOT = modellabs_home()
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
 REAL_CODEX_PATH_FILE = ROOT / "real-codex-path"
 MANAGED_CODEX_PATH_FILE = ROOT / "managed-codex-path"
+
+
+def proxy_revision() -> str:
+    """Identify the exact proxy/accounting implementation loaded at runtime."""
+    digest = hashlib.sha256()
+    for name in ("turn_proxy.py", "telemetry.py", "modellabs.py", "adaptive_policy.py"):
+        digest.update(name.encode())
+        digest.update((ROOT / name).read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def proxy_port(revision: str) -> int:
+    """Use a release-specific loopback generation so old sessions can drain."""
+    return 46000 + int(revision[:8], 16) % 16000
 
 
 def real_codex_binary() -> Path:
@@ -55,7 +70,10 @@ def real_codex_binary() -> Path:
                 continue
             if managed.exists() and not managed.is_symlink() and os.path.samefile(resolved, managed):
                 continue
-            if b"model_host_launcher.py" in resolved.read_bytes()[:4096]:
+            prefix = resolved.read_bytes()[:4096]
+            if b"ModelLabs managed wrapper" in prefix or b"ModelLabs recovery wrapper" in prefix:
+                continue
+            if b"model_host_launcher.py" in prefix:
                 continue
             return resolved
         except OSError:

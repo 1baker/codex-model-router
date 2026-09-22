@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
+import signal
 import shlex
 import shutil
 import stat
@@ -125,15 +127,24 @@ def discover_real_codex(home: Path, bin_dir: Path) -> Path:
         Path("/snap/bin/codex"),
     ])
     shim = (bin_dir.expanduser().absolute() / "codex")
+    recovery = (bin_dir.expanduser().absolute() / "codex-direct")
     for candidate in candidates:
         candidate = candidate.expanduser()
         try:
             resolved = candidate.resolve(strict=True)
-            if resolved == shim.resolve(strict=False):
+            lexical = candidate.absolute()
+            # A symlink at the managed path may still be the only legitimate
+            # upstream installation. Preserve its resolved target. A regular
+            # managed entry and the recovery wrapper are never upstreams.
+            if lexical == recovery or (lexical == shim and not shim.is_symlink()):
                 continue
             if resolved.is_file() and os.access(resolved, os.X_OK):
                 prefix = resolved.read_bytes()[:4096]
+                if b"ModelLabs managed wrapper" in prefix or b"ModelLabs recovery wrapper" in prefix:
+                    continue
                 if b"model_host_launcher.py" in prefix:
+                    continue
+                if recovery.exists() and os.path.samefile(resolved, recovery):
                     continue
                 return resolved
         except OSError:
@@ -155,6 +166,16 @@ def write_wrappers(home: Path, bin_dir: Path, real_codex: Path) -> None:
             temporary.unlink(missing_ok=True)
 
     bin_dir.mkdir(parents=True, exist_ok=True)
+    upstream = real_codex.expanduser().resolve(strict=True)
+    if not upstream.is_file() or not os.access(upstream, os.X_OK):
+        raise RuntimeError("The selected upstream Codex executable is not executable.")
+    prefix = upstream.read_bytes()[:4096]
+    if (b"ModelLabs managed wrapper" in prefix or b"ModelLabs recovery wrapper" in prefix
+            or b"model_host_launcher.py" in prefix):
+        raise RuntimeError("A ModelLabs wrapper cannot be used as the upstream Codex executable.")
+    direct = bin_dir / "codex-direct"
+    if direct.exists() and os.path.samefile(upstream, direct):
+        raise RuntimeError("codex-direct cannot be used as its own recovery target.")
     for name, module in (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py"),
                          ("modellabs-health", "health_dashboard.py"),
                          ("modellabs-smoke", "smoke_bench.py")):
@@ -162,11 +183,10 @@ def write_wrappers(home: Path, bin_dir: Path, real_codex: Path) -> None:
         atomic_executable(path, f"#!/bin/sh\nexec {home / 'venv/bin/python'} {home / module} \"$@\"\n")
     codex = bin_dir / "codex"
     atomic_executable(codex,
-        f"#!/bin/sh\nexec {shlex.quote(str(home / 'venv/bin/python'))} "
+        f"#!/bin/sh\n# ModelLabs managed wrapper\nexec {shlex.quote(str(home / 'venv/bin/python'))} "
         f"{shlex.quote(str(home / 'model_host_launcher.py'))} \"$@\"\n",
     )
-    direct = bin_dir / "codex-direct"
-    atomic_executable(direct, f"#!/bin/sh\nexec {shlex.quote(str(real_codex))} \"$@\"\n")
+    atomic_executable(direct, f"#!/bin/sh\n# ModelLabs recovery wrapper\nexec {shlex.quote(str(upstream))} \"$@\"\n")
 
 
 def ensure_managed_route_precedence(path: Path, bin_dir: Path) -> None:
@@ -207,8 +227,38 @@ def enable_service() -> bool:
     command = ["systemctl", "--user", "daemon-reload"]
     if subprocess.run(command, env=env, capture_output=True).returncode:
         return False
-    return subprocess.run(["systemctl", "--user", "enable", "--now", "modellabs-proxy.service"],
-                          env=env, capture_output=True).returncode == 0
+    enabled = subprocess.run(["systemctl", "--user", "enable", "modellabs-proxy.service"],
+                             env=env, capture_output=True).returncode == 0
+    # Restart only the lightweight supervisor. Release-specific proxy children
+    # are detached and keep serving existing TUI connections while the new
+    # supervisor starts the new revision on its own loopback port.
+    restarted = subprocess.run(["systemctl", "--user", "restart", "modellabs-proxy.service"],
+                               env=env, capture_output=True).returncode == 0
+    return enabled and restarted
+
+
+def installed_proxy_port(home: Path) -> int:
+    digest = hashlib.sha256()
+    for name in ("turn_proxy.py", "telemetry.py", "modellabs.py", "adaptive_policy.py"):
+        digest.update(name.encode())
+        digest.update((home / name).read_bytes())
+    return 46000 + int(digest.hexdigest()[:8], 16) % 16000
+
+
+def retire_old_supervisors(home: Path, current_port: int) -> None:
+    """Stop obsolete watchdogs without touching their live proxy children."""
+    expected_script = str(home / "proxy_supervisor.py").encode()
+    for pid_file in home.glob("proxy-supervisor-*.pid"):
+        if pid_file.name == f"proxy-supervisor-{current_port}.pid":
+            continue
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if expected_script not in cmdline:
+                continue
+            os.kill(pid, signal.SIGTERM)
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, OSError):
+            continue
 
 
 def install(args: argparse.Namespace) -> None:
@@ -248,6 +298,7 @@ def install(args: argparse.Namespace) -> None:
         ensure_managed_route_precedence(shell_file, args.bin_dir)
     service = write_service(home)
     service_enabled = False if args.no_service else enable_service()
+    retire_old_supervisors(home, installed_proxy_port(home))
     state = home / "install-state.json"
     state.write_text(json.dumps({"home": str(home), "service": str(service), "service_enabled": service_enabled,
                                  "real_codex": str(real_codex), "managed_codex": str(args.bin_dir / 'codex')}, indent=2) + "\n")

@@ -125,6 +125,14 @@ def main() -> None:
         message += "Host accepted these settings for later steps of this active turn. Check later inference evidence before claiming a model switch."
     else:
         message += "Advisory only: this session is not controllable through the shared model host, or the turn was not updateable. Do not claim a model or tool switch."
+    if "agentBrowser" in choice["servers"]:
+        message += (
+            " For ChatGPT browser-backed intelligence, use AuraCall as the provider bridge with "
+            "the semantic selector chatgpt:premium while agent-browser retains browser lifecycle "
+            "ownership. Fail closed unless the completed receipt binds an observed Pro/premium "
+            "selection, response and assistant-message identities, conversation, runtime profile, "
+            "and browser account/profile; a requested selector alone is not execution proof."
+        )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                               "additionalContext": message}}))
 

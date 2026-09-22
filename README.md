@@ -130,17 +130,20 @@ shell path, while preserving the underlying executable as `codex-direct`. It
 does not publish a network port. New Codex launches are affected; already
 running chats are not replaced.
 
-The installed `modellabs-proxy.service` is a lingered user service. It keeps the
-updated loopback proxy healthy after logout and restart; it does not replace an
-older proxy that still serves an existing chat.
+The installed `modellabs-proxy.service` is a lingered user service. Each proxy
+implementation receives a revision-bound loopback port. Upgrades restart the
+lightweight supervisor onto the new revision while older proxy processes keep
+their existing chat connections until those sessions drain.
 
 ```bash
 codex
 ```
 
 In plain English: This is now the normal way to start Codex. The installed
-wrapper reads your first prompt before any model responds, then ModelLabs
-chooses a suitable model and reasoning effort. `codex-model-host start` remains
+wrapper sends the TUI through the local authenticated proxy, which reads the
+first `turn/start` before any model responds and chooses a suitable model and
+reasoning effort. The TUI remains the owner of approvals, user input, and
+interrupts. `codex-model-host start` remains
 as a compatibility alias, while `codex-direct` bypasses routing for maintenance
 or recovery. Starting a chat only starts local processes and does not modify
 your project files.

@@ -21,6 +21,7 @@ import websockets
 from host_control import HOST_URL, _read_token, _rpc
 from model_host_launcher import PROXY_URL, ensure_host, ensure_proxy
 from paths import ROOT, real_codex_binary
+from thread_owner import acquire_thread_ownership
 from adaptive_policy import adapt, set_adaptive_mode
 from telemetry import aggregate_usage, record as record_metric, usage_from
 
@@ -151,70 +152,11 @@ def launch_usage_observer(thread_id: str, turn_id: str, choice: dict) -> None:
 
 
 async def start(prompt: str, cwd: str, override_model: str | None,
-                override_effort: str | None) -> tuple[str, dict]:
-    choice = adapt(route(prompt, override_model, override_effort))
-    ensure_host()
-    async with websockets.connect(HOST_URL,
-                                  additional_headers={"Authorization": f"Bearer {_read_token()}"},
-                                  max_size=8 * 1024 * 1024) as ws:
-        await _rpc(ws, "initialize", {"clientInfo": {"name": "modellabs", "title": "ModelLabs", "version": "0.1"},
-                                      "capabilities": {"experimentalApi": True}}, 1)
-        await ws.send(json.dumps({"method": "initialized", "params": {}}))
-        catalog = await _rpc(ws, "model/list", {}, 2)
-        entry = next((m for m in catalog.get("data", []) if m.get("id") == choice["model"] and not m.get("hidden")), None)
-        if entry is None:
-            raise ValueError(f"Model {choice['model']} is unavailable on this host.")
-        efforts = {e.get("reasoningEffort") for e in entry.get("supportedReasoningEfforts", [])}
-        if choice["effort"] not in efforts:
-            raise ValueError(f"Model {choice['model']} does not support {choice['effort']} effort.")
-        begun = await _rpc(ws, "thread/start", {"cwd": cwd, "model": choice["model"], "experimentalRawEvents": True,
-                                                 "config": config_for(choice["servers"])}, 3)
-        thread_id = begun["thread"]["id"]
-        choice["thread_id"] = thread_id
-        # The first-turn hook must see the launcher choice before turn/start.
-        record_route({**choice, "status": "initial_route"})
-        # The first inference happens only after both the model and tool config are set.
-        await ws.send(json.dumps({"id": 4, "method": "turn/start", "params": {
-            "threadId": thread_id, "input": [{"type": "text", "text": prompt}],
-            "model": choice["model"], "effort": choice["effort"]}}))
-        queued: list[dict] = []
-        while True:
-            message = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
-            if message.get("id") == 4:
-                if "error" in message:
-                    raise ValueError(f"Model host rejected turn/start: {message['error']}")
-                started = message.get("result") or {}
-                break
-            queued.append(message)
-        turn_id = (started.get("turn") or {}).get("id")
-        if isinstance(turn_id, str):
-            record_metric("route_accepted", thread_id=thread_id, turn_id=turn_id,
-                          model=choice["model"], effort=choice["effort"],
-                          task_class=choice["class"], task_bucket=choice["task_bucket"],
-                          adaptive_reason=choice.get("adaptive_reason"))
-            samples: list[dict] = []
-            while True:
-                message = queued.pop(0) if queued else json.loads(await asyncio.wait_for(ws.recv(), timeout=15 * 60))
-                params = message.get("params") or {}
-                event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
-                if params.get("threadId") != thread_id or event_turn_id != turn_id:
-                    continue
-                if message.get("method") == "rawResponse/completed":
-                    usage = usage_from(params)
-                    if usage:
-                        samples.append(usage)
-                elif message.get("method") == "turn/completed":
-                    turn = params.get("turn") or {}
-                    record_metric("turn_completed", thread_id=thread_id, turn_id=turn_id,
-                                  model=choice["model"], effort=choice["effort"], task_class=choice["class"],
-                                  elapsed_ms=turn.get("durationMs"), status=turn.get("status"), usage=None)
-                    aggregated = aggregate_usage(samples)
-                    if aggregated:
-                        record_metric("turn_usage", thread_id=thread_id, turn_id=turn_id,
-                                      model=choice["model"], effort=choice["effort"], usage=aggregated,
-                                      sample_count=len(samples), source="initial_owner")
-                    break
-    return thread_id, choice
+                override_effort: str | None) -> tuple[str, dict, int]:
+    raise RuntimeError(
+        "Headless first-turn submission was removed because it cannot relay interactive approvals. "
+        "Use `modellabs run` or `codex-model-host start` so the real TUI owns the turn."
+    )
 
 
 def read_prompt(args: argparse.Namespace) -> str:
@@ -277,16 +219,18 @@ def main() -> None:
     if args.action == "route":
         print(json.dumps(adapt(route(prompt, args.model, args.effort)), sort_keys=True))
         return
-    thread_id, choice = asyncio.run(start(prompt, str(Path(args.cwd).resolve()), args.model, args.effort))
-    print(json.dumps(choice, sort_keys=True), flush=True)
-    if args.action == "run":
-        ensure_proxy()
-        env = os.environ.copy()
-        env["MODEL_SELECTOR_HOST_TOKEN"] = _read_token()
-        binary = real_codex_binary()
-        os.execve(binary, [str(binary), "--remote", PROXY_URL,
-                           "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN",
-                           "resume", thread_id], env)
+    if args.action == "start":
+        asyncio.run(start(prompt, str(Path(args.cwd).resolve()), args.model, args.effort))
+        return
+    command = [sys.executable, str(ROOT / "model_host_launcher.py"),
+               "-C", str(Path(args.cwd).resolve())]
+    if args.model:
+        command.extend(["--model", args.model])
+    if args.effort:
+        command.extend(["--config", f'model_reasoning_effort="{args.effort}"'])
+    if prompt:
+        command.append(prompt)
+    os.execv(sys.executable, command)
 
 
 if __name__ == "__main__":

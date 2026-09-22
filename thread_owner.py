@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 from pathlib import Path
 
 from host_control import HOST_URL, THREAD_ID_PATTERN
-from paths import CODEX_HOME
+from paths import CODEX_HOME, ROOT
 
 
 SESSIONS = CODEX_HOME / "sessions"
@@ -57,3 +58,29 @@ def require_unowned(thread_id: str) -> None:
             f"Thread {thread_id} is already open in standalone Codex process(es) "
             f"{', '.join(map(str, owners))}. Leave that chat first; ModelLabs will not resume a duplicate owner."
         )
+
+
+def acquire_thread_ownership(thread_id: str, *, existing_thread: bool = True) -> int:
+    """Atomically reserve one resumed TUI owner until that process exits."""
+    if not THREAD_ID_PATTERN.fullmatch(thread_id):
+        raise ValueError("Resume requires an exact thread UUID.")
+    if existing_thread:
+        rollout_for(thread_id)
+    lock_dir = ROOT / "thread-owner-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{thread_id}.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if existing_thread:
+            require_unowned(thread_id)
+        os.set_inheritable(descriptor, True)
+        return descriptor
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise RuntimeError(
+            f"Thread {thread_id} is already owned by another managed Codex process."
+        ) from error
+    except Exception:
+        os.close(descriptor)
+        raise

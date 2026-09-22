@@ -12,6 +12,8 @@ from paths import ROOT
 
 DEFAULT_PATH = ROOT / "metrics.jsonl"
 METRICS_PATH = Path(os.environ.get("MODELLABS_METRICS_PATH", DEFAULT_PATH))
+USAGE_FIELDS = ("inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
+                "outputTokens", "reasoningOutputTokens", "totalTokens")
 
 
 def record(event: str, **fields: Any) -> None:
@@ -39,23 +41,81 @@ def thread_usage_from(params: dict[str, Any]) -> Any:
 
 
 def usage_delta(baseline: dict[str, Any], total: dict[str, Any]) -> dict[str, int] | None:
-    fields = ("inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
-              "reasoningOutputTokens", "totalTokens")
+    if not baseline or not total:
+        return None
+    if "totalTokens" not in baseline or "totalTokens" not in total:
+        return None
     result: dict[str, int] = {}
-    for field in fields:
+    for field in USAGE_FIELDS:
         before, after = baseline.get(field, 0), total.get(field, 0)
-        if not isinstance(before, (int, float)) or not isinstance(after, (int, float)) or after < before:
+        if (not isinstance(before, (int, float)) or isinstance(before, bool)
+                or not isinstance(after, (int, float)) or isinstance(after, bool)
+                or before < 0 or after < before):
             return None
         result[field] = int(after - before)
     return result
+
+
+class UsageTracker:
+    """Validate cumulative accounting and permanently fail closed after resets."""
+
+    def __init__(self) -> None:
+        self.baseline: dict[str, int] | None = None
+        self.previous: dict[str, int] | None = None
+        self.observed = False
+        self.invalid_reason: str | None = None
+
+    @staticmethod
+    def _counters(value: Any) -> dict[str, int] | None:
+        if not isinstance(value, dict):
+            return None
+        if "totalTokens" not in value:
+            return None
+        result: dict[str, int] = {}
+        for field in USAGE_FIELDS:
+            item = value.get(field, 0)
+            if (not isinstance(item, (int, float)) or isinstance(item, bool)
+                    or item < 0 or int(item) != item):
+                return None
+            result[field] = int(item)
+        return result
+
+    def observe(self, params: dict[str, Any]) -> None:
+        self.observed = True
+        if self.invalid_reason:
+            return
+        token_usage = params.get("tokenUsage")
+        total = self._counters(token_usage.get("total") if isinstance(token_usage, dict) else None)
+        last = self._counters(token_usage.get("last") if isinstance(token_usage, dict) else None)
+        if total is None or last is None:
+            self.invalid_reason = "malformed_usage_snapshot"
+            return
+        if any(last[field] > total[field] for field in USAGE_FIELDS):
+            self.invalid_reason = "last_exceeds_total"
+            return
+        if self.previous is not None and any(total[field] < self.previous[field] for field in USAGE_FIELDS):
+            self.invalid_reason = "cumulative_counter_decreased"
+            return
+        if self.baseline is None:
+            self.baseline = {field: total[field] - last[field] for field in USAGE_FIELDS}
+        self.previous = total
+
+    def outcome(self) -> tuple[dict[str, int] | None, str | None]:
+        if not self.observed:
+            return None, "no_usage_evidence"
+        if self.invalid_reason:
+            return None, self.invalid_reason
+        if self.baseline is None or self.previous is None:
+            return None, "incomplete_usage_evidence"
+        delta = usage_delta(self.baseline, self.previous)
+        return (delta, None) if delta is not None else (None, "invalid_usage_delta")
 
 
 def aggregate_usage(samples: list[dict[str, Any]]) -> dict[str, int] | None:
     """Return one exact per-turn sum from raw upstream completion samples."""
     totals: dict[str, int] = {}
     for sample in samples:
-        for field in ("inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
-                      "reasoningOutputTokens", "totalTokens"):
+        for field in USAGE_FIELDS:
             value = sample.get(field)
             if isinstance(value, (int, float)) and value >= 0:
                 totals[field] = totals.get(field, 0) + int(value)
