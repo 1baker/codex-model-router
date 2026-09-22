@@ -31,6 +31,8 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
         for request in (
             {"id": 1, "method": "future/dangerousMutation", "params": {}},
             {"id": 2, "method": "thread/resume", "params": {"path": "/tmp/history"}},
+            {"id": 3, "method": "thread/resume", "params": {
+                "threadId": "00000000-0000-4000-8000-000000000099", "path": "/tmp/history"}},
         ):
             client = FakeClient(request)
             upstream = FakeUpstream([])
@@ -59,7 +61,6 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
             metrics = root / "metrics.jsonl"
             journal = root / "journal"
             with patch.object(telemetry, "METRICS_PATH", metrics), \
-                 patch.object(receipt_journal, "METRICS_PATH", metrics), \
                  patch.object(receipt_journal, "JOURNAL_DIR", journal):
                 info = {"model": "gpt", "effort": "low", "class": "routine",
                         "terminal_recorded": asyncio.Event(), "usage_recorded": asyncio.Event(),
@@ -89,6 +90,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sum(row["event"] == "turn_completed" for row in rows), 1)
                 self.assertEqual(sum(row["event"] == "turn_usage_unavailable" for row in rows), 1)
                 self.assertFalse(info["journal_path"].exists())
+                turn_proxy.ACCOUNTING_BLOCKED = False
 
     async def test_recovery_uses_persisted_identity_and_unavailable_usage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -104,13 +106,13 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                     info["finished"].set()
 
                 descriptor = os.open("/dev/null", os.O_RDONLY)
+                tasks = []
                 with patch.object(turn_proxy, "acquire_thread_ownership", return_value=descriptor), \
                      patch.object(turn_proxy, "record_completion", side_effect=finish), \
-                     patch.object(turn_proxy, "track_background", side_effect=lambda _task: None):
+                     patch.object(turn_proxy, "track_background", side_effect=tasks.append):
                     held = await turn_proxy.recover_receipt_obligations("token")
-                    await asyncio.sleep(0)
-                self.assertEqual(held, [descriptor])
-                os.close(descriptor)
+                    await asyncio.gather(*tasks)
+                self.assertIsNone(held)
 
     async def test_route_accepted_metric_failure_keeps_completion_obligation(self):
         thread_id = "00000000-0000-4000-8000-000000000041"
@@ -305,6 +307,147 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
             upstream.chmod(0o755)
             install.write_wrappers(home, bin_dir, upstream, dry_run=True)
             self.assertFalse(bin_dir.exists())
+
+    def test_telemetry_repairs_torn_tail_and_retries_log_fsync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = Path(directory) / "metrics.jsonl"
+            metrics.write_bytes(b'{"event":"torn"')
+            with patch.object(telemetry, "METRICS_PATH", metrics):
+                telemetry.record("turn_completed", receipt_id="r1", thread_id="t", turn_id="u")
+                rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+                self.assertEqual([row["receipt_id"] for row in rows], ["r1"])
+
+                real_fsync = os.fsync
+                calls = 0
+
+                def fail_log_once(fd):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 3:
+                        raise OSError("simulated log fsync failure")
+                    return real_fsync(fd)
+
+                with patch.object(telemetry.os, "fsync", side_effect=fail_log_once):
+                    with self.assertRaises(OSError):
+                        telemetry.record("turn_completed", receipt_id="r2", thread_id="t", turn_id="v")
+                telemetry.record("turn_completed", receipt_id="r2", thread_id="t", turn_id="v")
+                rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+                self.assertEqual(sum(row.get("receipt_id") == "r2" for row in rows), 1)
+
+    def test_existing_venv_rejects_escaping_site_packages_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            venv = root / "venv"
+            site = venv / "lib/python3.12"
+            site.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            (site / "site-packages").symlink_to(outside, target_is_directory=True)
+            (venv / "bin").mkdir()
+            (venv / "bin/python").symlink_to(Path(sys.executable))
+            with self.assertRaisesRegex(RuntimeError, "escaping virtualenv"):
+                install.verify_existing_venv_containment(venv)
+
+    async def test_async_authority_lock_cancellation_does_not_strand_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(authority, "ROOT", Path(directory)):
+            held = authority.acquire_lock("thread")
+            waiter = asyncio.create_task(authority.acquire_lock_async("thread"))
+            await asyncio.sleep(0.06)
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+            os.close(held)
+            descriptor = await asyncio.wait_for(authority.acquire_lock_async("thread"), timeout=1)
+            os.close(descriptor)
+
+    async def test_queued_thread_setting_commits_only_after_applied_notification(self):
+        thread_id = "00000000-0000-4000-8000-000000000071"
+        client = FakeClient([
+            {"id": 1, "method": "thread/resume", "params": {"threadId": thread_id}},
+            {"id": 2, "method": "thread/settings/update", "params": {
+                "threadId": thread_id, "model": "gpt-5.6-terra", "effort": "low"}},
+        ])
+        upstream = TwoRequestUpstream([
+            {"id": 1, "result": {"thread": {"id": thread_id}}},
+            {"id": 2, "result": {}},
+            {"method": "thread/settings/updated", "params": {"threadId": thread_id,
+                "threadSettings": {"model": "gpt-5.6-terra", "effort": "low"}}},
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                fd = authority.acquire_lock(thread_id)
+                try:
+                    authority.initialize_locked(thread_id, "gpt-5.6-sol", "high",
+                                                explicit_model=True, explicit_effort=True)
+                finally:
+                    os.close(fd)
+                with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                     patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                     patch.object(turn_proxy, "acquire_thread_ownership",
+                                  return_value=os.open("/dev/null", os.O_RDONLY)):
+                    await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+                value = authority.read_locked(thread_id)
+                self.assertEqual((value["model"], value["effort"]), ("gpt-5.6-terra", "low"))
+
+    async def test_explicit_resume_choice_replaces_older_pin_before_next_turn(self):
+        thread_id = "00000000-0000-4000-8000-000000000081"
+        client = FakeClient({"id": 1, "method": "thread/resume", "params": {
+            "threadId": thread_id, "model": "gpt-5.6-terra", "effort": "low"}},
+            authorization="Bearer token.explicit-both")
+        upstream = FakeUpstream([{"id": 1, "result": {"thread": {"id": thread_id}}}])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"):
+                fd = authority.acquire_lock(thread_id)
+                try:
+                    authority.initialize_locked(thread_id, "gpt-5.6-sol", "high",
+                                                explicit_model=True, explicit_effort=True)
+                finally:
+                    os.close(fd)
+                with patch.object(turn_proxy, "_read_token", return_value="token"), \
+                     patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                     patch.object(turn_proxy, "acquire_thread_ownership",
+                                  return_value=os.open("/dev/null", os.O_RDONLY)):
+                    await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+                value = authority.read_locked(thread_id)
+                self.assertEqual((value["model"], value["effort"]), ("gpt-5.6-terra", "low"))
+
+    async def test_duplicate_outstanding_client_id_is_rejected_before_forwarding(self):
+        class DuplicateClient:
+            request = SimpleNamespace(headers={"Authorization": "Bearer token"}, path="/")
+
+            def __init__(self):
+                self.items = iter([
+                    {"id": "private-id", "method": "thread/list", "params": {}},
+                    {"id": "private-id", "method": "model/list", "params": {}},
+                ])
+                self.done = asyncio.Event()
+                self.sent = []
+
+            def __aiter__(self): return self
+
+            async def __anext__(self):
+                try:
+                    return json.dumps(next(self.items))
+                except StopIteration:
+                    await self.done.wait()
+                    raise StopAsyncIteration
+
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+                self.done.set()
+
+            async def close(self, **_kwargs): self.done.set()
+
+        client, upstream = DuplicateClient(), FakeUpstream([])
+        with patch.object(turn_proxy, "_read_token", return_value="token"), \
+             patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)):
+            await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+        self.assertEqual(len(upstream.sent), 1)
+        self.assertEqual(client.sent[0]["error"]["code"], -32600)
 
 
 if __name__ == "__main__":

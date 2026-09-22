@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -11,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from paths import ROOT
-from telemetry import METRICS_PATH
 
 
 SCHEMA = "modellabs.receipt_obligation.v1"
@@ -94,10 +92,11 @@ def unresolved_for_thread(thread_id: str) -> bool:
 
 
 def quarantine(thread_id: str, request_id: object, method: str) -> Path:
-    key = hashlib.sha256(f"{thread_id}\0{request_id}\0{method}".encode()).hexdigest()
+    request_digest = hashlib.sha256(str(request_id).encode()).hexdigest()
+    key = hashlib.sha256(f"{thread_id}\0{request_digest}\0{method}".encode()).hexdigest()
     path = QUARANTINE_DIR / f"{key}.json"
     _atomic(path, {"schema": "modellabs.lifecycle_quarantine.v1", "thread_id": thread_id,
-                   "request_id": str(request_id), "method": method})
+                   "request_digest": request_digest, "method": method})
     return path
 
 
@@ -109,38 +108,6 @@ def clear_quarantine(path: Path) -> None:
             os.fsync(directory)
         finally:
             os.close(directory)
-
-
-def _receipt_exists(receipt_id: str) -> bool:
-    try:
-        with METRICS_PATH.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    if json.loads(line).get("receipt_id") == receipt_id:
-                        return True
-                except ValueError:
-                    continue
-    except FileNotFoundError:
-        pass
-    return False
-
-
-def append_receipt_once(receipt_id: str, payload: dict[str, Any]) -> None:
-    METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = METRICS_PATH.with_suffix(METRICS_PATH.suffix + ".receipt.lock")
-    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        if _receipt_exists(receipt_id):
-            return
-        fd = os.open(METRICS_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({**payload, "receipt_id": receipt_id},
-                                    sort_keys=True, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        os.close(descriptor)
 
 
 def mark(path: Path, stage: str) -> dict[str, Any]:

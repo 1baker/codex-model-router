@@ -12,7 +12,7 @@ from typing import Any
 
 import websockets
 from paths import ROOT
-from authority import AuthorityError, acquire_lock, read_locked
+from authority import AuthorityError, acquire_lock_async, read_locked
 
 
 HOST_URL = "ws://127.0.0.1:45172"
@@ -75,7 +75,7 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
         raise ModelHostError("Unsupported reasoning effort.")
     # This cross-process transaction lock is shared with the owner TUI proxy.
     # It covers validation, the actual host mutation and confirmed application.
-    lock_descriptor = acquire_lock(thread_id)
+    lock_descriptor = await acquire_lock_async(thread_id)
     try:
         authority = _choice_authority(thread_id)
         if authority.get("explicit_model") and authority.get("model") != model:

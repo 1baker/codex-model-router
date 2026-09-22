@@ -7,6 +7,8 @@ import fcntl
 import math
 import os
 import time
+import hashlib
+import secrets
 from pathlib import Path
 from typing import Any
 from paths import ROOT
@@ -23,29 +25,72 @@ def record(event: str, **fields: Any) -> None:
     payload = {"event": event, "recorded_at_ms": int(time.time() * 1000), **fields}
     METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
     receipt_id = fields.get("receipt_id")
-    lock_descriptor = None
-    duplicate = False
-    if receipt_id is not None:
-        lock_descriptor = os.open(METRICS_PATH.with_suffix(METRICS_PATH.suffix + ".receipt.lock"),
-                                  os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        try:
-            with METRICS_PATH.open(encoding="utf-8") as source:
-                duplicate = any(_has_receipt(line, receipt_id) for line in source)
-        except FileNotFoundError:
-            pass
+    lock_descriptor = os.open(METRICS_PATH.with_suffix(METRICS_PATH.suffix + ".lock"),
+                              os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+    created = not METRICS_PATH.exists()
     try:
-        if duplicate:
-            return
-        fd = os.open(METRICS_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.chmod(METRICS_PATH, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as out:
-            out.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
-            out.flush()
-            os.fsync(out.fileno())
+        if receipt_id is not None:
+            payload = _persist_receipt(receipt_id, payload)
+        fd = os.open(METRICS_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            content = os.read(fd, os.fstat(fd).st_size)
+            if content and not content.endswith(b"\n"):
+                boundary = content.rfind(b"\n") + 1
+                os.ftruncate(fd, boundary)
+                content = content[:boundary]
+            duplicate = receipt_id is not None and any(
+                _has_receipt(line.decode("utf-8", "replace"), receipt_id)
+                for line in content.splitlines())
+            if not duplicate:
+                os.lseek(fd, 0, os.SEEK_END)
+                os.write(fd, (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if created:
+            _fsync_directory(METRICS_PATH.parent)
     finally:
-        if lock_descriptor is not None:
-            os.close(lock_descriptor)
+        os.close(lock_descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _persist_receipt(receipt_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    directory = METRICS_PATH.parent / "receipts"
+    directory_created = not directory.exists()
+    directory.mkdir(parents=True, exist_ok=True)
+    if directory_created:
+        _fsync_directory(directory.parent)
+    path = directory / f"{hashlib.sha256(receipt_id.encode()).hexdigest()}.json"
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if (existing.get("receipt_id") != receipt_id
+                or existing.get("event") != payload.get("event")
+                or existing.get("thread_id") != payload.get("thread_id")
+                or existing.get("turn_id") != payload.get("turn_id")):
+            raise RuntimeError("Receipt identity collision.")
+        return existing
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+        _fsync_directory(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return payload
 
 
 def _has_receipt(line: str, receipt_id: str) -> bool:

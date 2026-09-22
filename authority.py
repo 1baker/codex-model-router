@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import asyncio
 import hashlib
 import json
 import os
@@ -29,13 +30,26 @@ def lock_path_for(thread_id: str) -> Path:
     return path_for(thread_id).with_suffix(".lock")
 
 
-def acquire_lock(thread_id: str) -> int:
+def acquire_lock(thread_id: str, *, nonblocking: bool = False) -> int:
     directory = path_for(thread_id).parent
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
     descriptor = os.open(lock_path_for(thread_id), os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+    except Exception:
+        os.close(descriptor)
+        raise
     return descriptor
+
+
+async def acquire_lock_async(thread_id: str) -> int:
+    """Acquire without blocking the event loop and close on cancellation."""
+    while True:
+        try:
+            return acquire_lock(thread_id, nonblocking=True)
+        except BlockingIOError:
+            await asyncio.sleep(0.05)
 
 
 def _validate(payload: Any, thread_id: str) -> dict[str, Any]:

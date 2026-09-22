@@ -19,7 +19,8 @@ from telemetry import UsageTracker, record as _record_metric, usage_from
 from adaptive_policy import adapt, note_followup
 from paths import ROOT, proxy_port, proxy_revision
 from thread_owner import acquire_thread_ownership
-from authority import (AuthorityError, acquire_lock as acquire_authority_lock,
+from authority import (AuthorityError, acquire_lock as acquire_authority_lock_sync,
+                       acquire_lock_async as acquire_authority_lock,
                        initialize_locked as initialize_authority_locked,
                        path_for as authority_path, read_locked as read_authority_locked,
                        update_locked as update_authority_locked)
@@ -61,7 +62,7 @@ def write_choice_authority(thread_id: str, model: str | None, effort: str | None
                            explicit_model: bool, explicit_effort: bool,
                            initialize: bool = False) -> None:
     """Persist prompt-free explicit-choice provenance for every mutation path."""
-    lock_descriptor = acquire_authority_lock(thread_id)
+    lock_descriptor = acquire_authority_lock_sync(thread_id)
     try:
         operation = initialize_authority_locked if initialize else update_authority_locked
         operation(thread_id, model, effort, explicit_model=explicit_model,
@@ -278,8 +279,8 @@ def track_background(task: asyncio.Task) -> None:
 async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, Any], token: str,
                             delivered: asyncio.Event) -> None:
     """Poll the durable turn record when event delivery belongs to another client."""
-    deadline = time.monotonic() + 15 * 60
-    while time.monotonic() < deadline:
+    diagnostic_at = time.monotonic() + 15 * 60
+    while True:
         if delivered.is_set():
             return
         try:
@@ -300,36 +301,63 @@ async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, 
                 return
         except Exception:
             pass
+        if time.monotonic() >= diagnostic_at:
+            record_metric("turn_reconciliation_delayed", thread_id=thread_id, turn_id=turn_id,
+                          reason="terminal_state_not_confirmed")
+            diagnostic_at = time.monotonic() + 15 * 60
         await asyncio.sleep(1)
-    finalize_route(thread_id, turn_id, route_info, status="completion_unavailable",
-                   elapsed_ms=None, terminal_source="durable_poll_timeout", usage_complete=False)
 
 
-async def recover_receipt_obligations(token: str) -> list[int]:
+async def recover_receipt_obligations(token: str) -> None:
     """Recover crash-left receipts before this generation begins admission."""
-    descriptors: list[int] = []
+    grouped: dict[str, list[tuple[Any, dict[str, Any]]]] = {}
     for path, obligation in receipt_journal.list_obligations():
-        descriptor = acquire_thread_ownership(obligation["thread_id"], existing_thread=False,
-                                              allow_unresolved=True)
-        descriptors.append(descriptor)
-        terminal = asyncio.Event()
-        usage = asyncio.Event()
-        if obligation["terminal"]:
-            terminal.set()
-        if obligation["usage"]:
-            usage.set()
-        finished = asyncio.Event()
-        info = {"model": obligation["model"], "effort": obligation["effort"],
-                "class": obligation["task_class"], "started_at": time.monotonic(),
-                "delivered": finished, "terminal_recorded": terminal,
-                "usage_recorded": usage, "finished": finished,
-                "usage_tracker": UsageTracker(), "journal_path": path}
-        if not obligation["accepted"]:
-            record_accepted_receipt(obligation["thread_id"], obligation["turn_id"], info)
-        task = asyncio.create_task(record_completion(obligation["thread_id"], obligation["turn_id"],
-                                                     info, token, finished))
-        track_background(task)
-    return descriptors
+        grouped.setdefault(obligation["thread_id"], []).append((path, obligation))
+    async def recover_thread(thread_id: str, obligations: list[tuple[Any, dict[str, Any]]]) -> None:
+        descriptor = None
+        while any(path.exists() for path, _obligation in obligations):
+            try:
+                descriptor = acquire_thread_ownership(thread_id, existing_thread=False,
+                                                      allow_unresolved=True)
+                break
+            except RuntimeError:
+                # A healthy predecessor owns this thread. Serve unrelated
+                # threads and retry without stealing until its journal drains.
+                await asyncio.sleep(1)
+        if descriptor is None:
+            return
+        finished_events: list[asyncio.Event] = []
+        for path, obligation in obligations:
+            if not path.exists():
+                continue
+            obligation = receipt_journal.load(path)
+            terminal, usage, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            if obligation["terminal"]:
+                terminal.set()
+            if obligation["usage"]:
+                usage.set()
+            info = {"model": obligation["model"], "effort": obligation["effort"],
+                    "class": obligation["task_class"], "started_at": time.monotonic(),
+                    "delivered": finished, "terminal_recorded": terminal,
+                    "usage_recorded": usage, "finished": finished,
+                    "usage_tracker": UsageTracker(), "journal_path": path}
+            if not obligation["accepted"]:
+                record_accepted_receipt(thread_id, obligation["turn_id"], info)
+            task = asyncio.create_task(record_completion(thread_id, obligation["turn_id"],
+                                                         info, token, finished))
+            track_background(task)
+            finished_events.append(finished)
+
+        async def release_when_settled(fd: int, events: list[asyncio.Event]) -> None:
+            try:
+                await asyncio.gather(*(event.wait() for event in events))
+            finally:
+                os.close(fd)
+
+        await release_when_settled(descriptor, finished_events)
+
+    for thread_id, obligations in grouped.items():
+        track_background(asyncio.create_task(recover_thread(thread_id, obligations)))
 
 
 async def handler(client: websockets.ServerConnection) -> None:
@@ -381,8 +409,11 @@ async def handler(client: websockets.ServerConnection) -> None:
         ownership_pending: set[object] = set()
         admission_events: dict[object, asyncio.Event] = {}
         authority_pending: dict[object, dict[str, Any]] = {}
+        authority_waiting: dict[str, tuple[object, dict[str, Any]]] = {}
+        authority_notifications: dict[str, dict[str, Any]] = {}
         lifecycle_pending: dict[object, Any] = {}
         server_request_ids: set[object] = set()
+        request_ledger: dict[object, dict[str, Any]] = {}
         owner_descriptors: dict[str, int] = {}
         catalog: dict[str, Any] | None = None
         catalog_at = 0.0
@@ -405,6 +436,29 @@ async def handler(client: websockets.ServerConnection) -> None:
             event = admission_events.pop(request_id, None)
             if event is not None:
                 event.set()
+
+        def reconcile_authority_notification(thread_id: str) -> None:
+            waiting = authority_waiting.get(thread_id)
+            notification = authority_notifications.get(thread_id)
+            if not waiting or not notification:
+                return
+            waiting_id, update = waiting
+            settings = notification.get("threadSettings") or {}
+            if (update["model"] is not None and settings.get("model") != update["model"]
+                    or update["effort"] is not None and settings.get("effort") != update["effort"]):
+                return
+            update_authority_locked(
+                thread_id, update["model"], update["effort"],
+                explicit_model=update["model"] is not None,
+                explicit_effort=update["effort"] is not None)
+            if update["model"] is not None:
+                manual_model_threads.add(thread_id)
+            if update["effort"] is not None:
+                manual_effort_threads.add(thread_id)
+            os.close(update["descriptor"])
+            authority_waiting.pop(thread_id, None)
+            authority_notifications.pop(thread_id, None)
+            settle_admission(waiting_id)
 
         async def inbound() -> None:
             nonlocal catalog, catalog_at, initial_preselection_available, launch_scope_available
@@ -444,6 +498,10 @@ async def handler(client: websockets.ServerConnection) -> None:
                         await upstream.send(raw)
                         continue
                     policy = classify_protocol_method(method)
+                    if request_id is not None and request_id in request_ledger:
+                        await client.send(json.dumps({"id": request_id, "error": {
+                            "code": -32600, "message": "ModelLabs rejects duplicate outstanding request IDs."}}))
+                        continue
                     if policy == "unknown":
                         if request_id is not None:
                             await client.send(json.dumps({"id": request_id, "error": {
@@ -463,6 +521,12 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if method == "thread/start":
                         launch_scope_available = False
                     if method == "thread/resume" and isinstance(params, dict):
+                        if "history" in params or "path" in params:
+                            if request_id is not None:
+                                await client.send(json.dumps({"id": request_id, "error": {
+                                    "code": -32003,
+                                    "message": "ModelLabs refuses path- or history-based resume."}}))
+                            continue
                         resume_thread = params.get("threadId")
                         if not isinstance(resume_thread, str) or not resume_thread:
                             if request_id is not None:
@@ -475,11 +539,19 @@ async def handler(client: websockets.ServerConnection) -> None:
                             if resume_thread not in owner_descriptors:
                                 owner_descriptors[resume_thread] = acquire_thread_ownership(resume_thread)
                                 acquired = True
-                            authority_lock = await asyncio.to_thread(acquire_authority_lock, resume_thread)
+                            authority_lock = await acquire_authority_lock(resume_thread)
                             try:
                                 read_authority_locked(resume_thread)
+                                if request_id is not None and (preserve_cli_model or preserve_cli_effort):
+                                    authority_pending[request_id] = {
+                                        "method": method, "thread": resume_thread,
+                                        "model": params.get("model") if preserve_cli_model else None,
+                                        "effort": params.get("effort") if preserve_cli_effort else None,
+                                        "descriptor": authority_lock}
+                                    authority_lock = None
                             finally:
-                                os.close(authority_lock)
+                                if authority_lock is not None:
+                                    os.close(authority_lock)
                         except Exception as exc:
                             if acquired:
                                 os.close(owner_descriptors.pop(resume_thread))
@@ -502,6 +574,13 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     "code": -32003,
                                     "message": "ModelLabs rejected a thread mutation from a non-owner connection."}}))
                             continue
+                        if (method == "turn/start"
+                                and (any(key[0] == mutation_thread for key in active)
+                                     or any(item.get("thread_id") == mutation_thread for item in pending.values()))):
+                            await client.send(json.dumps({"id": request_id, "error": {
+                                "code": -32007,
+                                "message": "ModelLabs rejects overlapping turn admission."}}))
+                            continue
                         if request_id is None:
                             continue
                         if request_id not in lifecycle_pending:
@@ -512,17 +591,17 @@ async def handler(client: websockets.ServerConnection) -> None:
                             and isinstance(params, dict) and params.get("threadId")
                             and (params.get("model") is not None or params.get("effort") is not None)):
                         if request_id is not None:
-                            descriptor = await asyncio.to_thread(acquire_authority_lock, params["threadId"])
+                            descriptor = await acquire_authority_lock(params["threadId"])
                             try:
                                 read_authority_locked(params["threadId"])
                             except Exception:
                                 os.close(descriptor)
                                 raise
                             authority_pending[request_id] = {
-                                "thread": params["threadId"], "model": params.get("model"),
+                                "method": method, "thread": params["threadId"], "model": params.get("model"),
                                 "effort": params.get("effort"), "descriptor": descriptor}
                     if method == "turn/start" and isinstance(params, dict):
-                        descriptor = await asyncio.to_thread(acquire_authority_lock, params["threadId"])
+                        descriptor = await acquire_authority_lock(params["threadId"])
                         try:
                             authority = read_authority_locked(params["threadId"])
                         finally:
@@ -591,6 +670,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 provisional.setdefault(info["thread_id"], [])
                     except ValueError:
                         pass
+                if request_id is not None:
+                    request_ledger[request_id] = {"method": method,
+                                                  "thread_id": params.get("threadId") if isinstance(params, dict) else None}
                 await upstream.send(routed)
 
         async def account_event(response: dict[str, Any]) -> None:
@@ -616,29 +698,58 @@ async def handler(client: websockets.ServerConnection) -> None:
                     response = json.loads(raw)
                     response_id = response.get("id")
                     rpc_response = is_rpc_response(response)
-                    authority_update = authority_pending.pop(response_id, None) if rpc_response else None
+                    ledger_entry = request_ledger.get(response_id) if rpc_response else None
+                    if rpc_response:
+                        if ledger_entry is None:
+                            continue
+                        result = response.get("result") or {}
+                        expected_method = ledger_entry["method"]
+                        shape_valid = "error" in response
+                        if expected_method == "thread/resume":
+                            shape_valid = (((result.get("thread") or {}).get("id"))
+                                           == ledger_entry["thread_id"])
+                        elif expected_method == "thread/start":
+                            shape_valid = isinstance((result.get("thread") or {}).get("id"), str)
+                        elif expected_method == "turn/start":
+                            shape_valid = isinstance((result.get("turn") or {}).get("id"), str)
+                        else:
+                            shape_valid = shape_valid or isinstance(response.get("result"), dict)
+                        if not shape_valid:
+                            ACCOUNTING_BLOCKED = True
+                            continue
+                        request_ledger.pop(response_id, None)
+                    authority_update = authority_pending.get(response_id) if rpc_response else None
                     if authority_update:
-                        try:
-                            applied = ((response.get("result") or {}).get("status") == "applied")
-                            if "error" not in response and applied:
-                                authority_thread = authority_update["thread"]
-                                authority_model = authority_update["model"]
-                                authority_effort = authority_update["effort"]
-                                update_authority_locked(
-                                    authority_thread, authority_model, authority_effort,
-                                    explicit_model=authority_model is not None,
-                                    explicit_effort=authority_effort is not None)
-                                if authority_model is not None:
-                                    manual_model_threads.add(authority_thread)
-                                if authority_effort is not None:
-                                    manual_effort_threads.add(authority_thread)
-                            elif "error" not in response:
-                                response = {"id": response_id, "error": {
-                                    "code": -32005,
-                                    "message": "ModelLabs refused to pin an unconfirmed settings mutation."}}
-                                raw = json.dumps(response)
-                        finally:
-                            os.close(authority_update["descriptor"])
+                        authority_method = authority_update["method"]
+                        if (authority_method == "thread/settings/update"
+                                and "error" not in response and response.get("result") == {}):
+                            authority_pending.pop(response_id, None)
+                            authority_waiting[authority_update["thread"]] = (response_id, authority_update)
+                            reconcile_authority_notification(authority_update["thread"])
+                        else:
+                            authority_pending.pop(response_id, None)
+                            try:
+                                applied = (authority_method == "thread/resume" or
+                                           (response.get("result") or {}).get("status") == "applied")
+                                if "error" not in response and applied:
+                                    authority_thread = authority_update["thread"]
+                                    authority_model = authority_update["model"]
+                                    authority_effort = authority_update["effort"]
+                                    update_authority_locked(
+                                        authority_thread, authority_model, authority_effort,
+                                        explicit_model=authority_model is not None,
+                                        explicit_effort=authority_effort is not None)
+                                    if authority_model is not None:
+                                        manual_model_threads.add(authority_thread)
+                                    if authority_effort is not None:
+                                        manual_effort_threads.add(authority_thread)
+                                elif "error" not in response:
+                                    response = {"id": response_id, "error": {
+                                        "code": -32005,
+                                        "message": "ModelLabs refused to pin an unconfirmed settings mutation."}}
+                                    raw = json.dumps(response)
+                            finally:
+                                os.close(authority_update["descriptor"])
                     if rpc_response and response_id in ownership_pending:
                         ownership_pending.discard(response_id)
                         thread_id = ((response.get("result") or {}).get("thread") or {}).get("id")
@@ -705,8 +816,16 @@ async def handler(client: websockets.ServerConnection) -> None:
                             ACCOUNTING_BLOCKED = True
                         if info["status"] != "accepted_by_host":
                             settle_admission(response_id)
-                    elif rpc_response and response_id in admission_events:
+                    elif (rpc_response and response_id in admission_events
+                          and not (authority_update and authority_update["method"] == "thread/settings/update"
+                                   and "error" not in response)):
                         settle_admission(response_id)
+                    if response.get("method") == "thread/settings/updated":
+                        notification = response.get("params") or {}
+                        notification_thread = notification.get("threadId")
+                        if isinstance(notification_thread, str):
+                            authority_notifications[notification_thread] = notification
+                            reconcile_authority_notification(notification_thread)
                     if response.get("method") is not None and response_id is not None:
                         server_request_ids.add(response_id)
                     params = response.get("params") or {}
@@ -728,14 +847,18 @@ async def handler(client: websockets.ServerConnection) -> None:
 
         tasks = [asyncio.create_task(inbound()), asyncio.create_task(outbound())]
         done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        if tasks[0] in done and (ownership_pending or pending or admission_events or authority_pending):
-            while (ownership_pending or pending or admission_events or authority_pending) and not tasks[1].done():
+        if tasks[0] in done and (ownership_pending or pending or admission_events
+                                 or authority_pending or authority_waiting):
+            while (ownership_pending or pending or admission_events
+                   or authority_pending or authority_waiting) and not tasks[1].done():
                 await asyncio.sleep(0.05)
         for request_id in list(ownership_pending):
-            record_metric("route_admission_unresolved", request_id=str(request_id),
+            record_metric("route_admission_unresolved",
+                          request_digest=hashlib.sha256(str(request_id).encode()).hexdigest(),
                           reason="client_disconnected_before_admission_receipt")
         for request_id, info in list(pending.items()):
-            record_metric("route_admission_unresolved", request_id=str(request_id),
+            record_metric("route_admission_unresolved",
+                          request_digest=hashlib.sha256(str(request_id).encode()).hexdigest(),
                           thread_id=info.get("thread_id"), model=info.get("model"),
                           effort=info.get("effort"), reason="admission_receipt_timeout")
         for task in pending_tasks:
@@ -744,6 +867,8 @@ async def handler(client: websockets.ServerConnection) -> None:
         if active:
             await asyncio.gather(*(info["finished"].wait() for info in active.values()))
         for update in authority_pending.values():
+            os.close(update["descriptor"])
+        for _request_id, update in authority_waiting.values():
             os.close(update["descriptor"])
         for descriptor in owner_descriptors.values():
             os.close(descriptor)

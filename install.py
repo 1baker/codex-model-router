@@ -258,6 +258,29 @@ def verify_upstream_protocol_version(upstream: Path) -> str:
     return version
 
 
+def verify_existing_venv_containment(venv: Path) -> None:
+    if not venv.exists():
+        return
+    root = venv.resolve(strict=True)
+    python = venv / "bin/python"
+    if not python.exists():
+        return
+    for path in venv.rglob("*"):
+        if not path.is_symlink():
+            continue
+        relative = path.relative_to(venv)
+        if relative.parts[0] == "bin" and relative.name.startswith("python"):
+            continue
+        try:
+            path.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Refusing escaping virtualenv link {path}.") from exc
+    result = subprocess.run([str(python), "-c", "import sys; print(sys.prefix)"],
+                            check=True, capture_output=True, text=True, timeout=15)
+    if Path(result.stdout.strip()).resolve(strict=True) != root:
+        raise RuntimeError("Existing virtualenv interpreter does not belong to the ModelLabs venv.")
+
+
 def migrate_authority_documents(home: Path) -> None:
     directory = home / "thread-authority"
     if not directory.exists():
@@ -511,6 +534,7 @@ def install(args: argparse.Namespace) -> None:
     preflight_install_payloads(payloads, home, real_codex, args.codex_home, args.bin_dir)
     write_wrappers(home, args.bin_dir, real_codex, dry_run=True)
     upstream_version = verify_upstream_protocol_version(real_codex)
+    verify_existing_venv_containment(home / "venv")
     home.mkdir(parents=True, exist_ok=True)
     migrate_authority_documents(home)
     for path, content in payloads.items():
