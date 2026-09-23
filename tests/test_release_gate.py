@@ -15,6 +15,7 @@ import authority
 import install
 import receipt_journal
 import telemetry
+import thread_owner
 import turn_proxy
 from protocol_policy import classify
 from test_turn_proxy import ConnectContext, FakeClient, FakeUpstream, TwoRequestUpstream
@@ -54,7 +55,8 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 if nested is not None:
                     params["collaborationMode"] = {"settings": nested}
                 client = FakeClient([
-                    {"id": 1, "method": "thread/resume", "params": {"threadId": thread_id}},
+                    {"id": 1, "method": "thread/resume", "params": {
+                        "threadId": thread_id, "history": None, "path": None}},
                     {"id": 2, "method": "turn/start", "params": params},
                 ])
                 upstream = TwoRequestUpstream([
@@ -413,6 +415,8 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 async def finish(thread_id, turn_id, info, _token, _delivered):
                     self.assertEqual((thread_id, turn_id), ("thread", "turn"))
                     self.assertEqual(info["journal_path"], receipt_journal.path_for("thread", "turn"))
+                    for stage in ("accepted", "terminal", "usage"):
+                        receipt_journal.mark(info["journal_path"], stage)
                     info["finished"].set()
 
                 descriptor = os.open("/dev/null", os.O_RDONLY)
@@ -484,6 +488,86 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(*tasks)
         with self.assertRaises(OSError):
             os.fstat(descriptor)
+
+    async def test_recovery_discovery_failure_retries_while_holding_owner(self):
+        thread_id = "00000000-0000-4000-8000-000000000091"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route = {"model": "gpt", "effort": "low", "class": "routine"}
+            with patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"):
+                receipt_journal.create(thread_id, "turn", route)
+                path = receipt_journal.path_for(thread_id, "turn")
+                descriptor = os.open("/dev/null", os.O_RDONLY)
+                attempts = 0
+
+                def discover():
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        raise OSError("temporary retirement listing failure")
+                    if attempts == 2:
+                        return {thread_id: {"obligations": [(path, receipt_journal.load(path))],
+                                            "quarantines": [], "retirements": [], "cleanups": []}}
+                    return {}
+
+                async def complete(_thread, _turn, info, _token, finished):
+                    # The retry must still own the descriptor when it reaches
+                    # normal reconciliation after failed discovery.
+                    os.fstat(descriptor)
+                    for stage in ("accepted", "terminal", "usage"):
+                        receipt_journal.mark(info["journal_path"], stage)
+                    finished.set()
+
+                async def retry_sleep(_seconds):
+                    os.fstat(descriptor)
+
+                with patch.object(turn_proxy, "acquire_thread_ownership", return_value=descriptor), \
+                     patch.object(turn_proxy, "_discover_recovery_state", side_effect=discover), \
+                     patch.object(turn_proxy, "record_completion", side_effect=complete), \
+                     patch.object(turn_proxy.asyncio, "sleep", side_effect=retry_sleep):
+                    await turn_proxy._recover_receipt_thread(thread_id, "token")
+                self.assertGreaterEqual(attempts, 3)
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    async def test_continuous_recovery_discovers_late_thread(self):
+        first = "00000000-0000-4000-8000-000000000092"
+        second = "00000000-0000-4000-8000-000000000093"
+        discovered, workers, stop = 0, [], asyncio.Event()
+        both_started = asyncio.Event()
+
+        def snapshot():
+            nonlocal discovered
+            discovered += 1
+            if discovered == 1:
+                return {first: {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []}}
+            return {
+                first: {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []},
+                second: {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []},
+            }
+
+        async def recover(thread_id, _token):
+            workers.append(thread_id)
+            if set(workers) == {first, second}:
+                both_started.set()
+            await stop.wait()
+
+        original_sleep = asyncio.sleep
+
+        async def yield_supervisor(_seconds):
+            await original_sleep(0)
+
+        tasks = []
+        with patch.object(turn_proxy, "_discover_recovery_state", side_effect=snapshot), \
+             patch.object(turn_proxy, "_recover_receipt_thread", side_effect=recover), \
+             patch.object(turn_proxy.asyncio, "sleep", side_effect=yield_supervisor), \
+             patch.object(turn_proxy, "track_background", side_effect=tasks.append):
+            await turn_proxy.recover_receipt_obligations("token", continuous=True)
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            stop.set()
+            tasks[0].cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(set(workers), {first, second})
 
     async def test_recovery_child_failure_retains_owner_and_retries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1187,6 +1271,93 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(receipt_journal.unresolved_for_thread(thread_id))
                 with self.assertRaises(OSError):
                     os.fstat(owner)
+
+    async def test_rejected_resume_keeps_real_owner_through_cleanup_barrier(self):
+        thread_id = "00000000-0000-4000-8000-000000000094"
+
+        class ResumeClient(FakeClient):
+            async def __anext__(self):
+                if self._request_index < len(self._requests):
+                    return await super().__anext__()
+                await self.done.wait()
+                raise StopAsyncIteration
+
+            async def send(self, raw):
+                # Keep the inbound half open until the assertion observes the
+                # durable cleanup task holding its duplicate descriptor.
+                self.sent.append(json.loads(raw))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocked, release = asyncio.Event(), asyncio.Event()
+            failed = False
+
+            original_clear = receipt_journal.clear_quarantine
+
+            def fail_once(path):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    value = receipt_journal.load_quarantine(path)
+                    marker = root / "quarantine-cleanups" / path.name
+                    receipt_journal._atomic(marker, {
+                        "schema": receipt_journal.QUARANTINE_CLEANUP_SCHEMA,
+                        "state": "pending", "quarantine": path.name,
+                        "thread_id": value["thread_id"],
+                    })
+                    path.unlink()
+                    raise OSError("post-unlink cleanup barrier")
+                return original_clear(path)
+
+            original_sleep = asyncio.sleep
+
+            async def retry_sleep(_seconds):
+                if not failed:
+                    await original_sleep(0)
+                    return
+                blocked.set()
+                await release.wait()
+
+            def acquire(_thread, **_kwargs):
+                return thread_owner.acquire_thread_ownership(
+                    thread_id, existing_thread=False, allow_unresolved=True)
+
+            client = ResumeClient([
+                {"id": 1, "method": "thread/resume", "params": {"threadId": thread_id}},
+            ])
+            upstream = FakeUpstream([
+                {"id": 1, "error": {"code": -1, "message": "host rejected resume"}},
+            ])
+            with patch.object(thread_owner, "ROOT", root), \
+                 patch.object(authority, "ROOT", root), \
+                 patch.object(receipt_journal, "JOURNAL_DIR", root / "journal"), \
+                 patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"), \
+                 patch.object(turn_proxy, "_read_token", return_value="token"), \
+                 patch.object(turn_proxy.websockets, "connect", return_value=ConnectContext(upstream)), \
+                 patch.object(turn_proxy, "acquire_thread_ownership", side_effect=acquire), \
+                 patch.object(receipt_journal, "clear_quarantine", side_effect=fail_once), \
+                 patch.object(turn_proxy.asyncio, "sleep", side_effect=retry_sleep):
+                descriptor = authority.acquire_lock(thread_id)
+                try:
+                    authority.initialize_locked(thread_id, None, None,
+                                                explicit_model=False, explicit_effort=False)
+                finally:
+                    os.close(descriptor)
+                task = asyncio.create_task(turn_proxy.handler(client))
+                await original_sleep(0.1)
+                self.assertTrue(blocked.is_set(), (upstream.sent, client.sent, task.done()))
+                self.assertTrue(receipt_journal.unresolved_for_thread(thread_id))
+                with self.assertRaises(RuntimeError):
+                    thread_owner.acquire_thread_ownership(
+                        thread_id, existing_thread=False, allow_unresolved=True)
+                release.set()
+                client.done.set()
+                await asyncio.wait_for(task, timeout=2)
+                self.assertTrue(failed)
+                self.assertFalse(receipt_journal.unresolved_for_thread(thread_id))
+                descriptor = thread_owner.acquire_thread_ownership(
+                    thread_id, existing_thread=False, allow_unresolved=True)
+                os.close(descriptor)
 
     async def test_reused_rpc_id_cannot_settle_waiting_settings_lifecycle(self):
         thread_id = "00000000-0000-4000-8000-000000000083"

@@ -387,156 +387,183 @@ async def record_completion(thread_id: str, turn_id: str, route_info: dict[str, 
         await asyncio.sleep(1)
 
 
-async def recover_receipt_obligations(token: str) -> None:
-    """Recover crash-left receipts before this generation begins admission."""
+def _discover_recovery_state() -> dict[str, dict[str, list]]:
+    """Return one durable snapshot of every recoverable thread."""
     grouped: dict[str, dict[str, list]] = {}
     for path, obligation in receipt_journal.list_obligations():
+        if not path.exists():
+            continue
         grouped.setdefault(obligation["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
             "obligations"].append((path, obligation))
     for path, quarantine in receipt_journal.list_quarantines():
+        if not path.exists():
+            continue
         if quarantine["method"] == "turn/start" and quarantine.get("route") is not None:
             grouped.setdefault(quarantine["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
                 "quarantines"].append((path, quarantine))
         # Legacy v1 quarantines intentionally remain as unresolved ownership
         # fences. They lack route/turn evidence and must never be fabricated.
     for marker, retirement in receipt_journal.list_retirements():
+        if not marker.exists():
+            continue
         grouped.setdefault(retirement["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
             "retirements"].append((marker, retirement))
     for marker, cleanup in receipt_journal.list_quarantine_cleanups():
+        if not marker.exists():
+            continue
         grouped.setdefault(cleanup["thread_id"], {"obligations": [], "quarantines": [], "retirements": [], "cleanups": []})[
             "cleanups"].append((marker, cleanup))
+    return grouped
 
-    async def recover_thread(thread_id: str, state: dict[str, list]) -> None:
-        obligations = state["obligations"]
-        quarantines = state["quarantines"]
-        retirements = state["retirements"]
-        cleanups = state["cleanups"]
-
-        def refresh_retirements() -> None:
-            known = {marker for marker, _value in retirements}
-            for marker, retirement in receipt_journal.list_retirements():
-                if retirement["thread_id"] == thread_id and marker not in known:
-                    retirements.append((marker, retirement))
-
-        def refresh_cleanups() -> None:
-            known = {marker for marker, _value in cleanups}
-            for marker, cleanup in receipt_journal.list_quarantine_cleanups():
-                if cleanup["thread_id"] == thread_id and marker not in known:
-                    cleanups.append((marker, cleanup))
-
-        descriptor = None
-        while descriptor is None:
+async def _recover_receipt_thread(thread_id: str, token: str, *,
+                                  descriptor: int | None = None) -> None:
+    """Retry one thread's recovery work while continuously owning it."""
+    while descriptor is None:
+        try:
+            descriptor = acquire_thread_ownership(thread_id, existing_thread=False,
+                                                  allow_unresolved=True)
+        except RuntimeError:
+            await asyncio.sleep(1)
+    try:
+        while True:
+            completion_tasks: list[asyncio.Task] = []
             try:
-                descriptor = acquire_thread_ownership(thread_id, existing_thread=False,
-                                                      allow_unresolved=True)
-            except RuntimeError:
-                # A healthy predecessor owns this thread. Serve unrelated
-                # threads and retry without stealing until its journal drains.
+                # Discovery is deliberately inside the retry boundary. A
+                # transient directory failure cannot kill this owned worker.
+                state = _discover_recovery_state().get(thread_id)
+                if state is None:
+                    return
+                for marker, retirement in state["retirements"]:
+                    receipt_journal.confirm_retired(
+                        receipt_journal.JOURNAL_DIR / retirement["obligation"])
+                for marker, _cleanup in state["cleanups"]:
+                    receipt_journal.confirm_quarantine_cleanup(marker)
+                for quarantine_path, _quarantine in state["quarantines"]:
+                    if not quarantine_path.exists():
+                        continue
+                    quarantine = receipt_journal.load_quarantine(quarantine_path)
+                    route = quarantine["route"]
+                    turn_id = quarantine.get("turn_id")
+                    if turn_id is None:
+                        latest = await latest_host_turn_id(thread_id, token)
+                        if latest is None or latest == route.get("baseline_turn_id"):
+                            raise RuntimeError("Dispatched admission has no authoritative turn yet.")
+                        turn_id = latest
+                        receipt_journal.bind_quarantine(quarantine_path, turn_id=turn_id)
+                    journal_path = receipt_journal.path_for(thread_id, turn_id)
+                    receipt_journal.create(thread_id, turn_id, route)
+                    info = {**route, "journal_path": journal_path}
+                    record_accepted_receipt(thread_id, turn_id, info)
+                    receipt_journal.clear_quarantine(quarantine_path)
+
+                # Refresh after marker and quarantine reconciliation so work
+                # materialized by this pass is never hidden by a stale list.
+                state = _discover_recovery_state().get(thread_id)
+                if state is None:
+                    return
+                for path, _obligation in state["obligations"]:
+                    if not path.exists():
+                        continue
+                    obligation = receipt_journal.load(path)
+                    if receipt_journal.retire_if_complete(path):
+                        continue
+                    for stage in ("accepted", "terminal", "usage"):
+                        if obligation[stage]:
+                            continue
+                        receipt_id = f"{thread_id}:{obligation['turn_id']}:{stage}"
+                        payload = canonical_receipt(receipt_id)
+                        if payload is not None:
+                            info = {"journal_path": path}
+                            reconcile_receipt_stage(
+                                thread_id, obligation["turn_id"], info, stage, payload["event"],
+                                {key: value for key, value in payload.items()
+                                 if key not in {"event", "receipt_id", "thread_id", "turn_id"}})
+                    if not path.exists():
+                        continue
+                    obligation = receipt_journal.load(path)
+                    terminal, usage, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                    if obligation["terminal"]:
+                        terminal.set()
+                    if obligation["usage"]:
+                        usage.set()
+                    info = {"model": obligation["model"], "effort": obligation["effort"],
+                            "class": obligation["task_class"], "started_at": time.monotonic(),
+                            "delivered": finished, "terminal_recorded": terminal,
+                            "usage_recorded": usage, "finished": finished,
+                            "usage_tracker": UsageTracker(), "journal_path": path}
+                    if not obligation["accepted"]:
+                        record_accepted_receipt(thread_id, obligation["turn_id"], info)
+                    completion_tasks.append(asyncio.create_task(record_completion(
+                        thread_id, obligation["turn_id"], info, token, finished)))
+                if completion_tasks:
+                    done, pending_tasks = await asyncio.wait(
+                        completion_tasks, return_when=asyncio.FIRST_EXCEPTION)
+                    failure = next((task.exception() for task in done
+                                    if not task.cancelled() and task.exception() is not None), None)
+                    if failure is not None:
+                        for task in pending_tasks:
+                            task.cancel()
+                        await asyncio.gather(*completion_tasks, return_exceptions=True)
+                        raise failure
+                    await asyncio.gather(*pending_tasks)
+                # This post-pass discovery closes the mid-recovery creation
+                # race. Only an empty durable snapshot permits lock release.
+                if thread_id not in _discover_recovery_state():
+                    return
+            except asyncio.CancelledError:
+                for task in completion_tasks:
+                    task.cancel()
+                await asyncio.gather(*completion_tasks, return_exceptions=True)
+                raise
+            except Exception:
+                for task in completion_tasks:
+                    task.cancel()
+                await asyncio.gather(*completion_tasks, return_exceptions=True)
                 await asyncio.sleep(1)
+    finally:
+        os.close(descriptor)
+
+
+async def recover_receipt_obligations(token: str, *, continuous: bool = False) -> None:
+    """Recover existing work, or supervise rolling durable work continuously."""
+    if not continuous:
+        for thread_id in _discover_recovery_state():
+            track_background(asyncio.create_task(_recover_receipt_thread(thread_id, token)))
+        return
+
+    async def supervise() -> None:
+        workers: dict[str, asyncio.Task] = {}
         try:
             while True:
-                refresh_retirements()
-                refresh_cleanups()
-                if (not any(path.exists() for path, _value in obligations)
-                        and not any(path.exists() for path, _value in quarantines)
-                        and not retirements and not cleanups):
-                    return
-                completion_tasks: list[asyncio.Task] = []
                 try:
-                    for marker, retirement in list(retirements):
-                        receipt_journal.confirm_retired(
-                            receipt_journal.JOURNAL_DIR / retirement["obligation"])
-                        retirements.remove((marker, retirement))
-                    for marker, cleanup in list(cleanups):
-                        receipt_journal.confirm_quarantine_cleanup(marker)
-                        cleanups.remove((marker, cleanup))
-                    for quarantine_path, _quarantine in quarantines:
-                        if not quarantine_path.exists():
-                            continue
-                        quarantine = receipt_journal.load_quarantine(quarantine_path)
-                        route = quarantine["route"]
-                        turn_id = quarantine.get("turn_id")
-                        if turn_id is None:
-                            latest = await latest_host_turn_id(thread_id, token)
-                            if latest is None or latest == route.get("baseline_turn_id"):
-                                raise RuntimeError("Dispatched admission has no authoritative turn yet.")
-                            turn_id = latest
-                            receipt_journal.bind_quarantine(quarantine_path, turn_id=turn_id)
-                        journal_path = receipt_journal.path_for(thread_id, turn_id)
-                        receipt_journal.create(thread_id, turn_id, route)
-                        info = {**route, "journal_path": journal_path}
-                        record_accepted_receipt(thread_id, turn_id, info)
-                        if not any(path == journal_path for path, _value in obligations):
-                            obligations.append((journal_path, receipt_journal.load(journal_path)))
-                        receipt_journal.clear_quarantine(quarantine_path)
-                    for path, obligation in obligations:
-                        if not path.exists():
-                            continue
-                        obligation = receipt_journal.load(path)
-                        if receipt_journal.retire_if_complete(path):
-                            continue
-                        for stage in ("accepted", "terminal", "usage"):
-                            if obligation[stage]:
-                                continue
-                            receipt_id = f"{thread_id}:{obligation['turn_id']}:{stage}"
-                            payload = canonical_receipt(receipt_id)
-                            if payload is not None:
-                                info = {"journal_path": path}
-                                reconcile_receipt_stage(
-                                    thread_id, obligation["turn_id"], info, stage, payload["event"],
-                                    {key: value for key, value in payload.items()
-                                     if key not in {"event", "receipt_id", "thread_id", "turn_id"}})
-                        if not path.exists():
-                            continue
-                        obligation = receipt_journal.load(path)
-                        terminal, usage, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
-                        if obligation["terminal"]:
-                            terminal.set()
-                        if obligation["usage"]:
-                            usage.set()
-                        info = {"model": obligation["model"], "effort": obligation["effort"],
-                                "class": obligation["task_class"], "started_at": time.monotonic(),
-                                "delivered": finished, "terminal_recorded": terminal,
-                                "usage_recorded": usage, "finished": finished,
-                                "usage_tracker": UsageTracker(), "journal_path": path}
-                        if not obligation["accepted"]:
-                            record_accepted_receipt(thread_id, obligation["turn_id"], info)
-                        task = asyncio.create_task(record_completion(
-                            thread_id, obligation["turn_id"], info, token, finished))
-                        completion_tasks.append(task)
-                    if completion_tasks:
-                        done, pending_tasks = await asyncio.wait(
-                            completion_tasks, return_when=asyncio.FIRST_EXCEPTION)
-                        failure = next((task.exception() for task in done
-                                        if not task.cancelled() and task.exception() is not None), None)
-                        if failure is not None:
-                            for task in pending_tasks:
-                                task.cancel()
-                            await asyncio.gather(*completion_tasks, return_exceptions=True)
-                            raise failure
-                        await asyncio.gather(*pending_tasks)
-                        refresh_retirements()
-                        refresh_cleanups()
-                        if not retirements and not cleanups:
-                            return
-                except asyncio.CancelledError:
-                    for task in completion_tasks:
-                        task.cancel()
-                    await asyncio.gather(*completion_tasks, return_exceptions=True)
-                    raise
+                    grouped = _discover_recovery_state()
                 except Exception:
-                    # Retain ownership and refresh marker work before retrying.
-                    for task in completion_tasks:
-                        task.cancel()
-                    await asyncio.gather(*completion_tasks, return_exceptions=True)
-                    refresh_retirements()
-                    refresh_cleanups()
                     await asyncio.sleep(1)
+                    continue
+                for thread_id in grouped:
+                    worker = workers.get(thread_id)
+                    if worker is None or worker.done():
+                        if worker is not None:
+                            try:
+                                worker.result()
+                            except (Exception, asyncio.CancelledError):
+                                pass
+                        workers[thread_id] = asyncio.create_task(
+                            _recover_receipt_thread(thread_id, token))
+                for thread_id, worker in list(workers.items()):
+                    if worker.done() and thread_id not in grouped:
+                        try:
+                            worker.result()
+                        except (Exception, asyncio.CancelledError):
+                            pass
+                        workers.pop(thread_id, None)
+                await asyncio.sleep(1)
         finally:
-            os.close(descriptor)
+            for worker in workers.values():
+                worker.cancel()
+            await asyncio.gather(*workers.values(), return_exceptions=True)
 
-    for thread_id, state in grouped.items():
-        track_background(asyncio.create_task(recover_thread(thread_id, state)))
+    track_background(asyncio.create_task(supervise()))
 
 
 async def handler(client: websockets.ServerConnection) -> None:
@@ -595,6 +622,7 @@ async def handler(client: websockets.ServerConnection) -> None:
         server_request_ids: set[object] = set()
         request_ledger: dict[object, dict[str, Any]] = {}
         cleanup_tasks: dict[object, asyncio.Task] = {}
+        settlement_descriptors: dict[object, int] = {}
         owner_descriptors: dict[str, int] = {}
         reserved_descriptors: dict[str, int] = {}
         catalog: dict[str, Any] | None = None
@@ -647,26 +675,68 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 for waiting_id, _update in authority_waiting.values())):
                 request_ledger.pop(request_id, None)
 
+        def retain_settlement_ownership(request_id: object, method: str | None,
+                                        params: dict[str, Any] | None) -> None:
+            if request_id in settlement_descriptors:
+                return
+            entry = request_ledger.get(request_id) or {}
+            request_method = method or entry.get("method")
+            request_params = params or {}
+            thread_id = request_params.get("threadId") or entry.get("thread_id")
+            if request_method == "thread/resume" and isinstance(thread_id, str):
+                descriptor = reserved_descriptors.pop(thread_id, None)
+                if descriptor is not None:
+                    settlement_descriptors[request_id] = descriptor
+                    return
+            descriptor = owner_descriptors.get(thread_id)
+            if descriptor is not None:
+                # A duplicate keeps the same flock alive if the presentation
+                # handler exits while durable settlement continues.
+                settlement_descriptors[request_id] = os.dup(descriptor)
+
+        async def cleanup_request(request_id: object, *, abandon: bool,
+                                  method: str | None,
+                                  params: dict[str, Any] | None) -> None:
+            try:
+                if abandon:
+                    pending.pop(request_id, None)
+                    ownership_pending.discard(request_id)
+                    update = authority_pending.pop(request_id, None)
+                    if update is not None:
+                        os.close(update["descriptor"])
+                lifecycle_id = request_lifecycles.get(request_id)
+                if lifecycle_id is not None:
+                    await settle_admission(lifecycle_id)
+                    request_lifecycles.pop(request_id, None)
+                maybe_release_request_id(request_id)
+            finally:
+                descriptor = settlement_descriptors.pop(request_id, None)
+                if descriptor is not None:
+                    os.close(descriptor)
+
+        def schedule_cleanup(request_id: object, *, abandon: bool = False,
+                             method: str | None = None,
+                             params: dict[str, Any] | None = None) -> asyncio.Task:
+            task = cleanup_tasks.get(request_id)
+            if task is not None:
+                return task
+            retain_settlement_ownership(request_id, method, params)
+            task = asyncio.create_task(cleanup_request(
+                request_id, abandon=abandon, method=method, params=params))
+            cleanup_tasks[request_id] = task
+            task.add_done_callback(lambda completed, rid=request_id:
+                cleanup_tasks.pop(rid, None)
+                if cleanup_tasks.get(rid) is completed else None)
+            track_background(task)
+            return task
+
         async def settle_request(request_id: object) -> None:
-            lifecycle_id = request_lifecycles.get(request_id)
-            if lifecycle_id is not None:
-                await settle_admission(lifecycle_id)
-                request_lifecycles.pop(request_id, None)
-            maybe_release_request_id(request_id)
+            await asyncio.shield(schedule_cleanup(request_id))
 
         async def abandon_request(request_id: object, method: str | None,
                                   params: dict[str, Any]) -> None:
-            pending.pop(request_id, None)
-            ownership_pending.discard(request_id)
-            update = authority_pending.pop(request_id, None)
-            if update is not None:
-                os.close(update["descriptor"])
-            if method == "thread/resume":
-                thread_id = params.get("threadId")
-                descriptor = reserved_descriptors.pop(thread_id, None)
-                if descriptor is not None:
-                    os.close(descriptor)
-            await settle_request(request_id)
+            await asyncio.shield(schedule_cleanup(
+                request_id, abandon=True, method=method, params=params))
 
         async def reject_and_abandon(request_id: object, method: str | None,
                                      params: dict[str, Any], code: int, message: str) -> None:
@@ -674,15 +744,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                 await client.send(json.dumps({"id": request_id, "error": {
                     "code": code, "message": message}}))
             finally:
-                task = cleanup_tasks.get(request_id)
-                if task is None:
-                    task = asyncio.create_task(abandon_request(request_id, method, params))
-                    cleanup_tasks[request_id] = task
-                    task.add_done_callback(lambda completed, rid=request_id:
-                        cleanup_tasks.pop(rid, None)
-                        if cleanup_tasks.get(rid) is completed else None)
-                    track_background(task)
-                await asyncio.shield(task)
+                await abandon_request(request_id, method, params)
 
         async def reconcile_authority_notification(thread_id: str) -> None:
             waiting = authority_waiting.get(thread_id)
@@ -772,7 +834,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if method == "thread/start":
                         launch_scope_available = False
                     if method == "thread/resume" and isinstance(params, dict):
-                        if "history" in params or "path" in params:
+                        if params.get("history") is not None or params.get("path") is not None:
                             if request_id is not None:
                                 await client.send(json.dumps({"id": request_id, "error": {
                                     "code": -32003,
@@ -1074,12 +1136,13 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if (rpc_response and ledger_entry
                             and ledger_entry["method"] == "thread/resume"):
                         resume_thread = ledger_entry["thread_id"]
-                        descriptor = reserved_descriptors.pop(resume_thread, None)
-                        if descriptor is not None:
-                            if "error" in response:
-                                os.close(descriptor)
-                            else:
+                        if "error" not in response:
+                            descriptor = reserved_descriptors.pop(resume_thread, None)
+                            if descriptor is not None:
                                 owner_descriptors[resume_thread] = descriptor
+                        # On rejection, schedule_cleanup transfers the reserved
+                        # descriptor into the durable cleanup task. It must not
+                        # be released before quarantine confirmation.
                     info = pending.pop(response_id, None) if rpc_response else None
                     if info:
                         result = response.get("result") or {}
@@ -1118,10 +1181,14 @@ async def handler(client: websockets.ServerConnection) -> None:
                             task = asyncio.create_task(reconcile_and_retire(
                                 info["thread_id"], info["turn_id"], route_info))
                             track_background(task)
-                            await settle_request(response_id)
+                            # Consume host events that arrived before the
+                            # admission response before yielding to durable
+                            # cleanup: a very fast completion task may retire
+                            # the active entry as soon as the loop yields.
                             buffered = provisional.pop(info["thread_id"], [])
                             for event in buffered:
                                 await account_event(event)
+                            await settle_request(response_id)
                         try:
                             record_route(info)
                         except Exception:
@@ -1204,7 +1271,7 @@ async def main() -> None:
     # This bearer-token control plane is deliberately local-only. Do not place
     # it behind a public Traefik router: Authelia does not replace this client
     # capability token or provide a safe interactive authentication flow for it.
-    await recover_receipt_obligations(_read_token())
+    await recover_receipt_obligations(_read_token(), continuous=True)
     async with websockets.serve(handler, "127.0.0.1", PROXY_PORT, max_size=MAX_MESSAGE_BYTES):
         await asyncio.Future()
 
