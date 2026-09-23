@@ -21,7 +21,7 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parent
 PYTHON_FILES = [
     "adaptive_policy.py", "authority.py", "health_dashboard.py", "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
-    "modellabs.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
+    "modellabs.py", "outcome_model.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
     "protocol_policy.py", "receipt_journal.py", "thread_owner.py", "turn_proxy.py", "usage_observer.py", "smoke_bench.py",
 ]
 SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
@@ -135,7 +135,7 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
     selected_bin = (bin_dir or Path.home() / ".local/bin").expanduser().absolute()
     wrappers = [selected_bin / name for name in
                 ("codex", "codex-direct", "modellabs", "codex-model-host",
-                 "modellabs-health", "modellabs-smoke")]
+                 "modellabs-health", "modellabs-smoke", "modellabs-learn")]
     authority_dir = home / "thread-authority"
     authority_files = list(authority_dir.glob("*.json")) if authority_dir.is_dir() else []
     mutation_roots = [home, home / "venv", authority_dir, selected_bin, codex_root,
@@ -173,7 +173,9 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
             owned = Path(recorded_path)
             if not owned.exists() or owned.is_symlink():
                 raise RuntimeError(f"Owned manifest entry is missing or redirected: {owned}.")
-            if _digest_bytes(owned.read_bytes()) != recorded_digest:
+            current = owned.read_bytes()
+            if (_digest_bytes(current) != recorded_digest
+                    and current != payloads.get(owned)):
                 raise RuntimeError(f"Refusing unrelated modified owned content: {owned}.")
         for path in payloads:
             if path.exists() and str(path) not in manifest:
@@ -210,6 +212,8 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
         except OSError as exc:
             raise RuntimeError(f"Cannot validate ModelLabs destination {path}.") from exc
         if manifest.get(str(path)) == actual:
+            continue
+        if str(path) in manifest and actual == _digest_bytes(source_content):
             continue
         if not has_manifest and legacy_install and _legacy_owned(path, source_content):
             continue
@@ -333,16 +337,21 @@ def configure_codex(codex_home: Path, home: Path) -> None:
     _atomic_bytes(config, text.encode())
 
     hooks_path = codex_home / "hooks.json"
-    hooks = json.loads(hooks_path.read_text(encoding="utf-8")) if hooks_path.exists() else {"hooks": {}}
-    command = f"{home / 'venv/bin/python'} {home / 'prompt_hook.py'}"
-    groups = hooks.setdefault("hooks", {}).setdefault("UserPromptSubmit", [{"hooks": []}])
-    if not groups:
-        groups.append({"hooks": []})
-    entries = groups[0].setdefault("hooks", [])
-    if not any(item.get("command") == command for item in entries if isinstance(item, dict)):
-        entries.append({"command": command, "statusMessage": "Routing prompt with ModelLabs", "timeout": 10,
-                        "type": "command"})
-    _atomic_bytes(hooks_path, (json.dumps(hooks, indent=2) + "\n").encode())
+    if hooks_path.exists():
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+        command = f"{home / 'venv/bin/python'} {home / 'prompt_hook.py'}"
+        groups = hooks.get("hooks", {}).get("UserPromptSubmit", [])
+        changed = False
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            entries = group["hooks"]
+            retained = [item for item in entries if not (isinstance(item, dict) and item.get("command") == command)]
+            if len(retained) != len(entries):
+                group["hooks"] = retained
+                changed = True
+        if changed:
+            _atomic_bytes(hooks_path, (json.dumps(hooks, indent=2) + "\n").encode())
 
 
 def discover_real_codex(home: Path, bin_dir: Path) -> Path:
@@ -418,7 +427,8 @@ def write_wrappers(home: Path, bin_dir: Path, real_codex: Path, *, dry_run: bool
         raise RuntimeError("codex-direct cannot be used as its own recovery target.")
     codex = bin_dir / "codex"
     modules = (("modellabs", "modellabs.py"), ("codex-model-host", "model_host_launcher.py"),
-               ("modellabs-health", "health_dashboard.py"), ("modellabs-smoke", "smoke_bench.py"))
+               ("modellabs-health", "health_dashboard.py"), ("modellabs-smoke", "smoke_bench.py"),
+               ("modellabs-learn", "outcome_model.py"))
     contents: dict[Path, str] = {}
     legacy: dict[Path, str] = {}
     for name, module in modules:

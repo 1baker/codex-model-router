@@ -31,10 +31,9 @@ Authelia-protected HTTPS route, and keep the control-plane ports local-only.
 
 ## Model choices
 
-The current defaults remain GPT-5.6 Luna for short, checked work; GPT-5.6
-Terra for routine work; GPT-5.6 Sol for difficult work; and GPT-6 Astra for
-consequential work. Explicit `gpt-6-sol` and `gpt-6-luna` requests are now
-selectable when the live Codex catalog lists them. Existing short names
+The current defaults are GPT-6 Luna for short, checked work; GPT-6 Sol for
+routine and difficult work; and GPT-6 Astra for consequential work. These
+choices are admitted only when the live Codex catalog lists them. Existing short names
 `Sol`, `Luna`, and `Terra` retain their GPT-5.6 meanings.
 
 ## Reasoning effort
@@ -123,6 +122,72 @@ as one `turn_usage` record. This prevents partial tool-step usage from being
 mistaken for the final product's cost and makes an unmatched legacy raw-usage
 record visibly non-gradeable.
 
+## Local outcome model
+
+ModelLabs now has a separate private learning store under
+`~/.local/share/model-selector/learning/`. It stores keyed text features and
+source identities, never raw prompt or response text. The ordinary
+`metrics.jsonl` remains metadata-only. Accepted managed Codex turns contribute
+features from the user prompt; explicit quality grades and exact token usage
+are joined later by the same thread and turn identities. The last completed
+Codex agent message contributes keyed result features after the turn ends;
+result text is not retained in the learning database or used to predict a
+model before the turn. Weak keyword feedback is excluded from model labels.
+Standalone local Codex rollout logs can also be imported with
+`modellabs-learn import-codex-sessions`. This captures completed user-prompt
+and final-answer feature pairs, observed model/effort, and reported turn usage
+without storing the text. These examples remain explicitly **ungraded** and
+are excluded from model training; reported session usage is not substituted
+for the managed proxy's exact server-usage and grade join. Re-imports are
+idempotent, with changed records reported as conflicts rather than overwritten.
+
+`modellabs-learn import-auracall` reads completed AuraCall Pro guard rounds from
+their saved guard state and exact durable response record. It requires the
+response ID, guard ID, nonce, round, submission fingerprint, succeeded run, and
+parsed grade to agree before adding an example. The model sees the review goal
+and the submitted revised artifact as pre-grade inputs. A Pro review grade is
+review evidence, not independent proof that the delivered product works.
+Use `--guard-id ID` to import only one completed guard round. Run
+`modellabs-learn update` after new guard results or explicit Codex grades to
+import, join, and retrain the local models in one step. This update does not
+submit prompts to a provider or alter live routing.
+The AuraCall guard also calls this local update after a completed poll when
+the command is installed. A failed learning update does not change the review
+verdict and is recorded as `learning_sync.status: failed`.
+
+For future iterative reviews, the guard can bind the original user prompt,
+the generation prompt that produced each candidate, its author, and the exact
+parent guard. ModelLabs imports those linked rounds and the prior reviewer
+feedback as private keyed features. `modellabs-learn train-iteration` fits a
+separate predictor only after enough linked task groups exist; its held-out
+score and `validated_for_shadow` flag are reported in `status`. The prompt
+model remains observational: it cannot prove that a prompt edit caused an
+improvement, and it does not rewrite prompts automatically. Once trained,
+`predict-iteration` scores a candidate generation prompt against the original
+prompt and optional prior feedback without submitting it to ChatGPT.
+When a later prompt exactly adopts the browser reviewer's suggested next
+prompt, `status` counts that link separately rather than trusting an author
+label alone.
+
+`modellabs-learn train` fits a regularized review-pass predictor and evaluates
+it on later, whole task groups withheld from training. `modellabs-learn status`
+reports counts and the holdout result. `modellabs-learn predict-review
+--goal-file GOAL --revision-file CANDIDATE --round N` scores a proposed review
+round locally. Its probability is advisory; a model with
+`validated_for_shadow: false` must not influence routing or release gates.
+The review model now requires at least 20 held-out episodes and both a 0.005
+absolute and 5% relative Brier-score improvement over the constant baseline
+before it can even qualify for shadow validation. This prospective conservative
+gate replaces the old positive-difference-only check, which could label a
+negligible improvement as validated.
+`modellabs-learn sync-codex` joins accepted turns with explicit grades and exact
+usage; `modellabs-learn train-codex` trains only when at least two model/effort
+arms have enough comparable graded turns in a task class. Predictions remain
+observational and shadow-only: routine traffic is heavily concentrated in one
+older arm, so the model cannot infer what an untried arm would have done. The
+current task-based router remains authoritative until paired, independently
+verified comparisons support a policy change.
+
 ## Run a managed chat
 
 Install or upgrade for the current user:
@@ -133,7 +198,7 @@ python3 install.py
 
 In plain English: This copies ModelLabs into your local data directory, creates
 its Python environment and private host token, installs the global Codex skill,
-preserves existing hooks, and writes a user service that restarts the local
+preserves unrelated hooks, removes the old ModelLabs prompt-injection hook, and writes a user service that restarts the local
 proxy after reboot. It also installs a managed `codex` wrapper first in the
 shell path, while preserving the underlying executable as `codex-direct`. It
 does not publish a network port. New Codex launches are affected; already
@@ -151,9 +216,11 @@ codex
 ```
 
 In plain English: This is now the normal way to start Codex. The installed
-wrapper sends the TUI through the local authenticated proxy, which reads the
-first `turn/start` before any model responds and chooses a suitable model and
-reasoning effort. The TUI remains the owner of approvals, user input, and
+wrapper opens the TUI through the local authenticated proxy. Enter the first
+prompt in the TUI; the proxy reads its `turn/start` before any model responds
+and chooses a suitable model and reasoning effort. A prompt supplied as a
+command-line argument can also scope the initial MCP servers before the TUI
+opens. The TUI remains the owner of approvals, user input, and
 interrupts. Every thread mutation must come from the connection holding that
 thread's ownership lock, and server-to-client requests use a separate RPC
 namespace so approval or input request IDs cannot consume admission state.

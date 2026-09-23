@@ -33,9 +33,9 @@ SERVERS = frozenset({
     "codegraph", "previews", "codexResearch", "litScout", "modelControl",
 })
 MODEL_BY_CLASS = {
-    "simple": "gpt-5.6-luna",
-    "routine": "gpt-5.6-terra",
-    "difficult": "gpt-5.6-sol",
+    "simple": "gpt-6-luna",
+    "routine": "gpt-6-sol",
+    "difficult": "gpt-6-sol",
     "consequential": "gpt-6-astra",
 }
 EFFORT_LEVELS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")

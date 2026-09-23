@@ -10,8 +10,8 @@ description: Choose or revise the GPT model and reasoning effort for a Codex tas
 Clone the ModelLabs repository and run `python3 install.py`. The installer uses
 `MODELLABS_HOME` when set, otherwise the portable default
 `$XDG_DATA_HOME/model-selector` (normally `~/.local/share/model-selector`). It
-creates a private host token, installs the global skill and prompt hook without
-discarding existing hooks, writes wrappers to `~/.local/bin`, and enables the
+creates a private host token, removes the old ModelLabs prompt hook while
+preserving unrelated hooks, writes wrappers to `~/.local/bin`, and enables the
 lingered user service `modellabs-proxy.service`. The app-server and proxy remain
 bound to loopback. An installer that cannot reach the user service manager still
 completes the local installation and reports `service_enabled: false`.
@@ -26,9 +26,9 @@ Minimize expected **total tokens to a verified result**, with correctness as a h
 
    | Work | Starting choice |
    | --- | --- |
-   | Short, fully specified extraction, formatting, or classification with easy checks | GPT-5.6 Luna, low |
-   | Routine coding, document work, or research with bounded decisions | GPT-5.6 Terra, low or medium |
-   | Difficult focused debugging or analysis where a cheaper attempt is likely to need rework | GPT-5.6 Sol, medium or high |
+   | Short, fully specified extraction, formatting, or classification with easy checks | GPT-6 Luna, low |
+   | Routine coding, document work, or research with bounded decisions | GPT-6 Sol, medium |
+   | Difficult focused debugging or analysis where a cheaper attempt is likely to need rework | GPT-6 Sol, high |
    | Hard end-to-end, cross-system, ambiguous, or consequential work needing strong judgment | GPT-6 Astra, medium or high |
 
    These are heuristics, not a required ladder. ModelLabs also selects the reasoning-effort slider independently: `low` for simple checked work, `medium` for routine work, `high` for difficult analysis, `xhigh` for consequential architecture/security/release work, `max` for formal verification or adversarial audit, and `ultra` only for an explicit exhaustive-rigor request. Explicit `none` is parsed but accepted only when the live Codex catalog supports it for that model. It checks the selected model's live supported efforts before submitting a new turn and fails closed when unavailable, without silently lowering an explicit effort request. Do not assume higher effort always improves a task. For a consequential or repeated workload, prefer representative task results over a generic benchmark ranking; match any benchmark to the actual work before using it.
@@ -46,7 +46,7 @@ The `codex-model-host` launcher connects its TUI to the authenticated ModelLabs 
 
 ModelLabs records server-reported token counts for managed turns in its private mode-0600 `metrics.jsonl`. The same owning proxy handles initial and later turns, buffers matching usage events that arrive before admission, and computes a delta only from a monotonic, turn-ID-scoped sequence of `thread/tokenUsage/updated` totals followed by the live terminal accounting boundary. Repeated snapshots do not add tokens. Missing, malformed, decreasing, reset, disconnected, or durable-only counter evidence produces an explicit `turn_usage_unavailable` record instead of promoting a partial snapshot to an exact value. Each exact usage record contains input, cached-input, output, reasoning-output, and total tokens without prompt or response text. Durable completion polling is lifecycle evidence only, never token-accounting evidence. Do not compare routes on a token count alone; retain elapsed time, completion status, and verification outcome.
 
-The globally trusted `UserPromptSubmit` hook is advisory only. It may read recent local transcript context for very short continuation prompts, keeps the original prompt unchanged, and logs only a hash plus routing metadata, but it never calls a settings-update API. The authenticated proxy is the sole before-admission routing authority, so the hook cannot override an explicit CLI choice or create misleading post-admission attribution. In an ordinary standalone local chat it can recommend a model and relevant MCP servers but cannot change the model or attached tool definitions; do not describe that as a successful switch. For genuine before-inference selection on every turn, route that TUI through the proxy. Never resume the same thread concurrently just to claim a switch.
+The authenticated proxy is the sole before-admission routing authority. ModelLabs does not add a `UserPromptSubmit` hook or inject routing text into user turns. An ordinary standalone local chat has no automatic ModelLabs model switch; route that TUI through the proxy for before-inference selection. Never resume the same thread concurrently just to claim a switch.
 
 In a managed chat, obtain the exact current ID from the shell's `CODEX_THREAD_ID`, then call `modelControl.switch_current_turn_model` with that `thread_id`, the selected `model`, and optional `effort`. The tool checks the host catalog, requires the thread and turn to be active on this host, requires an ID-discovery command in that turn, and refuses to contradict model or effort fields explicitly pinned by the user's launch or TUI choice. It only reports that later steps were updated; use per-request evidence when claiming the model actually handled a later step. A regular local `codex` chat does not share this host and the tool must reject it.
 

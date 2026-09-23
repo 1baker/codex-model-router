@@ -735,7 +735,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
             finished.set()
 
         async def catalog(_token):
-            return {"data": [{"id": "gpt-5.6-luna", "hidden": False,
+            return {"data": [{"id": "gpt-6-luna", "hidden": False,
                               "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}
 
         failures = 0
@@ -849,7 +849,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Future()
 
         async def catalog(_token):
-            return {"data": [{"id": "gpt-5.6-luna", "hidden": False,
+            return {"data": [{"id": "gpt-6-luna", "hidden": False,
                               "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}
 
         async def complete(_thread, _turn, _info, _token, finished):

@@ -27,6 +27,7 @@ from authority import (AuthorityError, acquire_lock as acquire_authority_lock_sy
                        update_locked as update_authority_locked)
 from protocol_policy import classify as classify_protocol_method
 import receipt_journal
+from outcome_model import capture_codex_result, capture_codex_turn, prepare_codex_prompt
 
 
 PROXY_REVISION = proxy_revision()
@@ -207,6 +208,11 @@ def route_request(raw: str, context_prompt: str | None = None,
                 + ", ".join(choice["servers"])
                 + ". Use other tools available in this thread if the task requires them; this shortlist does not grant access."}
         info = {**choice, "thread_id": params.get("threadId"), "status": "submitted_to_host"}
+        try:
+            info["learning_observation"] = prepare_codex_prompt(prompt)
+        except Exception:
+            # Learning is observational and must not interrupt host admission.
+            pass
         return json.dumps(message), info
     except (TypeError, ValueError, KeyError) as exc:
         try:
@@ -215,6 +221,19 @@ def route_request(raw: str, context_prompt: str | None = None,
         except json.JSONDecodeError:
             pass
         return raw, None
+
+
+def completed_agent_message(response: dict[str, Any]) -> str | None:
+    """Read the completed assistant message without changing its relay payload."""
+    if response.get("method") != "item/completed":
+        return None
+    item = (response.get("params") or {}).get("item") or {}
+    if not isinstance(item, dict) or item.get("type") != "agentMessage":
+        return None
+    value = item.get("text")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def selection_is_listed(catalog: dict[str, Any], choice: dict[str, Any]) -> bool:
@@ -611,6 +630,7 @@ async def handler(client: websockets.ServerConnection) -> None:
         manual_model_threads: set[str] = set()
         manual_effort_threads: set[str] = set()
         active: dict[tuple[str, str], dict[str, Any]] = {}
+        assistant_results: dict[tuple[str, str], str] = {}
         provisional: dict[str, list[dict[str, Any]]] = {}
         ownership_pending: set[object] = set()
         admission_events: dict[object, asyncio.Event] = {}
@@ -1017,10 +1037,19 @@ async def handler(client: websockets.ServerConnection) -> None:
             route_info = active.get(key)
             if not route_info:
                 return
+            agent_text = completed_agent_message(response)
+            if agent_text is not None and len(agent_text) <= 256_000:
+                assistant_results[key] = agent_text
             if response.get("method") == "thread/tokenUsage/updated":
                 route_info["usage_tracker"].observe(params)
             if response.get("method") == "turn/completed":
                 turn = params.get("turn") or {}
+                result_text = assistant_results.pop(key, None)
+                if result_text is not None and turn.get("status") == "completed":
+                    try:
+                        capture_codex_result(key[0], key[1], result_text)
+                    except Exception as exc:
+                        print(f"ModelLabs result capture skipped: {type(exc).__name__}", file=sys.stderr)
                 while not route_info["finished"].is_set():
                     try:
                         finalize_route(key[0], key[1], route_info,
@@ -1037,6 +1066,13 @@ async def handler(client: websockets.ServerConnection) -> None:
                                        route_info: dict[str, Any]) -> None:
             await record_completion(thread_id, turn_id, route_info, token, route_info["finished"])
             if route_info["finished"].is_set():
+                result_text = assistant_results.pop((thread_id, turn_id), None)
+                terminal = canonical_receipt(f"{thread_id}:{turn_id}:terminal")
+                if result_text is not None and terminal is not None and terminal.get("status") == "completed":
+                    try:
+                        capture_codex_result(thread_id, turn_id, result_text)
+                    except Exception as exc:
+                        print(f"ModelLabs result capture skipped: {type(exc).__name__}", file=sys.stderr)
                 active.pop((thread_id, turn_id), None)
 
         async def outbound() -> None:
@@ -1145,6 +1181,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                         # be released before quarantine confirmation.
                     info = pending.pop(response_id, None) if rpc_response else None
                     if info:
+                        learning_observation = info.pop("learning_observation", None)
                         result = response.get("result") or {}
                         info["status"] = "accepted_by_host" if "error" not in response else "rejected_by_host"
                         info["turn_id"] = (result.get("turn") or {}).get("id")
@@ -1170,6 +1207,14 @@ async def handler(client: websockets.ServerConnection) -> None:
                                     route_info["journal_path"] = receipt_journal.path_for(
                                         info["thread_id"], info["turn_id"])
                                     record_accepted_receipt(info["thread_id"], info["turn_id"], route_info)
+                                    if learning_observation is not None:
+                                        try:
+                                            capture_codex_turn(info["thread_id"], info["turn_id"],
+                                                               learning_observation, info["model"],
+                                                               info["effort"], info["class"])
+                                        except Exception as exc:
+                                            print(f"ModelLabs learning capture skipped: {type(exc).__name__}",
+                                                  file=sys.stderr)
                                     ACCOUNTING_FAILURES.discard(admission_claim)
                                     ACCOUNTING_BLOCKED = bool(ACCOUNTING_FAILURES)
                                     break
@@ -1211,7 +1256,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                         server_request_ids.add(response_id)
                     params = response.get("params") or {}
                     event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
-                    if (response.get("method") in {"thread/tokenUsage/updated", "turn/completed"}
+                    if (response.get("method") in {"thread/tokenUsage/updated", "item/completed", "turn/completed"}
                             and params.get("threadId") in provisional
                             and (params.get("threadId"), event_turn_id) not in active):
                         provisional[params["threadId"]].append(response)

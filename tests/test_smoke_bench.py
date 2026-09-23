@@ -39,12 +39,12 @@ class SmokeBenchTests(unittest.TestCase):
         evidence = [{"event": "benchmark_result", "task_class": "routine", "model": "gpt-5.6-sol",
                      "effort": "medium", "product_pass": True, "satisfaction_score": 100,
                      "total_tokens": 50, "recorded_at_ms": 2_000_000_000_000},
-                    {"event": "benchmark_result", "task_class": "routine", "model": "gpt-5.6-terra",
+                    {"event": "benchmark_result", "task_class": "routine", "model": "gpt-6-sol",
                      "effort": "medium", "product_pass": True, "satisfaction_score": 100,
                      "total_tokens": 100, "recorded_at_ms": 2_000_000_000_000}]
         with patch.dict("os.environ", {"MODELLABS_ADAPTIVE_MODE": "enforce"}):
             result = adapt(choice, records=evidence, now_ms=2_000_000_000_000)
-        self.assertEqual(result["model"], "gpt-5.6-terra")
+        self.assertEqual(result["model"], "gpt-6-sol")
         self.assertEqual(result["adaptive_recommendation"]["model"], "gpt-5.6-sol")
         self.assertEqual(result["adaptive_reason"], "shadow_benchmark_preliminary")
 
@@ -60,7 +60,7 @@ class SmokeBenchTests(unittest.TestCase):
     def test_verified_benchmark_can_apply_after_two_scenarios(self):
         choice = route("Investigate an intermittent race condition and fix it.")
         rows = []
-        for model, effort, tokens in (("gpt-5.6-sol", "high", 120),
+        for model, effort, tokens in (("gpt-6-sol", "high", 120),
                                       ("gpt-6-astra", "medium", 80)):
             for scenario in ("one", "two", "two"):
                 rows.append({"event": "benchmark_result", "scenario_id": scenario,

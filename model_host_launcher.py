@@ -357,26 +357,6 @@ def _routed_interactive_args(args: list[str], prompt: str, choice: dict,
     return result
 
 
-def _read_interactive_prompt() -> str:
-    if not sys.stdin.isatty():
-        prompt = sys.stdin.read()
-    else:
-        print("ModelLabs first prompt (finish with a line containing only .):", file=sys.stderr)
-        lines: list[str] = []
-        while True:
-            try:
-                line = input()
-            except EOFError:
-                break
-            if line == ".":
-                break
-            lines.append(line)
-        prompt = "\n".join(lines)
-    if not prompt.strip():
-        raise ValueError("A new managed chat requires a non-empty first prompt.")
-    return prompt
-
-
 def _create_launch_ticket(choice: dict, *, explicit_model: bool, explicit_effort: bool) -> str:
     ticket_id = secrets.token_hex(16)
     directory = ROOT / "launch-tickets"
@@ -421,8 +401,8 @@ def run_routed_exec(args: list[str]) -> int:
 
 
 def main() -> None:
-    # New prompt-first chats go through ModelLabs before the first model call.
-    # Resume and utility commands retain the existing TUI behavior.
+    # The TUI owns prompt entry. A positional prompt can still be preselected
+    # before launch so its initial MCP scope matches the route.
     args_in = sys.argv[1:]
     command_index = _command_index(args_in)
     command_name = args_in[command_index] if command_index is not None else None
@@ -448,17 +428,13 @@ def main() -> None:
     new_chat = literal_after_delimiter or command_name is None or command_name not in utility_commands
     preselected = False
     launch_ticket = None
-    if new_chat:
+    if new_chat and command_index is not None:
         explicit_model = _explicit_setting(args_in, "model") is not None
         explicit_effort = _explicit_setting(args_in, "model_reasoning_effort") is not None
-        if command_index is None:
-            prompt = _read_interactive_prompt()
-            append_prompt = True
-        else:
-            prompt = args_in[command_index]
-            if prompt == "--":
-                raise ValueError("A new managed chat requires a prompt after --.")
-            append_prompt = False
+        prompt = args_in[command_index]
+        if prompt == "--":
+            raise ValueError("A new managed chat requires a prompt after --.")
+        append_prompt = False
         choice = _route_choice(prompt, args_in, "interactive_preselection")
         args_in = _routed_interactive_args(args_in, prompt, choice, append_prompt)
         preselected = True

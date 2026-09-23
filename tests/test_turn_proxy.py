@@ -14,6 +14,18 @@ import authority
 import receipt_journal
 
 
+class AssistantResultExtractionTests(unittest.TestCase):
+    def test_only_completed_agent_messages_are_observed(self):
+        message = {"method": "item/completed", "params": {"item": {
+            "type": "agentMessage", "text": "The verified result."}}}
+        self.assertEqual(turn_proxy.completed_agent_message(message), "The verified result.")
+        message["params"]["item"]["type"] = "commandExecution"
+        self.assertIsNone(turn_proxy.completed_agent_message(message))
+        message["params"]["item"]["type"] = "agentMessage"
+        message["method"] = "item/updated"
+        self.assertIsNone(turn_proxy.completed_agent_message(message))
+
+
 class FakeClient:
     def __init__(self, request, authorization="Bearer token"):
         self.request = SimpleNamespace(headers={"Authorization": authorization}, path="/")
@@ -274,7 +286,7 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
         metrics = []
 
         async def catalog(_token):
-            return {"data": [{"id": "gpt-5.6-luna", "hidden": False,
+            return {"data": [{"id": "gpt-6-luna", "hidden": False,
                               "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}
 
         upstream.messages.insert(0, json.dumps({"id": 6, "result": {"thread": {"id": thread_id}}}))

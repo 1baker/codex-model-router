@@ -25,11 +25,45 @@ import thread_owner
 
 
 class RoutingTests(unittest.TestCase):
+    def test_configure_codex_removes_only_modellabs_prompt_hook(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home, home = root / "codex", root / "model-selector"
+            codex_home.mkdir()
+            command = f"{home / 'venv/bin/python'} {home / 'prompt_hook.py'}"
+            hooks = {"hooks": {"UserPromptSubmit": [{"hooks": [
+                {"command": "/bin/other-hook", "type": "command"},
+                {"command": command, "type": "command"},
+            ]}]}}
+            (codex_home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+            installer.configure_codex(codex_home, home)
+            result = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["hooks"]["UserPromptSubmit"][0]["hooks"],
+                             [{"command": "/bin/other-hook", "type": "command"}])
+            installer.configure_codex(codex_home, home)
+            self.assertEqual(result, json.loads((codex_home / "hooks.json").read_text(encoding="utf-8")))
+
+    def test_bare_codex_starts_tui_without_reading_prompt(self):
+        with patch.object(sys, "argv", ["codex"]), \
+             patch.object(model_host_launcher, "_read_token", return_value="token"), \
+             patch.object(model_host_launcher, "ensure_proxy"), \
+             patch.object(model_host_launcher, "ensure_proxy_supervisor"), \
+             patch.object(model_host_launcher, "real_codex_binary", return_value=Path("/real/codex")), \
+             patch.object(model_host_launcher, "_route_choice", side_effect=AssertionError("prompt read")), \
+             patch.object(model_host_launcher.os, "execve") as launch:
+            model_host_launcher.main()
+        binary, args, environment = launch.call_args.args
+        self.assertEqual(binary, Path("/real/codex"))
+        self.assertEqual(args, ["/real/codex", "--remote", model_host_launcher.PROXY_URL,
+                                "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN"])
+        self.assertEqual(environment["MODEL_SELECTOR_HOST_TOKEN"], "token")
+
     def test_selects_the_lowest_sufficient_effort(self):
         cases = [
-            ("Format these three values as CSV.", "gpt-5.6-luna", "low"),
-            ("Implement a small validated parser.", "gpt-5.6-terra", "medium"),
-            ("Investigate an intermittent race condition and fix it.", "gpt-5.6-sol", "high"),
+            ("Format these three values as CSV.", "gpt-6-luna", "low"),
+            ("Implement a small validated parser.", "gpt-6-sol", "medium"),
+            ("Investigate an intermittent race condition and fix it.", "gpt-6-sol", "high"),
             ("Design a production cross-system security architecture.", "gpt-6-astra", "xhigh"),
             ("Perform an adversarial audit of this production migration.", "gpt-6-astra", "max"),
             ("Create an ultra exhaustive independent review of this architecture.", "gpt-6-astra", "ultra"),
@@ -421,6 +455,10 @@ class RoutingTests(unittest.TestCase):
             target.write_bytes(payloads[target] + b"\n# changed\n")
             with self.assertRaisesRegex(RuntimeError, "unrelated"):
                 installer.preflight_install_payloads(payloads, home, upstream, codex_home)
+            manifest["files"][str(target)] = installer._digest_bytes(b"previous owned version")
+            (home / installer.OWNED_MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+            target.write_bytes(payloads[target])
+            installer.preflight_install_payloads(payloads, home, upstream, codex_home)
             target.unlink()
             (home / installer.OWNED_MANIFEST).unlink()
             redirected = root / "redirected"

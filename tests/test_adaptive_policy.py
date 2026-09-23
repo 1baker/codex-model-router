@@ -15,8 +15,8 @@ class AdaptiveTests(unittest.TestCase):
                'recorded_at_ms':2_000_000_000_000}] * 4
   with patch.dict('os.environ', {'MODELLABS_ADAPTIVE_MODE': 'shadow'}):
    result = adapt(choice, thread_id='thread', records=evidence, now_ms=2_000_000_000_000)
-  self.assertEqual(result['model'], 'gpt-5.6-terra')
-  self.assertEqual(result['adaptive_recommendation']['model'], 'gpt-5.6-sol')
+  self.assertEqual(result['model'], 'gpt-6-sol')
+  self.assertEqual(result['adaptive_recommendation']['model'], 'gpt-6-astra')
 
  def test_gpt_6_luna_retry_escalates_to_gpt_6_sol(self):
   choice = route('Use GPT-6 Luna to format these values as CSV.')
