@@ -233,6 +233,17 @@ class OutcomeModelTests(unittest.TestCase):
                 raw = outcome_model.DB_PATH.read_bytes()
                 self.assertNotIn(b"private actual user prompt", raw)
                 self.assertNotIn(b"private final answer", raw)
+                rows.insert(4, {"type": "response_item", "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "later user text"}]}})
+                (sessions / f"rollout-example-{thread_id}.jsonl").write_text(
+                    "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+                self.assertEqual(outcome_model.import_codex_sessions(sessions, thread_id)["turn_ineligible"], 1)
+                rows.pop(4)
+                rows.insert(3, {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "earlier inference"}]}})
+                (sessions / f"rollout-example-{thread_id}.jsonl").write_text(
+                    "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+                self.assertEqual(outcome_model.import_codex_sessions(sessions, thread_id)["turn_ineligible"], 1)
 
     def test_retrospective_grade_join_requires_exact_identity_and_usage(self):
         with tempfile.TemporaryDirectory() as directory:

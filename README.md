@@ -140,7 +140,10 @@ without storing the text. These examples remain explicitly **ungraded** and
 are excluded from model training unless `modellabs-learn sync-session-grades`
 finds an exact same-thread/turn accepted route, completed turn, proxy usage,
 and explicit grade in local telemetry. That retrospective join also requires
-the session's model, effort, and reported usage to agree with telemetry. It is
+the session's model, effort, and reported usage to agree with telemetry and
+the completed turn to have exactly one genuine user message before any recorded
+assistant inference. Older ambiguous, multi-message, or late-message rows are
+excluded from training. It is
 reported separately from live pre-inference managed capture and is not by
 itself evidence of prospective adaptation. Explicitly graded retrospective
 examples can enter the observational Codex outcome trainer, where independent
@@ -157,7 +160,8 @@ and the submitted revised artifact as pre-grade inputs. A Pro review grade is
 review evidence, not independent proof that the delivered product works.
 Use `--guard-id ID` to import only one completed guard round. Run
 `modellabs-learn update` after new guard results or explicit Codex grades to
-import, join, and retrain the local models in one step. This update does not
+import browser rounds and local Codex sessions, join available explicit grades
+and exact usage, and retrain the local models in one step. This update does not
 submit prompts to a provider or alter live routing.
 The AuraCall guard also calls this local update after a completed poll when
 the command is installed. A failed learning update does not change the review

@@ -159,7 +159,8 @@ def _connect() -> sqlite3.Connection:
     )""")
     session_columns = {row[1] for row in connection.execute("PRAGMA table_info(session_turns)")}
     for name, definition in (("task_class", "TEXT"), ("exact_total_tokens", "INTEGER"),
-                             ("quality_score", "INTEGER"), ("verification", "TEXT")):
+                             ("quality_score", "INTEGER"), ("verification", "TEXT"),
+                             ("input_scope", "TEXT NOT NULL DEFAULT 'legacy_unverified'")):
         if name not in session_columns:
             connection.execute(f"ALTER TABLE session_turns ADD COLUMN {name} {definition}")
     return connection
@@ -266,14 +267,20 @@ def import_codex_sessions(sessions_root: Path | None = None,
                                 raise ValueError("session thread identity mismatch")
                         elif kind == "event_msg" and payload.get("type") == "task_started":
                             current = {"turn_id": payload.get("turn_id"), "prompts": [],
-                                       "model": None, "effort": None, "tokens": None}
+                                       "model": None, "effort": None, "tokens": None,
+                                       "inference_seen": False, "late_user": False}
                         elif current is not None and kind == "turn_context":
                             if payload.get("turn_id") == current["turn_id"]:
                                 current["model"], current["effort"] = payload.get("model"), payload.get("effort")
                         elif current is not None and kind == "response_item":
                             value = _session_message_text(payload)
-                            if value is not None and len(current["prompts"]) < 8:
-                                current["prompts"].append(value)
+                            if value is not None:
+                                if current["inference_seen"]:
+                                    current["late_user"] = True
+                                elif len(current["prompts"]) < 8:
+                                    current["prompts"].append(value)
+                            elif payload.get("role") == "assistant" or payload.get("type") != "message":
+                                current["inference_seen"] = True
                         elif current is not None and kind == "token_usage_record":
                             if payload.get("turn_id") == current["turn_id"]:
                                 tokens = (payload.get("turn_token_usage") or {}).get("total_tokens")
@@ -284,7 +291,8 @@ def import_codex_sessions(sessions_root: Path | None = None,
                             if payload.get("turn_id") != current["turn_id"]:
                                 current = None
                                 continue
-                            prompt = "\n".join(current["prompts"]).strip()
+                            prompt = (current["prompts"][0].strip()
+                                      if len(current["prompts"]) == 1 and not current["late_user"] else "")
                             result = payload.get("last_agent_message")
                             if (not isinstance(source_thread, str) or not isinstance(current["turn_id"], str)
                                     or not prompt or not isinstance(result, str) or not result.strip()
@@ -303,20 +311,27 @@ def import_codex_sessions(sessions_root: Path | None = None,
                                 continue
                             identity = (_digest(key, source_thread), _digest(key, current["turn_id"]))
                             prompt_digest, result_digest = _digest(key, prompt), _digest(key, result)
-                            previous = connection.execute("""SELECT prompt_digest,result_digest FROM session_turns
+                            previous = connection.execute("""SELECT prompt_digest,result_digest,input_scope FROM session_turns
                                                              WHERE thread_key=? AND turn_key=?""", identity).fetchone()
                             if previous:
-                                counts["unchanged" if previous == (prompt_digest, result_digest) else "conflict"] += 1
+                                if previous[:2] == (prompt_digest, result_digest):
+                                    if previous[2] != "single_pre_inference_message":
+                                        connection.execute("""UPDATE session_turns SET input_scope='single_pre_inference_message'
+                                                              WHERE thread_key=? AND turn_key=?""", identity)
+                                    counts["unchanged"] += 1
+                                else:
+                                    counts["conflict"] += 1
                             else:
                                 connection.execute("""INSERT INTO session_turns
                                     (thread_key,turn_key,prompt_digest,prompt_features,result_digest,
-                                     result_features,model,effort,reported_total_tokens,completed_at,source_path_digest)
-                                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                     result_features,model,effort,reported_total_tokens,completed_at,
+                                     source_path_digest,input_scope)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     (*identity, prompt_digest,
                                      json.dumps(_features(prompt, "", 1, key), sort_keys=True),
                                      result_digest, json.dumps(_features(result, "", 1, key), sort_keys=True),
                                      current["model"], current["effort"], current["tokens"],
-                                     completed_at, _digest(key, str(path))))
+                                     completed_at, _digest(key, str(path)), "single_pre_inference_message"))
                                 counts["imported"] += 1
                             current = None
             except (OSError, ValueError, TypeError):
@@ -352,7 +367,7 @@ def sync_session_grades(metrics_path: Path | None = None) -> dict[str, int]:
     with _connect() as connection:
         for identity, events in grouped.items():
             session = connection.execute("""SELECT model,effort,reported_total_tokens,grade_status,
-                                        exact_total_tokens,quality_score,verification
+                                        exact_total_tokens,quality_score,verification,input_scope
                                         FROM session_turns WHERE thread_key=? AND turn_key=?""",
                                          identity).fetchone()
             if session is None:
@@ -365,7 +380,8 @@ def sync_session_grades(metrics_path: Path | None = None) -> dict[str, int]:
                                                   ("route_accepted", "turn_completed", "turn_usage", "quality_grade"))
             total = (usage.get("usage") or {}).get("totalTokens")
             score = grade.get("quality_score")
-            if (completed.get("status") != "completed"
+            if (session[7] != "single_pre_inference_message"
+                    or completed.get("status") != "completed"
                     or usage.get("source") not in {"proxy_thread_usage", "proxy_thread_usage_delta"}
                     or grade.get("source") != "explicit"
                     or grade.get("verification") not in {"passed", "failed"}
@@ -378,7 +394,7 @@ def sync_session_grades(metrics_path: Path | None = None) -> dict[str, int]:
                 counts["ineligible"] += 1
                 continue
             expected = (total, score, grade["verification"])
-            if session[3] == "explicit" and session[4:] == expected:
+            if session[3] == "explicit" and session[4:7] == expected:
                 counts["unchanged"] += 1
                 continue
             if session[3] != "ungraded":
@@ -705,6 +721,7 @@ def train_codex_model() -> dict[str, Any]:
         historical = connection.execute("""SELECT thread_key,turn_key,completed_at,prompt_features,
                                          model,effort,task_class,quality_score,verification,exact_total_tokens
                                          FROM session_turns WHERE grade_status='explicit'
+                                         AND input_scope='single_pre_inference_message'
                                          AND quality_score IS NOT NULL AND verification IS NOT NULL
                                          AND exact_total_tokens IS NOT NULL""").fetchall()
     for thread_key, turn_key, completed_at, features, model, effort, task_class, score, verification, tokens in historical:
@@ -928,7 +945,8 @@ def status() -> dict[str, Any]:
                                      SUM(adopted_parent_suggestion) FROM iteration_traces""").fetchone()
         sessions = connection.execute("""SELECT COUNT(*),COUNT(DISTINCT thread_key),
                                        SUM(reported_total_tokens IS NOT NULL),
-                                       SUM(grade_status='explicit' AND exact_total_tokens IS NOT NULL)
+                                       SUM(grade_status='explicit' AND exact_total_tokens IS NOT NULL),
+                                       SUM(input_scope='single_pre_inference_message')
                                        FROM session_turns""").fetchone()
     summary: dict[str, Any] = {"sources": {source: {"episodes": count, "task_groups": groups,
                                                        "passing": passing or 0}
@@ -943,6 +961,7 @@ def status() -> dict[str, Any]:
                                    "thread_groups": sessions[1],
                                    "reported_usage_pairs": sessions[2] or 0,
                                    "complete_explicit_grade_exact_usage": sessions[3] or 0,
+                                   "single_pre_inference_prompt_pairs": sessions[4] or 0,
                                    "training_role": "retrospective_observational_only"}
     if MODEL_PATH.exists():
         model = _read_json(MODEL_PATH)
@@ -987,8 +1006,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.action == "update":
         imported = import_auracall(args.guard_root, args.runs_root, args.guard_id)
+        sessions = import_codex_sessions(args.sessions_root, args.thread_id)
+        session_grades = sync_session_grades()
         synced = sync_codex_grades()
-        result = {"auracall": imported, "codex": synced,
+        result = {"auracall": imported, "sessions": sessions,
+                  "session_grades": session_grades, "codex": synced,
                   "review_model": train_review_model(), "iteration_model": train_iteration_model(),
                   "codex_model": train_codex_model()}
     elif args.action == "import-auracall":
