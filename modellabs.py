@@ -213,7 +213,16 @@ def main() -> None:
             parser.error("grade requires --thread-id, --turn-id, --quality-score, and --verification")
         from adaptive_policy import record_explicit_grade
         grade = record_explicit_grade(args.thread_id, args.turn_id, args.quality_score, args.verification)
-        print(json.dumps({"recorded": "quality_grade", **grade}, sort_keys=True))
+        try:
+            from outcome_model import sync_codex_grades, train_codex_model
+            joined = sync_codex_grades()
+            model = train_codex_model()
+            learning_sync = {"status": "ok", "joined": joined,
+                             "model_status": model.get("status", "trained")}
+        except Exception as exc:
+            learning_sync = {"status": "failed", "error_type": type(exc).__name__}
+        print(json.dumps({"recorded": "quality_grade", **grade,
+                          "learning_sync": learning_sync}, sort_keys=True))
         return
     prompt = read_prompt(args)
     if args.action == "route":

@@ -32,9 +32,16 @@ KEY_PATH = LEARNING_ROOT / "feature-key"
 DB_PATH = LEARNING_ROOT / "episodes.sqlite3"
 MODEL_PATH = LEARNING_ROOT / "review-model.json"
 CODEX_MODEL_PATH = LEARNING_ROOT / "codex-model.json"
-ITERATION_MODEL_PATH = LEARNING_ROOT / "iteration-model.json"
+ITERATION_MODEL_PATH = LEARNING_ROOT / "iteration-model-v5.json"
+IMPROVEMENT_MODEL_PATH = LEARNING_ROOT / "revision-improvement-model-v2.json"
+REVIEW_EVAL_PATH = LEARNING_ROOT / "review-evaluation-checkpoint.json"
+ITERATION_EVAL_PATH = LEARNING_ROOT / "iteration-evaluation-checkpoint-v5.json"
+IMPROVEMENT_EVAL_PATH = LEARNING_ROOT / "revision-improvement-evaluation-checkpoint-v2.json"
+CODEX_EVAL_PATH = LEARNING_ROOT / "codex-evaluation-checkpoint.json"
 FEATURE_COUNT = 512
 FEATURE_VERSION = 1
+ITERATION_FEATURE_VERSION = 4
+MIN_ITERATION_REVISION_GROUPS = 8
 MODEL_IDS = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol",
              "gpt-6-luna", "gpt-6-sol", "gpt-6-astra")
 EFFORTS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
@@ -129,6 +136,7 @@ def _connect() -> sqlite3.Connection:
         parent_feedback_features TEXT, result_feedback_features TEXT,
         submitted_at TEXT NOT NULL, passed INTEGER NOT NULL,
         suggested_prompt_digest TEXT, adopted_parent_suggestion INTEGER NOT NULL DEFAULT 0,
+        parent_result_features TEXT, parent_quality_score INTEGER,
         FOREIGN KEY(episode_id) REFERENCES episodes(episode_id)
     )""")
     trace_columns = {row[1] for row in connection.execute("PRAGMA table_info(iteration_traces)")}
@@ -136,6 +144,10 @@ def _connect() -> sqlite3.Connection:
         connection.execute("ALTER TABLE iteration_traces ADD COLUMN suggested_prompt_digest TEXT")
     if "adopted_parent_suggestion" not in trace_columns:
         connection.execute("ALTER TABLE iteration_traces ADD COLUMN adopted_parent_suggestion INTEGER NOT NULL DEFAULT 0")
+    if "parent_result_features" not in trace_columns:
+        connection.execute("ALTER TABLE iteration_traces ADD COLUMN parent_result_features TEXT")
+    if "parent_quality_score" not in trace_columns:
+        connection.execute("ALTER TABLE iteration_traces ADD COLUMN parent_quality_score INTEGER")
     connection.execute("""CREATE TABLE IF NOT EXISTS codex_turns (
         thread_key TEXT NOT NULL, turn_key TEXT NOT NULL, group_id TEXT NOT NULL,
         accepted_at_ms INTEGER NOT NULL, prompt_digest TEXT NOT NULL,
@@ -163,6 +175,15 @@ def _connect() -> sqlite3.Connection:
                              ("input_scope", "TEXT NOT NULL DEFAULT 'legacy_unverified'")):
         if name not in session_columns:
             connection.execute(f"ALTER TABLE session_turns ADD COLUMN {name} {definition}")
+    connection.execute("""CREATE TABLE IF NOT EXISTS review_codex_links (
+        episode_id TEXT PRIMARY KEY, thread_key TEXT NOT NULL, turn_key TEXT NOT NULL,
+        source_kind TEXT NOT NULL, linked_at TEXT NOT NULL,
+        link_status TEXT NOT NULL DEFAULT 'valid',
+        FOREIGN KEY(episode_id) REFERENCES episodes(episode_id)
+    )""")
+    link_columns = {row[1] for row in connection.execute("PRAGMA table_info(review_codex_links)")}
+    if "link_status" not in link_columns:
+        connection.execute("ALTER TABLE review_codex_links ADD COLUMN link_status TEXT NOT NULL DEFAULT 'valid'")
     return connection
 
 
@@ -417,7 +438,8 @@ def sync_codex_grades(metrics_path: Path | None = None) -> dict[str, int]:
     counts = Counter()
     if not path.exists():
         return {"graded": 0, "usage_matched": 0}
-    with _connect() as connection, path.open("r", encoding="utf-8") as source:
+    records = []
+    with path.open("r", encoding="utf-8") as source:
         for line in source:
             try:
                 row = json.loads(line)
@@ -425,6 +447,11 @@ def sync_codex_grades(metrics_path: Path | None = None) -> dict[str, int]:
                 continue
             if not isinstance(row, dict) or not isinstance(row.get("thread_id"), str):
                 continue
+            records.append(row)
+    completed = {(row.get("thread_id"), row.get("turn_id")) for row in records
+                 if row.get("event") == "turn_completed" and row.get("status") == "completed"}
+    with _connect() as connection:
+        for row in records:
             event = row.get("event")
             turn_id = row.get("source_turn_id") if event == "quality_grade" else row.get("turn_id")
             if not isinstance(turn_id, str):
@@ -442,11 +469,14 @@ def sync_codex_grades(metrics_path: Path | None = None) -> dict[str, int]:
                 counts["graded"] += cursor.rowcount
             elif event == "turn_usage":
                 tokens = (row.get("usage") or {}).get("totalTokens")
-                if not isinstance(tokens, int) or tokens <= 0:
+                if (not isinstance(tokens, int) or tokens <= 0
+                        or row.get("source") != "proxy_thread_usage_delta"
+                        or (row["thread_id"], turn_id) not in completed):
                     continue
                 cursor = connection.execute("""UPDATE codex_turns SET total_tokens=?
-                                               WHERE thread_key=? AND turn_key=? AND total_tokens IS NULL""",
-                                            (tokens, *identity))
+                                               WHERE thread_key=? AND turn_key=? AND total_tokens IS NULL
+                                               AND selected_model=? AND effort=?""",
+                                            (tokens, *identity, row.get("model"), row.get("effort")))
                 counts["usage_matched"] += cursor.rowcount
     return {"graded": counts["graded"], "usage_matched": counts["usage_matched"]}
 
@@ -581,6 +611,8 @@ def _guard_trace(path: Path, runs_root: Path, key: bytes,
         raise ValueError("invalid trace root")
     parent_episode_id = None
     parent_feedback = None
+    parent_result_features = None
+    parent_quality_score = None
     adopted_parent_suggestion = 0
     parent_id = trace.get("parent_guard_id")
     if parent_id is not None:
@@ -599,6 +631,15 @@ def _guard_trace(path: Path, runs_root: Path, key: bytes,
             raise ValueError("parent trace identity mismatch")
         parent_episode_id = parent_row[0]
         parent_feedback = json.dumps(_features(_verdict_feedback(parent), "", 1, key), sort_keys=True)
+        parent_record = _read_json(runs_root / parent["response_id"] / "record.json")
+        parent_artifact = (((parent_record.get("bundle") or {}).get("run") or {})
+                           .get("initialInputs") or {}).get("requestInput")
+        if not isinstance(parent_artifact, str) or not parent_artifact.strip():
+            raise ValueError("parent review artifact is missing")
+        # The legacy column name says "result", but this is reviewer input,
+        # not a verified Codex final answer. Exact answers are linked separately.
+        parent_result_features = json.dumps(_features(parent_artifact, "", 1, key), sort_keys=True)
+        parent_quality_score = parent_row[12]
         parent_suggestion = (parent.get("verdict") or {}).get("suggested_next_prompt")
         if isinstance(parent_suggestion, str) and parent_suggestion.strip() == generation:
             adopted_parent_suggestion = 1
@@ -613,7 +654,44 @@ def _guard_trace(path: Path, runs_root: Path, key: bytes,
             json.dumps(_features(origin, generation, state["round"], key), sort_keys=True),
             parent_feedback, json.dumps(_features(feedback, "", 1, key), sort_keys=True),
             row[3], row[13], _digest(key, suggestion) if isinstance(suggestion, str) and suggestion else None,
-            adopted_parent_suggestion)
+            adopted_parent_suggestion, parent_result_features, parent_quality_score)
+
+
+def _link_review_to_codex(connection: sqlite3.Connection, episode_id: str,
+                          generation_digest: str, artifact_digest: str) -> str:
+    """Link a browser grade only to one exact prompt-and-final-answer pair."""
+    live = connection.execute("""SELECT thread_key,turn_key FROM codex_turns
+                                 WHERE prompt_digest=? AND result_digest IS NOT NULL
+                                 AND result_digest=?""",
+                              (generation_digest, artifact_digest)).fetchall()
+    completed_sessions = connection.execute("""SELECT thread_key,turn_key FROM session_turns
+                                               WHERE prompt_digest=? AND result_digest=?
+                                               AND input_scope='single_pre_inference_message'""",
+                                            (generation_digest, artifact_digest)).fetchall()
+    identities = set(live) | set(completed_sessions)
+    existing = connection.execute("""SELECT thread_key,turn_key,link_status FROM review_codex_links
+                                     WHERE episode_id=?""", (episode_id,)).fetchone()
+    if not identities:
+        return "no_match"
+    if len(identities) != 1:
+        if existing and existing[2] != "ambiguous":
+            connection.execute("""UPDATE review_codex_links SET link_status='ambiguous'
+                                  WHERE episode_id=?""", (episode_id,))
+        return "ambiguous"
+    identity = next(iter(identities))
+    if existing:
+        if existing[:2] != identity:
+            return "conflict"
+        if existing[2] != "valid":
+            connection.execute("""UPDATE review_codex_links SET link_status='valid'
+                                  WHERE episode_id=?""", (episode_id,))
+        return "unchanged"
+    source_kind = "managed" if identity in live else "completed_session"
+    connection.execute("""INSERT INTO review_codex_links
+                         (episode_id,thread_key,turn_key,source_kind,linked_at)
+                         VALUES (?,?,?,?,?)""",
+                       (episode_id, *identity, source_kind, datetime.now(timezone.utc).isoformat()))
+    return "imported"
 
 
 def import_auracall(guard_root: Path | None = None, runs_root: Path | None = None,
@@ -652,17 +730,36 @@ def import_auracall(guard_root: Path | None = None, runs_root: Path | None = Non
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
                 counts["trace_rejected"] += 1
                 continue
+            if trace is None:
+                counts["trace_missing"] += 1
+                continue
             if trace is not None:
                 existing_trace = connection.execute(
-                    "SELECT root_key,parent_episode_id,origin_prompt_digest,generation_prompt_digest,prompt_author,prompt_features,parent_feedback_features,result_feedback_features,submitted_at,passed,suggested_prompt_digest,adopted_parent_suggestion FROM iteration_traces WHERE episode_id=?",
+                    "SELECT root_key,parent_episode_id,origin_prompt_digest,generation_prompt_digest,prompt_author,prompt_features,parent_feedback_features,result_feedback_features,submitted_at,passed,suggested_prompt_digest,adopted_parent_suggestion,parent_result_features,parent_quality_score FROM iteration_traces WHERE episode_id=?",
                     (trace[0],)).fetchone()
                 if existing_trace:
-                    counts["trace_unchanged" if existing_trace == trace[1:] else "trace_conflict"] += 1
+                    if existing_trace[:12] != trace[1:13] or any(
+                            old is not None and old != new
+                            for old, new in zip(existing_trace[12:], trace[13:])):
+                        counts["trace_conflict"] += 1
+                        continue
+                    if existing_trace[12:] != trace[13:]:
+                        connection.execute("""UPDATE iteration_traces
+                                           SET parent_result_features=?,parent_quality_score=?
+                                           WHERE episode_id=?""", (*trace[13:], trace[0]))
+                    counts["trace_unchanged"] += 1
                 else:
-                    connection.execute("INSERT INTO iteration_traces VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", trace)
+                    connection.execute("INSERT INTO iteration_traces VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", trace)
                     counts["trace_imported"] += 1
+                link_result = _link_review_to_codex(connection, row[0], trace[4], row[7])
+                counts[f"codex_link_{link_result}"] += 1
+                if link_result == "conflict":
+                    counts["conflict"] += 1
     return {name: counts[name] for name in ("imported", "unchanged", "ineligible", "rejected", "conflict",
-                                            "trace_imported", "trace_unchanged", "trace_rejected", "trace_conflict")}
+                                            "trace_imported", "trace_unchanged", "trace_missing",
+                                            "trace_rejected", "trace_conflict",
+                                            "codex_link_imported", "codex_link_unchanged",
+                                            "codex_link_no_match", "codex_link_ambiguous", "codex_link_conflict")}
 
 
 def _sigmoid(value: float) -> float:
@@ -693,6 +790,75 @@ def _brier(rows: list[tuple[dict[str, float], int]], weights: list[float], bias:
                for vector, label in rows) / len(rows)
 
 
+def _utc_timestamp(value: str) -> float:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp is missing timezone")
+    return parsed.timestamp()
+
+
+def _evaluation_checkpoint(path: Path, schema: str, groups: list[str],
+                           grouped: dict[str, list[tuple[str, dict[str, float], int]]],
+                           extra: dict[str, Any] | None = None,
+                           feature_version: int = FEATURE_VERSION) -> dict[str, Any]:
+    """Freeze one predictor before future independent task groups arrive."""
+    if path.exists():
+        checkpoint = _read_json(path)
+        if (checkpoint.get("schema") != schema
+                or checkpoint.get("feature_version") != feature_version
+                or not isinstance(checkpoint.get("development_groups"), list)
+                or not isinstance(checkpoint.get("weights"), list)
+                or not isinstance(checkpoint.get("bias"), (int, float))
+                or not isinstance(checkpoint.get("baseline_rate"), (int, float))):
+            raise ValueError("review evaluation checkpoint is incompatible")
+        if extra and any(name not in checkpoint for name in extra):
+            raise ValueError("evaluation checkpoint lacks eligibility metadata")
+        return checkpoint
+    training = [(vector, label) for group in groups for _at, vector, label in grouped[group]]
+    weights, bias = _fit(training)
+    checkpoint = {
+        "schema": schema,
+        "feature_version": feature_version,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "development_groups": groups,
+        "development_episodes": len(training),
+        "baseline_rate": sum(label for _vector, label in training) / len(training),
+        "weights": weights,
+        "bias": bias,
+    }
+    if extra:
+        checkpoint.update(extra)
+    _private_root()
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        return _evaluation_checkpoint(path, schema, groups, grouped, extra, feature_version)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(checkpoint, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return checkpoint
+
+
+def _prospective_rows(groups: list[str], grouped: dict[str, list[tuple[str, dict[str, float], int]]],
+                      checkpoint: dict[str, Any]) -> tuple[list[str], list[tuple[dict[str, float], int]]]:
+    development_groups = set(checkpoint["development_groups"])
+    selected = []
+    cutoff = _utc_timestamp(checkpoint["created_at"])
+    for group in groups:
+        if group in development_groups:
+            continue
+        try:
+            first_submitted = min(_utc_timestamp(row[0]) for row in grouped[group])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if first_submitted > cutoff:
+            selected.append(group)
+    return selected, [(vector, label) for group in selected
+                      for _at, vector, label in grouped[group]]
+
+
 def _codex_features(prompt_features: dict[str, float], model: str,
                     effort: str, task_class: str) -> dict[str, float]:
     if model not in MODEL_IDS or effort not in EFFORTS or task_class not in TASK_CLASSES:
@@ -713,11 +879,13 @@ def train_codex_model() -> dict[str, Any]:
                                    effort,task_class,quality_score,verification,total_tokens
                                    FROM codex_turns WHERE quality_score IS NOT NULL
                                    AND verification IS NOT NULL AND total_tokens IS NOT NULL
+                                   AND result_digest IS NOT NULL
                                    ORDER BY accepted_at_ms,turn_key""").fetchall()
         live_identities = set(connection.execute("""SELECT thread_key,turn_key FROM codex_turns
                                                    WHERE quality_score IS NOT NULL
                                                    AND verification IS NOT NULL
-                                                   AND total_tokens IS NOT NULL""").fetchall())
+                                                   AND total_tokens IS NOT NULL
+                                                   AND result_digest IS NOT NULL""").fetchall())
         historical = connection.execute("""SELECT thread_key,turn_key,completed_at,prompt_features,
                                          model,effort,task_class,quality_score,verification,exact_total_tokens
                                          FROM session_turns WHERE grade_status='explicit'
@@ -758,6 +926,45 @@ def train_codex_model() -> dict[str, Any]:
     baseline_rate = sum(label for _vector, label in training) / len(training)
     baseline_brier = sum((baseline_rate - label) ** 2 for _vector, label in test) / len(test)
     model_brier = _brier(test, weights, bias)
+    checkpoint_groups: dict[str, list[tuple[str, dict[str, float], int]]] = {}
+    for group, at_ms, vector, label in mapped:
+        observed_at = datetime.fromtimestamp(at_ms / 1000, timezone.utc).isoformat()
+        checkpoint_groups.setdefault(group, []).append((observed_at, vector, label))
+    eligible_arms = sorted(f"{task_class}|{model}|{effort}" for task_class, model, effort in supported
+                           if task_class in comparable_classes)
+    checkpoint = _evaluation_checkpoint(CODEX_EVAL_PATH,
+                                        "modellabs.codex_evaluation_checkpoint.v1", groups,
+                                        checkpoint_groups, {"eligible_arms": eligible_arms})
+    frozen_arms = set(checkpoint["eligible_arms"])
+    prospective_candidates = [row for row in selected
+                              if f"{row[5]}|{row[3]}|{row[4]}" in frozen_arms]
+    candidate_groups: dict[str, list[tuple[str, dict[str, float], int]]] = {}
+    for row in prospective_candidates:
+        observed_at = datetime.fromtimestamp(row[1] / 1000, timezone.utc).isoformat()
+        vector = _codex_features(json.loads(row[2]), row[3], row[4], row[5])
+        label = int(row[7] == "passed" and row[6] >= 90)
+        candidate_groups.setdefault(row[0], []).append((observed_at, vector, label))
+    future_groups, _ignored = _prospective_rows(list(candidate_groups), candidate_groups, checkpoint)
+    cutoff_ms = _utc_timestamp(checkpoint["created_at"]) * 1000
+    first_any = {group: min(row[1] for row in raw if row[0] == group) for group in future_groups}
+    future_groups = [group for group in future_groups if first_any[group] > cutoff_ms]
+    prospective = [(vector, label) for group in future_groups
+                   for _at, vector, label in candidate_groups[group]]
+    prospective_arms = Counter((row[5], row[3], row[4]) for row in prospective_candidates
+                               if row[0] in future_groups)
+    comparable_prospective = any(
+        sum(arm[0] == task_class and count >= 5 for arm, count in prospective_arms.items()) >= 2
+        for task_class in TASK_CLASSES)
+    prospective_baseline = (sum((checkpoint["baseline_rate"] - label) ** 2
+                                for _vector, label in prospective) / len(prospective)
+                            if prospective else None)
+    prospective_model = (_brier(prospective, checkpoint["weights"], checkpoint["bias"])
+                         if prospective else None)
+    gain = (prospective_baseline - prospective_model) if prospective else 0.0
+    validated = (len(prospective) >= MIN_REVIEW_HOLDOUT
+                 and len(future_groups) >= 10 and comparable_prospective
+                 and gain >= MIN_REVIEW_BRIER_GAIN
+                 and gain / max(prospective_baseline or 0.0, 1e-9) >= MIN_REVIEW_RELATIVE_GAIN)
     weights, bias = _fit([(vector, label) for _group, _at, vector, label in mapped])
     arm_rows: dict[str, dict[str, Any]] = {}
     for task_class, model, effort in sorted(supported):
@@ -769,7 +976,14 @@ def train_codex_model() -> dict[str, Any]:
     artifact = {"schema": "modellabs.codex_outcome_model.v1", "feature_version": FEATURE_VERSION,
                 "trained_turns": len(selected), "task_groups": len(groups), "holdout_turns": len(test),
                 "baseline_brier": round(baseline_brier, 6), "model_brier": round(model_brier, 6),
-                "validated_for_shadow": model_brier < baseline_brier,
+                "retrospective_holdout_is_diagnostic_only": True,
+                "prospective_checkpoint_created_at": checkpoint["created_at"],
+                "prospective_holdout_turns": len(prospective),
+                "prospective_holdout_task_groups": len(future_groups),
+                "prospective_comparable_arms": comparable_prospective,
+                "prospective_baseline_brier": round(prospective_baseline, 6) if prospective else None,
+                "prospective_model_brier": round(prospective_model, 6) if prospective else None,
+                "validated_for_shadow": validated,
                 "causal_model_comparison": False, "supported_arms": arm_rows,
                 "weights": weights, "bias": bias}
     temporary = CODEX_MODEL_PATH.with_name(f".{CODEX_MODEL_PATH.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
@@ -805,11 +1019,38 @@ def predict_codex(prompt: str, task_class: str) -> dict[str, Any]:
 
 def train_review_model() -> dict[str, Any]:
     with _connect() as connection:
-        raw = connection.execute("""SELECT group_id,submitted_at,features,passed FROM episodes
-                                    WHERE source='auracall_pro_guard' AND verifier='nonce_bound_pro_guard'
-                                    ORDER BY submitted_at,episode_id""").fetchall()
+        raw = connection.execute("""SELECT e.group_id,t.root_key,e.submitted_at,e.features,e.passed
+                                    FROM episodes e LEFT JOIN iteration_traces t
+                                    ON t.episode_id=e.episode_id
+                                    WHERE e.source='auracall_pro_guard'
+                                    AND e.verifier='nonce_bound_pro_guard'
+                                    ORDER BY e.submitted_at,e.episode_id""").fetchall()
+    # Equal goals are conservatively one task; a verified trace additionally
+    # joins rounds whose review-goal wording changed within the same task.
+    parents: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parents.setdefault(node, node)
+        path = []
+        while parents[node] != node:
+            path.append(node)
+            node = parents[node]
+        for member in path:
+            parents[member] = node
+        return node
+
+    for goal_key, root_key, _at, _features_json, _passed in raw:
+        goal_node = f"goal:{goal_key}"
+        if root_key is not None:
+            root_node = f"root:{root_key}"
+            parents[find(root_node)] = find(goal_node)
+    component_keys: dict[str, str] = {}
+    for goal_key, _root_key, _at, _features_json, _passed in raw:
+        component = find(f"goal:{goal_key}")
+        component_keys[component] = min(component_keys.get(component, goal_key), goal_key)
     grouped: dict[str, list[tuple[str, dict[str, float], int]]] = {}
-    for group_id, submitted_at, features, passed in raw:
+    for goal_key, _root_key, submitted_at, features, passed in raw:
+        group_id = component_keys[find(f"goal:{goal_key}")]
         grouped.setdefault(group_id, []).append((submitted_at, json.loads(features), passed))
     groups = sorted(grouped, key=lambda item: min(row[0] for row in grouped[item]))
     if len(raw) < 20 or len(groups) < 6:
@@ -824,16 +1065,33 @@ def train_review_model() -> dict[str, Any]:
     baseline_rate = sum(label for _vector, label in training) / len(training)
     baseline_brier = sum((baseline_rate - label) ** 2 for _vector, label in test) / len(test)
     model_brier = _brier(test, weights, bias)
-    gain = baseline_brier - model_brier
-    validated = (len(test) >= MIN_REVIEW_HOLDOUT
+    checkpoint = _evaluation_checkpoint(REVIEW_EVAL_PATH,
+                                        "modellabs.review_evaluation_checkpoint.v1", groups, grouped)
+    prospective_groups, prospective = _prospective_rows(groups, grouped, checkpoint)
+    prospective_baseline = (sum((checkpoint["baseline_rate"] - label) ** 2
+                                for _vector, label in prospective) / len(prospective)
+                            if prospective else None)
+    prospective_model = (_brier(prospective, checkpoint["weights"], checkpoint["bias"])
+                         if prospective else None)
+    gain = (prospective_baseline - prospective_model) if prospective else 0.0
+    validated = (len(prospective) >= MIN_REVIEW_HOLDOUT
+                 and len(prospective_groups) >= 10
                  and gain >= MIN_REVIEW_BRIER_GAIN
-                 and gain / max(baseline_brier, 1e-9) >= MIN_REVIEW_RELATIVE_GAIN)
+                 and gain / max(prospective_baseline or 0.0, 1e-9) >= MIN_REVIEW_RELATIVE_GAIN)
     final_weights, final_bias = _fit([(vector, label) for group in groups
                                       for _at, vector, label in grouped[group]])
     artifact = {"schema": "modellabs.review_outcome_model.v1", "feature_version": FEATURE_VERSION,
+                "task_group_policy": "connected_review_goal_and_verified_iteration_root",
                 "trained_episodes": len(raw), "task_groups": len(groups),
                 "holdout_episodes": len(test), "holdout_task_groups": len(test_groups),
                 "baseline_brier": round(baseline_brier, 6), "model_brier": round(model_brier, 6),
+                "retrospective_holdout_is_diagnostic_only": True,
+                "prospective_checkpoint_created_at": checkpoint["created_at"],
+                "prospective_checkpoint_development_episodes": checkpoint["development_episodes"],
+                "prospective_holdout_episodes": len(prospective),
+                "prospective_holdout_task_groups": len(prospective_groups),
+                "prospective_baseline_brier": round(prospective_baseline, 6) if prospective else None,
+                "prospective_model_brier": round(prospective_model, 6) if prospective else None,
                 "minimum_holdout": MIN_REVIEW_HOLDOUT,
                 "minimum_brier_gain": MIN_REVIEW_BRIER_GAIN,
                 "minimum_relative_gain": MIN_REVIEW_RELATIVE_GAIN,
@@ -855,7 +1113,8 @@ def predict_review(goal: str, revision: str, round_number: int) -> dict[str, Any
         raise ValueError("review model version mismatch")
     vector = _features(goal, revision, round_number, _key())
     probability = _sigmoid(model["bias"] + sum(model["weights"][int(index)] * value
-                                                   for index, value in vector.items()))
+                                                   for index, value in vector.items()
+                                                   if int(index) < len(model["weights"])))
     return {"predicted_review_pass_probability": round(probability, 4),
             "validated_for_shadow": model["validated_for_shadow"],
             "training_episodes": model["trained_episodes"]}
@@ -863,7 +1122,11 @@ def predict_review(goal: str, revision: str, round_number: int) -> dict[str, Any
 
 def _iteration_vector(prompt_features: dict[str, float],
                       feedback_features: dict[str, float] | None,
-                      author: str) -> dict[str, float]:
+                      author: str,
+                      parent_result_features: dict[str, float] | None = None,
+                      parent_quality_score: int | None = None,
+                      adopted_parent_suggestion: bool = False,
+                      parent_codex_final_features: dict[str, float] | None = None) -> dict[str, float]:
     authors = ("user", "chatgpt", "codex", "mixed")
     if author not in authors:
         raise ValueError("unknown prompt author")
@@ -872,23 +1135,82 @@ def _iteration_vector(prompt_features: dict[str, float],
         vector.update({str(FEATURE_COUNT + 3 + int(index)): value
                        for index, value in feedback_features.items()})
     vector[str(2 * (FEATURE_COUNT + 3) + authors.index(author))] = 1.0
+    if parent_result_features is not None:
+        vector.update({str(2 * (FEATURE_COUNT + 3) + len(authors) + int(index)): value
+                       for index, value in parent_result_features.items()})
+    if parent_quality_score is not None:
+        if not 0 <= parent_quality_score <= 100:
+            raise ValueError("parent quality score is out of range")
+        vector[str(3 * (FEATURE_COUNT + 3) + len(authors))] = parent_quality_score / 100.0
+    if adopted_parent_suggestion:
+        vector[str(3 * (FEATURE_COUNT + 3) + len(authors) + 1)] = 1.0
+    if parent_codex_final_features is not None:
+        base = 3 * (FEATURE_COUNT + 3) + len(authors) + 2
+        vector.update({str(base + int(index)): value
+                       for index, value in parent_codex_final_features.items()})
+        vector[str(base + FEATURE_COUNT + 3)] = 1.0
     return vector
+
+
+def _linked_codex_result_features(connection: sqlite3.Connection) -> dict[str, dict[str, float]]:
+    """Return only final answers from valid exact browser-to-Codex links."""
+    rows = connection.execute("""SELECT l.episode_id,
+                                CASE WHEN l.source_kind='managed' THEN c.result_features
+                                     WHEN l.source_kind='completed_session' THEN s.result_features END
+                                FROM review_codex_links l
+                                LEFT JOIN codex_turns c ON l.source_kind='managed'
+                                    AND c.thread_key=l.thread_key AND c.turn_key=l.turn_key
+                                LEFT JOIN session_turns s ON l.source_kind='completed_session'
+                                    AND s.thread_key=l.thread_key AND s.turn_key=l.turn_key
+                                WHERE l.link_status='valid'""").fetchall()
+    return {episode_id: json.loads(features) for episode_id, features in rows if features}
 
 
 def train_iteration_model() -> dict[str, Any]:
     """Learn prompt-revision outcomes only from explicitly linked review rounds."""
     with _connect() as connection:
+        linked_results = _linked_codex_result_features(connection)
         raw = connection.execute("""SELECT root_key,submitted_at,prompt_features,
-                                   parent_feedback_features,prompt_author,passed
+                                   parent_feedback_features,prompt_author,passed,
+                                   parent_result_features,parent_quality_score,
+                                   adopted_parent_suggestion,parent_episode_id
                                    FROM iteration_traces ORDER BY submitted_at,episode_id""").fetchall()
     groups: dict[str, list[tuple[str, dict[str, float], int]]] = {}
-    for root_key, submitted_at, prompt, feedback, author, passed in raw:
-        vector = _iteration_vector(json.loads(prompt), json.loads(feedback) if feedback else None, author)
+    revision_groups: set[str] = set()
+    revision_rounds = 0
+    linked_parent_codex_results = 0
+    for root_key, submitted_at, prompt, feedback, author, passed, parent_result, parent_score, adopted, parent_id in raw:
+        if parent_id is not None and parent_result is not None and parent_score is not None:
+            revision_groups.add(root_key)
+            revision_rounds += 1
+        codex_result = linked_results.get(parent_id)
+        if codex_result is not None:
+            linked_parent_codex_results += 1
+        vector = _iteration_vector(json.loads(prompt), json.loads(feedback) if feedback else None,
+                                   author, json.loads(parent_result) if parent_result else None,
+                                   parent_score, bool(adopted), codex_result)
         groups.setdefault(root_key, []).append((submitted_at, vector, passed))
     ordered = sorted(groups, key=lambda root: min(row[0] for row in groups[root]))
     if len(raw) < 30 or len(groups) < 10:
-        return {"status": "insufficient_linked_rounds", "rounds": len(raw), "task_groups": len(groups)}
+        return {"status": "insufficient_linked_rounds", "rounds": len(raw), "task_groups": len(groups),
+                "context_complete_revision_rounds": revision_rounds,
+                "context_complete_revision_task_groups": len(revision_groups),
+                "linked_parent_codex_results": linked_parent_codex_results}
+    if len(revision_groups) < MIN_ITERATION_REVISION_GROUPS:
+        return {"status": "insufficient_context_complete_revisions", "rounds": len(raw),
+                "task_groups": len(groups), "context_complete_revision_rounds": revision_rounds,
+                "context_complete_revision_task_groups": len(revision_groups),
+                "linked_parent_codex_results": linked_parent_codex_results,
+                "minimum_revision_task_groups": MIN_ITERATION_REVISION_GROUPS}
     holdout_count = max(2, math.ceil(len(ordered) * 0.2))
+    training_revision_groups = set(ordered[:-holdout_count]) & revision_groups
+    test_revision_groups = set(ordered[-holdout_count:]) & revision_groups
+    if (len(training_revision_groups) < MIN_ITERATION_REVISION_GROUPS
+            or len(test_revision_groups) < 2) and not ITERATION_EVAL_PATH.exists():
+        return {"status": "insufficient_revision_split", "rounds": len(raw),
+                "task_groups": len(groups),
+                "training_context_complete_revision_task_groups": len(training_revision_groups),
+                "holdout_context_complete_revision_task_groups": len(test_revision_groups)}
     training = [(vector, label) for root in ordered[:-holdout_count]
                 for _at, vector, label in groups[root]]
     test = [(vector, label) for root in ordered[-holdout_count:]
@@ -900,12 +1222,41 @@ def train_iteration_model() -> dict[str, Any]:
     baseline_rate = sum(label for _vector, label in training) / len(training)
     baseline_brier = sum((baseline_rate - label) ** 2 for _vector, label in test) / len(test)
     model_brier = _brier(test, weights, bias)
+    checkpoint = _evaluation_checkpoint(ITERATION_EVAL_PATH,
+                                        "modellabs.iteration_evaluation_checkpoint.v5", ordered, groups,
+                                        feature_version=ITERATION_FEATURE_VERSION)
+    prospective_groups, prospective = _prospective_rows(ordered, groups, checkpoint)
+    prospective_revision_groups = set(prospective_groups) & revision_groups
+    prospective_baseline = (sum((checkpoint["baseline_rate"] - label) ** 2
+                                for _vector, label in prospective) / len(prospective)
+                            if prospective else None)
+    prospective_model = (_brier(prospective, checkpoint["weights"], checkpoint["bias"])
+                         if prospective else None)
+    gain = (prospective_baseline - prospective_model) if prospective else 0.0
+    validated = (len(prospective) >= MIN_REVIEW_HOLDOUT
+                 and len(prospective_groups) >= 10
+                 and len(prospective_revision_groups) >= MIN_ITERATION_REVISION_GROUPS
+                 and gain >= MIN_REVIEW_BRIER_GAIN
+                 and gain / max(prospective_baseline or 0.0, 1e-9) >= MIN_REVIEW_RELATIVE_GAIN)
     final_weights, final_bias = _fit([(vector, label) for root in ordered
                                       for _at, vector, label in groups[root]])
-    artifact = {"schema": "modellabs.iteration_outcome_model.v1", "feature_version": FEATURE_VERSION,
+    artifact = {"schema": "modellabs.iteration_outcome_model.v5", "feature_version": ITERATION_FEATURE_VERSION,
                 "trained_rounds": len(raw), "task_groups": len(groups), "holdout_rounds": len(test),
+                "context_complete_revision_rounds": revision_rounds,
+                "context_complete_revision_task_groups": len(revision_groups),
+                "linked_parent_codex_results": linked_parent_codex_results,
+                "minimum_revision_task_groups": MIN_ITERATION_REVISION_GROUPS,
+                "training_context_complete_revision_task_groups": len(training_revision_groups),
+                "holdout_context_complete_revision_task_groups": len(test_revision_groups),
                 "baseline_brier": round(baseline_brier, 6), "model_brier": round(model_brier, 6),
-                "validated_for_shadow": model_brier < baseline_brier,
+                "retrospective_holdout_is_diagnostic_only": True,
+                "prospective_checkpoint_created_at": checkpoint["created_at"],
+                "prospective_holdout_rounds": len(prospective),
+                "prospective_holdout_task_groups": len(prospective_groups),
+                "prospective_context_complete_revision_task_groups": len(prospective_revision_groups),
+                "prospective_baseline_brier": round(prospective_baseline, 6) if prospective else None,
+                "prospective_model_brier": round(prospective_model, 6) if prospective else None,
+                "validated_for_shadow": validated,
                 "causal_prompt_comparison": False, "weights": final_weights, "bias": final_bias}
     temporary = ITERATION_MODEL_PATH.with_name(f".{ITERATION_MODEL_PATH.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
@@ -917,20 +1268,138 @@ def train_iteration_model() -> dict[str, Any]:
     return {key: value for key, value in artifact.items() if key not in {"weights", "bias"}}
 
 
+def train_improvement_model() -> dict[str, Any]:
+    """Predict whether a linked revision improves its parent's browser score."""
+    with _connect() as connection:
+        linked_results = _linked_codex_result_features(connection)
+        raw = connection.execute("""SELECT t.root_key,
+                                   (SELECT MIN(first.submitted_at) FROM iteration_traces first
+                                    WHERE first.root_key=t.root_key),t.prompt_features,
+                                   t.parent_feedback_features,t.prompt_author,
+                                   t.parent_result_features,t.parent_quality_score,
+                                   t.adopted_parent_suggestion,e.quality_score,t.parent_episode_id
+                                   FROM iteration_traces t JOIN episodes e ON e.episode_id=t.episode_id
+                                   WHERE t.parent_episode_id IS NOT NULL
+                                   AND t.parent_result_features IS NOT NULL
+                                   AND t.parent_quality_score IS NOT NULL
+                                   AND e.quality_score IS NOT NULL
+                                   ORDER BY t.submitted_at,t.episode_id""").fetchall()
+    groups: dict[str, list[tuple[str, dict[str, float], int]]] = {}
+    linked_parent_codex_results = 0
+    for root, submitted_at, prompt, feedback, author, parent_result, parent_score, adopted, score, parent_id in raw:
+        if not (0 <= parent_score <= 100 and 0 <= score <= 100):
+            continue
+        codex_result = linked_results.get(parent_id)
+        if codex_result is not None:
+            linked_parent_codex_results += 1
+        vector = _iteration_vector(json.loads(prompt), json.loads(feedback) if feedback else None,
+                                   author, json.loads(parent_result), parent_score, bool(adopted), codex_result)
+        groups.setdefault(root, []).append((submitted_at, vector, int(score > parent_score)))
+    ordered = sorted(groups, key=lambda root: min(row[0] for row in groups[root]))
+    revisions = sum(len(rows) for rows in groups.values())
+    if revisions < 20 or len(groups) < 10:
+        return {"status": "insufficient_scored_revisions", "scored_revisions": revisions,
+                "task_groups": len(groups),
+                "linked_parent_codex_results": linked_parent_codex_results}
+    holdout_count = max(2, math.ceil(len(ordered) * 0.2))
+    training = [(vector, label) for root in ordered[:-holdout_count]
+                for _at, vector, label in groups[root]]
+    test = [(vector, label) for root in ordered[-holdout_count:]
+            for _at, vector, label in groups[root]]
+    if len({label for _vector, label in training}) < 2 or len(test) < 4:
+        return {"status": "insufficient_improvement_diversity", "scored_revisions": revisions,
+                "task_groups": len(groups), "holdout_revisions": len(test)}
+    weights, bias = _fit(training)
+    baseline_rate = sum(label for _vector, label in training) / len(training)
+    baseline_brier = sum((baseline_rate - label) ** 2 for _vector, label in test) / len(test)
+    model_brier = _brier(test, weights, bias)
+    checkpoint = _evaluation_checkpoint(IMPROVEMENT_EVAL_PATH,
+                                        "modellabs.revision_improvement_evaluation_checkpoint.v2",
+                                        ordered, groups, feature_version=ITERATION_FEATURE_VERSION)
+    prospective_groups, prospective = _prospective_rows(ordered, groups, checkpoint)
+    prospective_baseline = (sum((checkpoint["baseline_rate"] - label) ** 2
+                                for _vector, label in prospective) / len(prospective)
+                            if prospective else None)
+    prospective_model = (_brier(prospective, checkpoint["weights"], checkpoint["bias"])
+                         if prospective else None)
+    gain = (prospective_baseline - prospective_model) if prospective else 0.0
+    validated = (len(prospective) >= MIN_REVIEW_HOLDOUT
+                 and len(prospective_groups) >= 10
+                 and gain >= MIN_REVIEW_BRIER_GAIN
+                 and gain / max(prospective_baseline or 0.0, 1e-9) >= MIN_REVIEW_RELATIVE_GAIN)
+    final_weights, final_bias = _fit([(vector, label) for root in ordered
+                                      for _at, vector, label in groups[root]])
+    artifact = {"schema": "modellabs.revision_improvement_model.v2",
+                "feature_version": ITERATION_FEATURE_VERSION,
+                "scored_revisions": revisions, "task_groups": len(groups),
+                "linked_parent_codex_results": linked_parent_codex_results,
+                "holdout_revisions": len(test),
+                "baseline_brier": round(baseline_brier, 6), "model_brier": round(model_brier, 6),
+                "retrospective_holdout_is_diagnostic_only": True,
+                "prospective_checkpoint_created_at": checkpoint["created_at"],
+                "prospective_holdout_revisions": len(prospective),
+                "prospective_holdout_task_groups": len(prospective_groups),
+                "prospective_baseline_brier": round(prospective_baseline, 6) if prospective else None,
+                "prospective_model_brier": round(prospective_model, 6) if prospective else None,
+                "validated_for_shadow": validated,
+                "causal_prompt_comparison": False,
+                "weights": final_weights, "bias": final_bias}
+    temporary = IMPROVEMENT_MODEL_PATH.with_name(
+        f".{IMPROVEMENT_MODEL_PATH.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
+        json.dump(artifact, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, IMPROVEMENT_MODEL_PATH)
+    return {key: value for key, value in artifact.items() if key not in {"weights", "bias"}}
+
+
 def predict_iteration(origin_prompt: str, generation_prompt: str, author: str,
-                      round_number: int, parent_feedback: str = "") -> dict[str, Any]:
+                      round_number: int, parent_feedback: str = "",
+                      parent_result: str = "", parent_quality_score: int | None = None,
+                      parent_suggestion: str = "", parent_codex_result: str = "") -> dict[str, Any]:
     model = _read_json(ITERATION_MODEL_PATH)
-    if model.get("schema") != "modellabs.iteration_outcome_model.v1" or model.get("feature_version") != FEATURE_VERSION:
+    if (model.get("schema") != "modellabs.iteration_outcome_model.v5"
+            or model.get("feature_version") != ITERATION_FEATURE_VERSION):
         raise ValueError("iteration model version mismatch")
+    if (parent_result or parent_quality_score is not None or parent_suggestion
+            or parent_codex_result) and round_number < 2:
+        raise ValueError("first-round prediction cannot include parent evidence")
+    adopted = bool(parent_suggestion.strip()) and parent_suggestion.strip() == generation_prompt.strip()
     key = _key()
     vector = _iteration_vector(_features(origin_prompt, generation_prompt, round_number, key),
                                _features(parent_feedback, "", 1, key) if parent_feedback else None,
-                               author)
+                               author, _features(parent_result, "", 1, key) if parent_result else None,
+                               parent_quality_score, adopted,
+                               _features(parent_codex_result, "", 1, key) if parent_codex_result else None)
     probability = _sigmoid(model["bias"] + sum(model["weights"][int(index)] * value
-                                                   for index, value in vector.items()))
+                                                   for index, value in vector.items()
+                                                   if int(index) < len(model["weights"])))
+    improvement_probability = None
+    improvement_validated = False
+    if (IMPROVEMENT_MODEL_PATH.exists() and round_number >= 2
+            and parent_result and parent_quality_score is not None):
+        improvement = _read_json(IMPROVEMENT_MODEL_PATH)
+        if (improvement.get("schema") != "modellabs.revision_improvement_model.v2"
+                or improvement.get("feature_version") != ITERATION_FEATURE_VERSION):
+            raise ValueError("revision improvement model version mismatch")
+        improvement_probability = round(_sigmoid(
+            improvement["bias"] + sum(improvement["weights"][int(index)] * value
+                                      for index, value in vector.items()
+                                      if int(index) < len(improvement["weights"]))), 4)
+        improvement_validated = improvement["validated_for_shadow"]
     return {"predicted_review_pass_probability": round(probability, 4),
+            "predicted_score_improvement_probability": improvement_probability,
+            "improvement_validated_for_shadow": improvement_validated,
             "validated_for_shadow": model["validated_for_shadow"],
-            "causal_prompt_comparison": False, "training_rounds": model["trained_rounds"]}
+            "causal_prompt_comparison": False, "training_rounds": model["trained_rounds"],
+            "parent_result_supplied": bool(parent_result),
+            "parent_review_artifact_supplied": bool(parent_result),
+            "parent_codex_result_supplied": bool(parent_codex_result),
+            "linked_parent_codex_results_in_training": model.get("linked_parent_codex_results", 0),
+            "parent_quality_score_supplied": parent_quality_score is not None,
+            "adopted_parent_suggestion": adopted}
 
 
 def status() -> dict[str, Any]:
@@ -938,48 +1407,103 @@ def status() -> dict[str, Any]:
         rows = connection.execute("SELECT source,COUNT(*),COUNT(DISTINCT group_id),SUM(passed) FROM episodes GROUP BY source").fetchall()
         codex = connection.execute("""SELECT COUNT(*),COUNT(DISTINCT group_id),
                                      SUM(quality_score IS NOT NULL),SUM(total_tokens IS NOT NULL),
-                                     SUM(result_digest IS NOT NULL)
+                                     SUM(result_digest IS NOT NULL),
+                                     SUM(quality_score IS NOT NULL AND total_tokens IS NOT NULL
+                                         AND result_digest IS NOT NULL)
                                      FROM codex_turns""").fetchone()
         traces = connection.execute("""SELECT COUNT(*),COUNT(DISTINCT root_key),
                                      SUM(parent_episode_id IS NOT NULL),
-                                     SUM(adopted_parent_suggestion) FROM iteration_traces""").fetchone()
+                                     SUM(adopted_parent_suggestion),
+                                     SUM(parent_episode_id IS NOT NULL AND parent_result_features IS NOT NULL
+                                         AND parent_quality_score IS NOT NULL),
+                                     COUNT(DISTINCT CASE WHEN parent_episode_id IS NOT NULL
+                                         AND parent_result_features IS NOT NULL
+                                         AND parent_quality_score IS NOT NULL THEN root_key END)
+                                     FROM iteration_traces""").fetchone()
         sessions = connection.execute("""SELECT COUNT(*),COUNT(DISTINCT thread_key),
                                        SUM(reported_total_tokens IS NOT NULL),
                                        SUM(grade_status='explicit' AND exact_total_tokens IS NOT NULL),
                                        SUM(input_scope='single_pre_inference_message')
                                        FROM session_turns""").fetchone()
+        cross_source = connection.execute("""SELECT COUNT(*),SUM(source_kind='managed' AND link_status='valid'),
+                                           SUM(source_kind='completed_session' AND link_status='valid'),
+                                           SUM(link_status='ambiguous')
+                                           FROM review_codex_links""").fetchone()
     summary: dict[str, Any] = {"sources": {source: {"episodes": count, "task_groups": groups,
                                                        "passing": passing or 0}
                                             for source, count, groups, passing in rows}}
     summary["codex"] = {"accepted_turns": codex[0], "thread_groups": codex[1],
                         "graded_turns": codex[2] or 0, "exact_usage_turns": codex[3] or 0,
-                        "result_captured_turns": codex[4] or 0}
+                        "result_captured_turns": codex[4] or 0,
+                        "complete_prompt_result_usage_grade_turns": codex[5] or 0}
     summary["iterations"] = {"linked_rounds": traces[0], "task_groups": traces[1],
                              "revisions_with_parent_feedback": traces[2] or 0,
-                             "adopted_browser_suggestions": traces[3] or 0}
+                             "adopted_browser_suggestions": traces[3] or 0,
+                             "context_complete_revision_rounds": traces[4] or 0,
+                             "context_complete_revision_task_groups": traces[5] or 0}
     summary["standalone_codex"] = {"completed_prompt_result_pairs": sessions[0],
                                    "thread_groups": sessions[1],
                                    "reported_usage_pairs": sessions[2] or 0,
                                    "complete_explicit_grade_exact_usage": sessions[3] or 0,
                                    "single_pre_inference_prompt_pairs": sessions[4] or 0,
                                    "training_role": "retrospective_observational_only"}
+    summary["browser_codex_links"] = {"exact_prompt_result_review_links": cross_source[0] - (cross_source[3] or 0),
+                                      "managed": cross_source[1] or 0,
+                                      "completed_session": cross_source[2] or 0,
+                                      "ambiguous": cross_source[3] or 0,
+                                      "label_role": "browser_review_only"}
     if MODEL_PATH.exists():
         model = _read_json(MODEL_PATH)
         summary["review_model"] = {key: model.get(key) for key in
-                                   ("trained_episodes", "task_groups", "holdout_episodes",
-                                    "baseline_brier", "model_brier", "validated_for_shadow")}
+                                   ("trained_episodes", "task_groups", "task_group_policy",
+                                    "holdout_episodes",
+                                    "baseline_brier", "model_brier",
+                                    "retrospective_holdout_is_diagnostic_only",
+                                    "prospective_checkpoint_created_at",
+                                    "prospective_holdout_episodes", "prospective_holdout_task_groups",
+                                    "prospective_baseline_brier", "prospective_model_brier",
+                                    "validated_for_shadow")}
     if CODEX_MODEL_PATH.exists():
         model = _read_json(CODEX_MODEL_PATH)
         summary["codex_model"] = {key: model.get(key) for key in
                                   ("trained_turns", "task_groups", "holdout_turns",
-                                   "baseline_brier", "model_brier", "validated_for_shadow",
+                                   "baseline_brier", "model_brier",
+                                   "retrospective_holdout_is_diagnostic_only",
+                                   "prospective_checkpoint_created_at",
+                                   "prospective_holdout_turns", "prospective_holdout_task_groups",
+                                   "prospective_comparable_arms",
+                                   "prospective_baseline_brier", "prospective_model_brier",
+                                   "validated_for_shadow",
                                    "causal_model_comparison")}
     if ITERATION_MODEL_PATH.exists():
         model = _read_json(ITERATION_MODEL_PATH)
         summary["iteration_model"] = {key: model.get(key) for key in
                                       ("trained_rounds", "task_groups", "holdout_rounds",
-                                       "baseline_brier", "model_brier", "validated_for_shadow",
+                                       "context_complete_revision_rounds",
+                                      "context_complete_revision_task_groups",
+                                       "linked_parent_codex_results",
+                                       "minimum_revision_task_groups",
+                                       "training_context_complete_revision_task_groups",
+                                       "holdout_context_complete_revision_task_groups",
+                                       "baseline_brier", "model_brier",
+                                       "retrospective_holdout_is_diagnostic_only",
+                                       "prospective_checkpoint_created_at",
+                                       "prospective_holdout_rounds", "prospective_holdout_task_groups",
+                                       "prospective_context_complete_revision_task_groups",
+                                       "prospective_baseline_brier", "prospective_model_brier",
+                                       "validated_for_shadow",
                                        "causal_prompt_comparison")}
+    if IMPROVEMENT_MODEL_PATH.exists():
+        model = _read_json(IMPROVEMENT_MODEL_PATH)
+        summary["improvement_model"] = {key: model.get(key) for key in
+                                        ("scored_revisions", "task_groups", "holdout_revisions",
+                                         "linked_parent_codex_results",
+                                         "baseline_brier", "model_brier",
+                                         "retrospective_holdout_is_diagnostic_only",
+                                         "prospective_checkpoint_created_at",
+                                         "prospective_holdout_revisions", "prospective_holdout_task_groups",
+                                         "prospective_baseline_brier", "prospective_model_brier",
+                                         "validated_for_shadow", "causal_prompt_comparison")}
     return summary
 
 
@@ -987,7 +1511,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Local ModelLabs outcome learner")
     parser.add_argument("action", choices=("update", "import-auracall", "import-codex-sessions",
                                            "sync-codex", "sync-session-grades", "train", "train-codex",
-                                           "train-iteration", "status", "predict-review", "predict-codex",
+                                           "train-iteration", "train-improvement", "status", "predict-review", "predict-codex",
                                            "predict-iteration"))
     parser.add_argument("--guard-root", type=Path)
     parser.add_argument("--runs-root", type=Path)
@@ -1002,16 +1526,21 @@ def main() -> None:
     parser.add_argument("--origin-prompt-file", type=Path)
     parser.add_argument("--generation-prompt-file", type=Path)
     parser.add_argument("--parent-feedback-file", type=Path)
+    parser.add_argument("--parent-result-file", type=Path)
+    parser.add_argument("--parent-codex-result-file", type=Path)
+    parser.add_argument("--parent-quality-score", type=int)
+    parser.add_argument("--parent-suggestion-file", type=Path)
     parser.add_argument("--prompt-author", choices=("user", "chatgpt", "codex", "mixed"))
     args = parser.parse_args()
     if args.action == "update":
-        imported = import_auracall(args.guard_root, args.runs_root, args.guard_id)
         sessions = import_codex_sessions(args.sessions_root, args.thread_id)
+        imported = import_auracall(args.guard_root, args.runs_root, args.guard_id)
         session_grades = sync_session_grades()
         synced = sync_codex_grades()
         result = {"auracall": imported, "sessions": sessions,
                   "session_grades": session_grades, "codex": synced,
                   "review_model": train_review_model(), "iteration_model": train_iteration_model(),
+                  "improvement_model": train_improvement_model(),
                   "codex_model": train_codex_model()}
     elif args.action == "import-auracall":
         result = import_auracall(args.guard_root, args.runs_root, args.guard_id)
@@ -1027,6 +1556,8 @@ def main() -> None:
         result = train_codex_model()
     elif args.action == "train-iteration":
         result = train_iteration_model()
+    elif args.action == "train-improvement":
+        result = train_improvement_model()
     elif args.action == "predict-review":
         if not args.goal_file or not args.revision_file:
             parser.error("predict-review requires --goal-file and --revision-file")
@@ -1041,9 +1572,16 @@ def main() -> None:
         if not args.origin_prompt_file or not args.generation_prompt_file or not args.prompt_author:
             parser.error("predict-iteration requires origin prompt, generation prompt, and author")
         feedback = args.parent_feedback_file.read_text(encoding="utf-8") if args.parent_feedback_file else ""
+        parent_result = args.parent_result_file.read_text(encoding="utf-8") if args.parent_result_file else ""
+        parent_codex_result = (args.parent_codex_result_file.read_text(encoding="utf-8")
+                               if args.parent_codex_result_file else "")
+        parent_suggestion = (args.parent_suggestion_file.read_text(encoding="utf-8")
+                             if args.parent_suggestion_file else "")
         result = predict_iteration(args.origin_prompt_file.read_text(encoding="utf-8"),
                                    args.generation_prompt_file.read_text(encoding="utf-8"),
-                                   args.prompt_author, args.round, feedback)
+                                   args.prompt_author, args.round, feedback,
+                                   parent_result, args.parent_quality_score, parent_suggestion,
+                                   parent_codex_result)
     else:
         result = status()
     print(json.dumps(result, sort_keys=True))

@@ -1,7 +1,9 @@
 import os
 import json
 import sys
+import io
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modellabs import route
+import modellabs
 import install as installer
 from install import (SHELL_PATH_START, discover_real_codex,
                      ensure_managed_route_precedence, upsert_toml, write_wrappers)
@@ -25,6 +28,26 @@ import thread_owner
 
 
 class RoutingTests(unittest.TestCase):
+    def test_grade_updates_local_learner_without_reversing_grade_on_failure(self):
+        arguments = ["modellabs", "grade", "--thread-id", "thread", "--turn-id", "turn",
+                     "--quality-score", "95", "--verification", "passed"]
+        with patch.object(sys, "argv", arguments), \
+                patch("adaptive_policy.record_explicit_grade", return_value={"quality_score": 95}) as grade, \
+                patch("outcome_model.sync_codex_grades", return_value={"graded": 1}) as sync, \
+                patch("outcome_model.train_codex_model", return_value={"status": "insufficient_comparable_outcomes"}), \
+                redirect_stdout(io.StringIO()) as output:
+            modellabs.main()
+        self.assertEqual(grade.call_count, 1)
+        self.assertEqual(sync.call_count, 1)
+        self.assertEqual(json.loads(output.getvalue())["learning_sync"]["status"], "ok")
+        with patch.object(sys, "argv", arguments), \
+                patch("adaptive_policy.record_explicit_grade", return_value={"quality_score": 95}) as grade, \
+                patch("outcome_model.sync_codex_grades", side_effect=OSError("private store unavailable")), \
+                redirect_stdout(io.StringIO()) as output:
+            modellabs.main()
+        self.assertEqual(grade.call_count, 1)
+        self.assertEqual(json.loads(output.getvalue())["learning_sync"]["status"], "failed")
+
     def test_configure_codex_removes_only_modellabs_prompt_hook(self):
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as directory:

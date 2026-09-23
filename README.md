@@ -133,6 +133,11 @@ are joined later by the same thread and turn identities. The last completed
 Codex agent message contributes keyed result features after the turn ends;
 result text is not retained in the learning database or used to predict a
 model before the turn. Weak keyword feedback is excluded from model labels.
+Managed Codex outcome training requires the same turn's captured final answer,
+explicit grade, completed status, and exact usage from the owning proxy. A
+grade or token total alone cannot promote an incomplete turn into training.
+`modellabs grade` attempts a local learner sync after recording the grade and
+reports that sync separately; a learning error cannot erase an accepted grade.
 Standalone local Codex rollout logs can also be imported with
 `modellabs-learn import-codex-sessions`. This captures completed user-prompt
 and final-answer feature pairs, observed model/effort, and reported turn usage
@@ -169,17 +174,61 @@ verdict and is recorded as `learning_sync.status: failed`.
 
 For future iterative reviews, the guard can bind the original user prompt,
 the generation prompt that produced each candidate, its author, and the exact
-parent guard. ModelLabs imports those linked rounds and the prior reviewer
-feedback as private keyed features. `modellabs-learn train-iteration` fits a
+parent guard. ModelLabs imports those linked rounds, the prior review artifact,
+its numeric review score, and the prior reviewer feedback as private keyed
+features. The artifact may be a packet containing an answer, checks, and other
+evidence; it is not assumed to be the Codex final answer. Only the **previous**
+round's artifact and score enter a candidate prompt's feature vector; the
+candidate's own answer and grade are never
+available to its pre-generation prediction. `modellabs-learn train-iteration` fits a
 separate predictor only after enough linked task groups exist; its held-out
 score and `validated_for_shadow` flag are reported in `status`. The prompt
 model remains observational: it cannot prove that a prompt edit caused an
 improvement, and it does not rewrite prompts automatically. Once trained,
 `predict-iteration` scores a candidate generation prompt against the original
-prompt and optional prior feedback without submitting it to ChatGPT.
+prompt and optional prior feedback, reviewed artifact, score, and exact browser-suggested
+prompt without submitting it to ChatGPT. Supply `--parent-feedback-file`,
+`--parent-result-file`, `--parent-quality-score`, and
+`--parent-suggestion-file` for a complete revised-round context. Exact adoption
+of that suggestion is a separate model feature, not merely a claimed prompt
+author. When the prior review artifact and bound generation prompt exactly
+match a Codex turn's completed final answer and prompt, the model adds that
+separately as verified Codex-result evidence. A candidate prediction can also
+accept `--parent-codex-result-file`; the caller-supplied text is reported as
+such, not claimed to be a verified training link. The upgraded iteration
+predictor uses a separate v5 model and frozen checkpoint, so an old
+evaluation cannot silently validate the new feature set.
+Training also requires at least eight distinct training task groups and two
+diagnostic holdout groups with revised rounds that include the previous
+reviewed result and score. Prospective shadow
+validation requires eight such new groups as well: first-round reviews alone
+cannot validate an adaptive iteration predictor.
+`modellabs-learn train-improvement` fits a separate revision-only outcome:
+whether the new browser review score exceeds its exact parent's score. Unlike
+the pass target, this captures progress that still falls short of the release
+threshold. It uses the bound original and revised prompts, prior feedback,
+prior review artifact and score, prompt author, exact suggestion adoption,
+and a separate Codex final-answer feature only when exact linkage proves it.
+`predict-iteration` reports `predicted_score_improvement_probability` only
+when this model exists and the parent result and score are supplied. Its frozen
+prospective checkpoint and `improvement_validated_for_shadow` flag are separate
+from the pass predictor; neither probability is a causal estimate or an
+automatic prompt rewrite. The prospective holdout admits only task roots that
+began after its checkpoint; a late revision of an older root cannot enter it.
 When a later prompt exactly adopts the browser reviewer's suggested next
 prompt, `status` counts that link separately rather than trusting an author
-label alone.
+label alone. The iteration model also freezes a private evaluation checkpoint
+once enough linked task groups exist; later independent groups, not a moving
+rolling holdout, determine whether its shadow-validation threshold is met.
+If the guard's bound generation prompt and submitted artifact exactly match a
+single Codex turn's prompt and completed final answer, the learner records a
+cross-source link. Ambiguous matches are rejected. The linked browser score
+remains a browser-review label, distinct from an operator-verified Codex grade;
+it does not silently train the managed Codex outcome model.
+`modellabs-learn update` reports `trace_missing` for otherwise eligible guard
+reviews that lack bound prompt lineage. These reviews can still inform the
+ordinary review-pass model, but not the adaptive iteration model; their missing
+generation prompts cannot be safely inferred from round numbers.
 
 `modellabs-learn train` fits a regularized review-pass predictor and evaluates
 it on later, whole task groups withheld from training. `modellabs-learn status`
@@ -189,16 +238,28 @@ round locally. Its probability is advisory; a model with
 `validated_for_shadow: false` must not influence routing or release gates.
 The review model now requires at least 20 held-out episodes and both a 0.005
 absolute and 5% relative Brier-score improvement over the constant baseline
-before it can even qualify for shadow validation. This prospective conservative
-gate replaces the old positive-difference-only check, which could label a
-negligible improvement as validated.
+before it can even qualify for shadow validation. An immutable private
+checkpoint freezes the evaluation predictor, baseline, and development task
+groups before future grades arrive. Only new task groups submitted after that
+checkpoint count toward this prospective test, and at least ten such groups
+are required. Episodes with the same review goal remain conservatively grouped;
+verified AuraCall iteration roots also connect rounds even if their review-goal
+wording changes. A later round of an older task therefore cannot enter the
+prospective holdout by changing its goal text. The older rolling holdout scores remain diagnostic only: their
+groups can move into later training, so they cannot validate an adaptive
+model. Live shadow predictions may continue fitting new graded data, but
+their validation flag remains false until the prospective checkpoint passes.
 `modellabs-learn sync-codex` joins accepted turns with explicit grades and exact
 usage; `modellabs-learn train-codex` trains only when at least two model/effort
 arms have enough comparable graded turns in a task class. Predictions remain
 observational and shadow-only: routine traffic is heavily concentrated in one
 older arm, so the model cannot infer what an untried arm would have done. The
-current task-based router remains authoritative until paired, independently
-verified comparisons support a policy change.
+Codex outcome model freezes its development groups and eligible model/effort
+arms before prospective evaluation; later new arms cannot count as evidence
+for an arm the checkpoint never learned. Future validation also requires
+comparable arms in a common task class. The current task-based router remains
+authoritative until paired, independently verified comparisons support a
+policy change.
 
 ## Run a managed chat
 
