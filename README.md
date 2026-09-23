@@ -137,9 +137,17 @@ Standalone local Codex rollout logs can also be imported with
 `modellabs-learn import-codex-sessions`. This captures completed user-prompt
 and final-answer feature pairs, observed model/effort, and reported turn usage
 without storing the text. These examples remain explicitly **ungraded** and
-are excluded from model training; reported session usage is not substituted
-for the managed proxy's exact server-usage and grade join. Re-imports are
-idempotent, with changed records reported as conflicts rather than overwritten.
+are excluded from model training unless `modellabs-learn sync-session-grades`
+finds an exact same-thread/turn accepted route, completed turn, proxy usage,
+and explicit grade in local telemetry. That retrospective join also requires
+the session's model, effort, and reported usage to agree with telemetry. It is
+reported separately from live pre-inference managed capture and is not by
+itself evidence of prospective adaptation. Explicitly graded retrospective
+examples can enter the observational Codex outcome trainer, where independent
+task-group holdout and multiple supported model/effort arms are still required
+before a model is trained. Re-imports and joins are
+idempotent, with changed session records reported as conflicts rather than
+overwritten.
 
 `modellabs-learn import-auracall` reads completed AuraCall Pro guard rounds from
 their saved guard state and exact durable response record. It requires the

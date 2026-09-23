@@ -229,10 +229,57 @@ class OutcomeModelTests(unittest.TestCase):
                 summary = outcome_model.status()["standalone_codex"]
                 self.assertEqual(summary["completed_prompt_result_pairs"], 1)
                 self.assertEqual(summary["reported_usage_pairs"], 1)
-                self.assertEqual(summary["grade_status"], "ungraded")
+                self.assertEqual(summary["complete_explicit_grade_exact_usage"], 0)
                 raw = outcome_model.DB_PATH.read_bytes()
                 self.assertNotIn(b"private actual user prompt", raw)
                 self.assertNotIn(b"private final answer", raw)
+
+    def test_retrospective_grade_join_requires_exact_identity_and_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            thread_id = "01234567-89ab-cdef-0123-456789abcdef"
+            turn_id = "11111111-2222-3333-4444-555555555555"
+            rows = [
+                {"type": "session_meta", "payload": {"id": thread_id}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "private graded prompt"}]}},
+                {"type": "turn_context", "payload": {"turn_id": turn_id, "model": "gpt-6-luna",
+                    "effort": "low"}},
+                {"type": "token_usage_record", "payload": {"turn_id": turn_id,
+                    "turn_token_usage": {"total_tokens": 321}}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id,
+                    "last_agent_message": "private graded answer", "completed_at": 1780274115}},
+            ]
+            (sessions / f"rollout-example-{thread_id}.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            common = {"thread_id": thread_id, "model": "gpt-6-luna", "effort": "low"}
+            metrics = [
+                {**common, "event": "route_accepted", "turn_id": turn_id, "task_class": "simple"},
+                {**common, "event": "turn_completed", "turn_id": turn_id, "status": "completed"},
+                {**common, "event": "turn_usage", "turn_id": turn_id,
+                 "source": "proxy_thread_usage_delta", "usage": {"totalTokens": 320}},
+                {**common, "event": "quality_grade", "source_turn_id": turn_id,
+                 "source": "explicit", "quality_score": 100, "verification": "passed"},
+            ]
+            metrics_path = root / "metrics.jsonl"
+            with self.private_store(root):
+                self.assertEqual(outcome_model.import_codex_sessions(sessions, thread_id)["imported"], 1)
+                metrics_path.write_text("\n".join(json.dumps(row) for row in metrics) + "\n")
+                self.assertEqual(outcome_model.sync_session_grades(metrics_path)["joined"], 0)
+                metrics[2]["usage"]["totalTokens"] = 321
+                metrics_path.write_text("\n".join(json.dumps(row) for row in metrics) + "\n")
+                self.assertEqual(outcome_model.sync_session_grades(metrics_path)["joined"], 1)
+                self.assertEqual(outcome_model.sync_session_grades(metrics_path)["unchanged"], 1)
+                self.assertEqual(outcome_model.status()["standalone_codex"]
+                                 ["complete_explicit_grade_exact_usage"], 1)
+                report = outcome_model.train_codex_model()
+                self.assertEqual(report["graded_with_usage"], 1)
+                self.assertEqual(report["status"], "insufficient_comparable_outcomes")
+                self.assertNotIn(b"private graded prompt", outcome_model.DB_PATH.read_bytes())
+                self.assertNotIn(b"private graded answer", outcome_model.DB_PATH.read_bytes())
 
 
 if __name__ == "__main__":

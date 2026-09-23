@@ -157,6 +157,11 @@ def _connect() -> sqlite3.Connection:
         grade_status TEXT NOT NULL DEFAULT 'ungraded',
         PRIMARY KEY(thread_key,turn_key)
     )""")
+    session_columns = {row[1] for row in connection.execute("PRAGMA table_info(session_turns)")}
+    for name, definition in (("task_class", "TEXT"), ("exact_total_tokens", "INTEGER"),
+                             ("quality_score", "INTEGER"), ("verification", "TEXT")):
+        if name not in session_columns:
+            connection.execute(f"ALTER TABLE session_turns ADD COLUMN {name} {definition}")
     return connection
 
 
@@ -317,6 +322,74 @@ def import_codex_sessions(sessions_root: Path | None = None,
             except (OSError, ValueError, TypeError):
                 counts["file_skipped"] += 1
     return {name: counts[name] for name in ("imported", "unchanged", "conflict", "turn_ineligible", "file_skipped")}
+
+
+def sync_session_grades(metrics_path: Path | None = None) -> dict[str, int]:
+    """Join complete retrospective sessions to exact proxy usage and explicit grades."""
+    from telemetry import METRICS_PATH
+
+    path = metrics_path or METRICS_PATH
+    if path.is_symlink() or not path.is_file():
+        return {"joined": 0, "unchanged": 0, "ineligible": 0}
+    key = _key()
+    grouped: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = {}
+    with path.open("r", encoding="utf-8") as source:
+        for line in source:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict) or row.get("event") not in {
+                    "route_accepted", "turn_completed", "turn_usage", "quality_grade"}:
+                continue
+            thread_id = row.get("thread_id")
+            turn_id = row.get("source_turn_id") if row["event"] == "quality_grade" else row.get("turn_id")
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                continue
+            identity = (_digest(key, thread_id), _digest(key, turn_id))
+            grouped.setdefault(identity, {}).setdefault(row["event"], []).append(row)
+    counts = Counter()
+    with _connect() as connection:
+        for identity, events in grouped.items():
+            session = connection.execute("""SELECT model,effort,reported_total_tokens,grade_status,
+                                        exact_total_tokens,quality_score,verification
+                                        FROM session_turns WHERE thread_key=? AND turn_key=?""",
+                                         identity).fetchone()
+            if session is None:
+                continue
+            if any(len(events.get(name, [])) != 1 for name in
+                   ("route_accepted", "turn_completed", "turn_usage", "quality_grade")):
+                counts["ineligible"] += 1
+                continue
+            accepted, completed, usage, grade = (events[name][0] for name in
+                                                  ("route_accepted", "turn_completed", "turn_usage", "quality_grade"))
+            total = (usage.get("usage") or {}).get("totalTokens")
+            score = grade.get("quality_score")
+            if (completed.get("status") != "completed"
+                    or usage.get("source") not in {"proxy_thread_usage", "proxy_thread_usage_delta"}
+                    or grade.get("source") != "explicit"
+                    or grade.get("verification") not in {"passed", "failed"}
+                    or not isinstance(score, int) or not 0 <= score <= 100
+                    or not isinstance(total, int) or total <= 0
+                    or session[0] not in MODEL_IDS or session[1] not in EFFORTS
+                    or session[2] != total
+                    or any(event.get("model") != session[0] or event.get("effort") != session[1]
+                           for event in (accepted, completed, usage, grade))):
+                counts["ineligible"] += 1
+                continue
+            expected = (total, score, grade["verification"])
+            if session[3] == "explicit" and session[4:] == expected:
+                counts["unchanged"] += 1
+                continue
+            if session[3] != "ungraded":
+                counts["ineligible"] += 1
+                continue
+            connection.execute("""UPDATE session_turns SET grade_status='explicit',task_class=?,
+                                exact_total_tokens=?,quality_score=?,verification=?
+                                WHERE thread_key=? AND turn_key=? AND grade_status='ungraded'""",
+                               (accepted.get("task_class"), total, score, grade["verification"], *identity))
+            counts["joined"] += 1
+    return {name: counts[name] for name in ("joined", "unchanged", "ineligible")}
 
 
 def sync_codex_grades(metrics_path: Path | None = None) -> dict[str, int]:
@@ -618,12 +691,31 @@ def _codex_features(prompt_features: dict[str, float], model: str,
 def train_codex_model() -> dict[str, Any]:
     """Fit only within supported arms; observational predictions stay shadow-only."""
     sync_codex_grades()
+    sync_session_grades()
     with _connect() as connection:
         raw = connection.execute("""SELECT group_id,accepted_at_ms,features,selected_model,
                                    effort,task_class,quality_score,verification,total_tokens
                                    FROM codex_turns WHERE quality_score IS NOT NULL
                                    AND verification IS NOT NULL AND total_tokens IS NOT NULL
                                    ORDER BY accepted_at_ms,turn_key""").fetchall()
+        live_identities = set(connection.execute("""SELECT thread_key,turn_key FROM codex_turns
+                                                   WHERE quality_score IS NOT NULL
+                                                   AND verification IS NOT NULL
+                                                   AND total_tokens IS NOT NULL""").fetchall())
+        historical = connection.execute("""SELECT thread_key,turn_key,completed_at,prompt_features,
+                                         model,effort,task_class,quality_score,verification,exact_total_tokens
+                                         FROM session_turns WHERE grade_status='explicit'
+                                         AND quality_score IS NOT NULL AND verification IS NOT NULL
+                                         AND exact_total_tokens IS NOT NULL""").fetchall()
+    for thread_key, turn_key, completed_at, features, model, effort, task_class, score, verification, tokens in historical:
+        if (thread_key, turn_key) in live_identities:
+            continue
+        try:
+            observed_at_ms = int(datetime.fromisoformat(completed_at.replace("Z", "+00:00")).timestamp() * 1000)
+        except (ValueError, OverflowError):
+            continue
+        raw.append((thread_key, observed_at_ms, features, model, effort, task_class,
+                    score, verification, tokens))
     raw = [row for row in raw if row[3] in MODEL_IDS and row[4] in EFFORTS
            and row[5] in TASK_CLASSES]
     arms = Counter((row[5], row[3], row[4]) for row in raw)
@@ -835,7 +927,8 @@ def status() -> dict[str, Any]:
                                      SUM(parent_episode_id IS NOT NULL),
                                      SUM(adopted_parent_suggestion) FROM iteration_traces""").fetchone()
         sessions = connection.execute("""SELECT COUNT(*),COUNT(DISTINCT thread_key),
-                                       SUM(reported_total_tokens IS NOT NULL)
+                                       SUM(reported_total_tokens IS NOT NULL),
+                                       SUM(grade_status='explicit' AND exact_total_tokens IS NOT NULL)
                                        FROM session_turns""").fetchone()
     summary: dict[str, Any] = {"sources": {source: {"episodes": count, "task_groups": groups,
                                                        "passing": passing or 0}
@@ -849,7 +942,8 @@ def status() -> dict[str, Any]:
     summary["standalone_codex"] = {"completed_prompt_result_pairs": sessions[0],
                                    "thread_groups": sessions[1],
                                    "reported_usage_pairs": sessions[2] or 0,
-                                   "grade_status": "ungraded"}
+                                   "complete_explicit_grade_exact_usage": sessions[3] or 0,
+                                   "training_role": "retrospective_observational_only"}
     if MODEL_PATH.exists():
         model = _read_json(MODEL_PATH)
         summary["review_model"] = {key: model.get(key) for key in
@@ -873,7 +967,7 @@ def status() -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local ModelLabs outcome learner")
     parser.add_argument("action", choices=("update", "import-auracall", "import-codex-sessions",
-                                           "sync-codex", "train", "train-codex",
+                                           "sync-codex", "sync-session-grades", "train", "train-codex",
                                            "train-iteration", "status", "predict-review", "predict-codex",
                                            "predict-iteration"))
     parser.add_argument("--guard-root", type=Path)
@@ -901,6 +995,8 @@ def main() -> None:
         result = import_auracall(args.guard_root, args.runs_root, args.guard_id)
     elif args.action == "import-codex-sessions":
         result = import_codex_sessions(args.sessions_root, args.thread_id)
+    elif args.action == "sync-session-grades":
+        result = sync_session_grades()
     elif args.action == "sync-codex":
         result = sync_codex_grades()
     elif args.action == "train":
