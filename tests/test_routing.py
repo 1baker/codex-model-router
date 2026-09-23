@@ -42,8 +42,21 @@ class RoutingTests(unittest.TestCase):
 
     def test_explicit_effort_wins(self):
         choice = route("Format these values as CSV with reasoning effort ultra.")
-        self.assertEqual(choice["effort"], "max")
+        self.assertEqual(choice["effort"], "ultra")
         self.assertTrue(choice["explicit_effort"])
+
+    def test_new_models_and_intelligence_choices(self):
+        for prompt, model, effort in [
+            ("Use GPT-6 Sol with reasoning effort ultra to review this.", "gpt-6-sol", "ultra"),
+            ("Use GPT-6 Luna with intelligence none to format this.", "gpt-6-luna", "none"),
+            ("Use Sol with reasoning effort max to investigate this.", "gpt-5.6-sol", "max"),
+            ("Use GPT-5.6 Sol with reasoning effort high to investigate this.", "gpt-5.6-sol", "high"),
+        ]:
+            with self.subTest(prompt=prompt):
+                choice = route(prompt)
+                self.assertEqual((choice["model"], choice["effort"]), (model, effort))
+                self.assertTrue(choice["explicit_model"])
+                self.assertTrue(choice["explicit_effort"])
 
     def test_explicit_model_is_never_adapted(self):
         choice = route("Use Sol to implement a small validated parser.")
@@ -81,6 +94,18 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(selection_is_listed(catalog, {"model": "gpt-6-astra", "effort": "ultra"}))
         self.assertFalse(selection_is_listed(catalog, {"model": "gpt-6-astra", "effort": "max"}))
         self.assertFalse(selection_is_listed(catalog, {"model": "gpt-5.6-luna", "effort": "low"}))
+
+    def test_new_model_efforts_follow_the_live_catalog(self):
+        catalog = {"data": [
+            {"id": "gpt-6-sol", "hidden": False,
+             "supportedReasoningEfforts": [{"reasoningEffort": "ultra"}]},
+            {"id": "gpt-6-luna", "hidden": False,
+             "supportedReasoningEfforts": [{"reasoningEffort": "max"}]},
+        ]}
+        self.assertTrue(selection_is_listed(catalog, route("Use GPT-6 Sol with reasoning effort ultra.")))
+        self.assertTrue(selection_is_listed(catalog, route("Use GPT-6 Luna with reasoning effort max.")))
+        self.assertFalse(selection_is_listed(catalog, route("Use GPT-6 Luna with reasoning effort ultra.")))
+        self.assertFalse(selection_is_listed(catalog, route("Use GPT-6 Luna with intelligence none.")))
 
     def test_toml_upsert_preserves_existing_sections(self):
         source = '[features]\nmemories = true\n\n[mcp_servers.other]\ncommand = "other"\n'

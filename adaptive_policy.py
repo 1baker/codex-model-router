@@ -16,7 +16,15 @@ from telemetry import METRICS_PATH, record
 
 RETRY = re.compile(r"\b(still|failed|failure|broken|incorrect|not working|try again|redo)\b", re.I)
 VERIFIED = re.compile(r"\b(tests? passed|verified|works now|looks good|fixed)\b", re.I)
-ORDER = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"]
+ORDER = ["gpt-5.6-luna", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6-astra"]
+ESCALATION_NEXT = {
+    "gpt-5.6-luna": "gpt-5.6-terra",
+    "gpt-5.6-terra": "gpt-5.6-sol",
+    "gpt-5.6-sol": "gpt-6-sol",
+    "gpt-6-luna": "gpt-6-sol",
+    "gpt-6-sol": "gpt-6-astra",
+    "gpt-6-astra": "gpt-6-astra",
+}
 WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 MIN_RETRY_SIGNALS = 4
 MIN_VERIFIED_SIGNALS = 10
@@ -204,7 +212,7 @@ def adapt(choice: dict[str, Any], *, thread_id: str | None = None,
     verified = sum(row.get("outcome") == "verified" for row in relevant)
     recommendation: dict[str, str] = {}
     if retries >= MIN_RETRY_SIGNALS and retries * 2 >= len(relevant):
-        recommendation = {"model": ORDER[min(ORDER.index(choice["model"]) + 1, len(ORDER) - 1)], "effort": "high"}
+        recommendation = {"model": ESCALATION_NEXT.get(choice["model"], choice["model"]), "effort": "high"}
         reason = "retry_escalation"
     elif verified >= MIN_VERIFIED_SIGNALS and not retries and choice["effort"] in {"high", "medium"}:
         recommendation = {"effort": "medium" if choice["effort"] == "high" else "low"}

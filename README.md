@@ -29,6 +29,14 @@ browser-facing services at the existing Traefik edge; it cannot replace the
 ModelLabs capability token. Keep any future browser dashboard on a separate,
 Authelia-protected HTTPS route, and keep the control-plane ports local-only.
 
+## Model choices
+
+The current defaults remain GPT-5.6 Luna for short, checked work; GPT-5.6
+Terra for routine work; GPT-5.6 Sol for difficult work; and GPT-6 Astra for
+consequential work. Explicit `gpt-6-sol` and `gpt-6-luna` requests are now
+selectable when the live Codex catalog lists them. Existing short names
+`Sol`, `Luna`, and `Terra` retain their GPT-5.6 meanings.
+
 ## Reasoning effort
 
 The router selects the least effort expected to reach a verified result:
@@ -44,7 +52,10 @@ The router selects the least effort expected to reach a verified result:
 
 An explicit model or effort request in the prompt takes precedence. The live
 Codex model catalog remains the authority: ModelLabs rejects unavailable models
-and unsupported effort values before a new managed turn starts. Route output and
+and unsupported effort values before a new managed turn starts. It never
+silently lowers an explicit `ultra` request to `max`. The `none` choice can be
+requested, but is admitted only if that model's live Codex catalog entry lists
+it; API support alone is not sufficient. Route output and
 managed-turn context expose the same value as `intelligence_slider`, while the
 host receives it as Codex's `effort` setting before inference.
 

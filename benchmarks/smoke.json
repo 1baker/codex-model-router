@@ -11,7 +11,7 @@
       },
       "verify": ["python3", "verify.py"],
       "expected_final": "{\"product\":\"ready\"}",
-      "matrix": [["gpt-5.6-luna", "low"], ["gpt-5.6-terra", "low"]]
+      "matrix": [["gpt-5.6-luna", "low"], ["gpt-5.6-terra", "low"], ["gpt-6-luna", "low"]]
     },
     {
       "id": "routine_cli",
@@ -22,7 +22,7 @@
       },
       "verify": ["python3", "verify.py"],
       "expected_final": "{\"product\":\"ready\"}",
-      "matrix": [["gpt-5.6-terra", "low"], ["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"]]
+      "matrix": [["gpt-5.6-terra", "low"], ["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"], ["gpt-6-sol", "medium"]]
     },
     {
       "id": "difficult_debug",
@@ -34,7 +34,7 @@
       },
       "verify": ["python3", "verify.py"],
       "expected_final": "{\"product\":\"ready\"}",
-      "matrix": [["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"], ["gpt-5.6-sol", "high"], ["gpt-6-astra", "medium"]]
+      "matrix": [["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"], ["gpt-5.6-sol", "high"], ["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
     },
     {
       "id": "consequential_policy",
@@ -46,7 +46,7 @@
       },
       "verify": ["python3", "verify.py"],
       "expected_final": "{\"product\":\"ready\"}",
-      "matrix": [["gpt-5.6-sol", "high"], ["gpt-6-astra", "medium"], ["gpt-6-astra", "high"]]
+      "matrix": [["gpt-5.6-sol", "high"], ["gpt-6-sol", "high"], ["gpt-6-astra", "medium"], ["gpt-6-astra", "high"]]
     },
     {
       "id": "difficult_merge",
@@ -58,7 +58,7 @@
       },
       "verify": ["python3", "verify.py"],
       "expected_final": "{\"product\":\"ready\"}",
-      "matrix": [["gpt-5.6-sol", "high"], ["gpt-6-astra", "medium"]]
+      "matrix": [["gpt-5.6-sol", "high"], ["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
     }
   ]
 }

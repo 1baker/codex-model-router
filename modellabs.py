@@ -38,14 +38,14 @@ MODEL_BY_CLASS = {
     "difficult": "gpt-5.6-sol",
     "consequential": "gpt-6-astra",
 }
-EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+EFFORT_LEVELS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
 def choose_effort(prompt: str, task_class: str, model: str) -> str:
     """Choose the least reasoning effort expected to reach a checked result."""
     p = prompt.lower()
     requested = re.search(r"\b(?:reasoning|intelligence)(?:\s+effort|\s+slider)?\s*(?:at|to|=|:)?\s*"
-                          r"(low|medium|high|xhigh|max|ultra)\b", p)
+                          r"(none|low|medium|high|xhigh|max|ultra)\b", p)
     if requested:
         effort = requested.group(1)
     elif re.search(r"\b(ultra|maximum rigor|exhaustive independent|leave no stone unturned)\b", p):
@@ -62,15 +62,15 @@ def choose_effort(prompt: str, task_class: str, model: str) -> str:
         effort = "medium"
     else:
         effort = "low"
-    # Luna's live catalog currently ends at max. Do not submit an unsupported
-    # ultra selection when a user requested it on a simple task.
-    return "max" if effort == "ultra" and model == "gpt-5.6-luna" else effort
+    # Preserve explicit choices: the live catalog gate must reject unsupported
+    # combinations instead of silently lowering the requested intelligence.
+    return effort
 
 
 def explicit_effort_requested(prompt: str) -> bool:
     """Whether the user, rather than the router, selected a reasoning effort."""
     return bool(re.search(r"\b(?:reasoning|intelligence)(?:\s+effort|\s+slider)?\s*"
-                          r"(?:at|to|=|:)?\s*(low|medium|high|xhigh|max|ultra)\b", prompt.lower()))
+                          r"(?:at|to|=|:)?\s*(none|low|medium|high|xhigh|max|ultra)\b", prompt.lower()))
 
 
 def route(prompt: str, model_override: str | None = None,
@@ -84,10 +84,10 @@ def route(prompt: str, model_override: str | None = None,
     simple = words <= 55 and bool(re.search(r"\b(translate|format|extract|classify|summari[sz]e|rewrite|convert)\b", p)) and not high and not hard
     task_class = "consequential" if high else "difficult" if hard else "simple" if simple else "routine"
     model = MODEL_BY_CLASS[task_class]
-    requested = re.search(r"\b(?:use|run|route to|switch to)\s+(?:the\s+)?(gpt-6-astra|gpt-5\.6-(?:luna|terra|sol)|astra|luna|terra|sol)\b", p)
+    requested = re.search(r"\b(?:use|run|route to|switch to)\s+(?:the\s+)?(gpt-6[- ](?:astra|sol|luna)|gpt-5\.6[- ](?:luna|terra|sol)|astra|luna|terra|sol)\b", p)
     explicit_model = bool(requested or model_override)
     if requested:
-        alias = requested.group(1)
+        alias = requested.group(1).replace(" ", "-")
         model = alias if alias.startswith("gpt-") else {"astra": "gpt-6-astra", "luna": "gpt-5.6-luna",
                                                      "terra": "gpt-5.6-terra", "sol": "gpt-5.6-sol"}[alias]
     if model_override:

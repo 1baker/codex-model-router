@@ -18,6 +18,15 @@ class AdaptiveTests(unittest.TestCase):
   self.assertEqual(result['model'], 'gpt-5.6-terra')
   self.assertEqual(result['adaptive_recommendation']['model'], 'gpt-5.6-sol')
 
+ def test_gpt_6_luna_retry_escalates_to_gpt_6_sol(self):
+  choice = route('Use GPT-6 Luna to format these values as CSV.')
+  choice['explicit_model'] = False
+  evidence = [{'event':'outcome_signal','source':'explicit','outcome':'retry',
+               'thread_id':'thread','task_bucket':choice['task_bucket'],
+               'recorded_at_ms':2_000_000_000_000}] * 4
+  result = adapt(choice, thread_id='thread', records=evidence, now_ms=2_000_000_000_000)
+  self.assertEqual(result['adaptive_recommendation']['model'], 'gpt-6-sol')
+
  def test_new_chat_does_not_reuse_another_threads_operator_outcome(self):
   choice = route('Implement a small validated parser.')
   evidence = [{'event':'outcome_signal','source':'explicit','outcome':'retry',
