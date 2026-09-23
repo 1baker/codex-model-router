@@ -27,7 +27,7 @@ PYTHON_FILES = [
 SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
 SHELL_PATH_END = "# <<< ModelLabs managed Codex route <<<"
 OWNED_MANIFEST = "owned-files.json"
-PINNED_CODEX_VERSION = "codex-cli 0.155.1"
+PINNED_CODEX_VERSION = "codex-cli 0.156.1"
 AUTHORITY_SCHEMA = "modellabs.thread_authority.v1"
 
 
