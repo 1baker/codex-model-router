@@ -3,13 +3,43 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from health_dashboard import read_records, summarize
+from health_dashboard import active_tmux_session, attach_runtime_modes, read_records, summarize
 
 
 class HealthDashboardTests(unittest.TestCase):
+    def test_auto_session_uses_current_tmux_session(self):
+        with patch("health_dashboard.subprocess.check_output", return_value="byobu\n"):
+            self.assertEqual(active_tmux_session(), "byobu")
+
+    def test_auto_session_falls_back_to_largest_live_session(self):
+        def output(command, **_kwargs):
+            if command[1] == "display-message":
+                raise OSError("outside tmux")
+            return "old\t2\t0\nbyobu\t7\t0\n"
+        with patch("health_dashboard.subprocess.check_output", side_effect=output):
+            self.assertEqual(active_tmux_session(), "byobu")
+
+    def test_tab_runtime_mode_uses_live_descendants_not_saved_mode_alone(self):
+        tabs = [
+            {"index": "0", "mode": "model-host", "pane_pid": "100"},
+            {"index": "1", "mode": "resume", "pane_pid": "200"},
+            {"index": "2", "mode": "model-host", "pane_pid": "300"},
+        ]
+        attach_runtime_modes(tabs, "\n".join((
+            "101 100 /bin/bash wrapper",
+            "102 101 node /opt/codex/bin/codex.js --remote ws://127.0.0.1:50000 --remote-auth-token-env MODEL_SELECTOR_HOST_TOKEN",
+            "201 200 node /opt/bin/codex resume some-thread",
+            "301 300 node /opt/bin/codex resume another-thread",
+        )))
+        self.assertEqual([tab["runtime_mode"] for tab in tabs],
+                         ["remote", "standalone", "standalone"])
+        self.assertEqual([tab["mode_matches_runtime"] for tab in tabs], [True, True, False])
+        self.assertNotIn("command", tabs[0])
+
     def test_summarize_uses_metadata_without_prompt_text(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "metrics.jsonl"

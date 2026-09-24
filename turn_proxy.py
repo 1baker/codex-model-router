@@ -8,9 +8,84 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 import time
+from pathlib import Path
 from typing import Any
+
+
+PROXY_GENERATION_FILES = (
+    "adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
+    "modellabs.py", "outcome_model.py", "paths.py", "protocol_policy.py",
+    "receipt_journal.py", "telemetry.py", "thread_owner.py", "turn_proxy.py",
+)
+PROXY_GENERATION_ENTRY_ENV = "MODELLABS_PROXY_GENERATION_ENTRY"
+
+
+def pinned_proxy_generation(runtime_root: Path, environment: dict[str, str]) -> tuple[Path, dict[str, str]] | None:
+    """Resolve and verify a port-bound immutable proxy generation."""
+    raw_port = environment.get("MODELLABS_PROXY_PORT")
+    if raw_port is None or environment.get(PROXY_GENERATION_ENTRY_ENV) == "1":
+        return None
+    if not raw_port.isdecimal() or not 1024 <= int(raw_port) <= 65535:
+        raise RuntimeError("invalid proxy generation port")
+    generations = runtime_root / "proxy-generations"
+    ports = generations / "ports"
+    for directory in (generations, ports):
+        if directory.is_symlink():
+            raise RuntimeError("proxy generation registry is redirected")
+    receipt_path = ports / f"{raw_port}.json"
+    if not receipt_path.exists():
+        if receipt_path.is_symlink():
+            raise RuntimeError("proxy generation receipt is redirected")
+        return None
+    descriptor = os.open(receipt_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise RuntimeError("invalid proxy generation receipt")
+        receipt = json.load(handle)
+    revision = receipt.get("revision") if isinstance(receipt, dict) else None
+    files = receipt.get("files") if isinstance(receipt, dict) else None
+    if (set(receipt) != {"schema", "port", "revision", "files"}
+            or receipt.get("schema") != "modellabs.proxy_generation.v1"
+            or receipt.get("port") != int(raw_port)
+            or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{16}", revision)
+            or not isinstance(files, dict) or set(files) != set(PROXY_GENERATION_FILES)
+            or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                   for value in files.values())):
+        raise RuntimeError("invalid proxy generation receipt")
+    bundle = generations / revision
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise RuntimeError("proxy generation bundle is missing or redirected")
+    for name in PROXY_GENERATION_FILES:
+        source = bundle / name
+        if source.is_symlink() or not source.is_file() or source.stat().st_size > 2 * 1024 * 1024:
+            raise RuntimeError("proxy generation source is missing or redirected")
+        if hashlib.sha256(source.read_bytes()).hexdigest() != files[name]:
+            raise RuntimeError("proxy generation source digest mismatch")
+    entry = bundle / "turn_proxy.py"
+    child_environment = dict(environment)
+    child_environment[PROXY_GENERATION_ENTRY_ENV] = "1"
+    child_environment["MODELLABS_HOME"] = str(runtime_root)
+    return entry, child_environment
+
+
+def dispatch_pinned_proxy_generation(runtime_root: Path | None = None,
+                                     environment: dict[str, str] | None = None) -> bool:
+    """Exec a verified bundle before importing mutable local proxy modules."""
+    selected = pinned_proxy_generation(runtime_root or Path(__file__).resolve().parent,
+                                       environment if environment is not None else dict(os.environ))
+    if selected is None:
+        return False
+    entry, child_environment = selected
+    os.execve(sys.executable, [sys.executable, str(entry)], child_environment)
+    raise RuntimeError("proxy generation exec unexpectedly returned")
+
+
+if __name__ == "__main__":
+    dispatch_pinned_proxy_generation()
 
 import websockets
 
@@ -27,7 +102,8 @@ from authority import (AuthorityError, acquire_lock as acquire_authority_lock_sy
                        update_locked as update_authority_locked)
 from protocol_policy import classify as classify_protocol_method
 import receipt_journal
-from outcome_model import capture_codex_result, capture_codex_turn, prepare_codex_prompt
+from outcome_model import (capture_codex_result, capture_codex_steer,
+                           capture_codex_turn, prepare_codex_prompt)
 
 
 PROXY_REVISION = proxy_revision()
@@ -236,6 +312,80 @@ def completed_agent_message(response: dict[str, Any]) -> str | None:
     return None
 
 
+def steer_learning_observation(params: dict[str, Any]) -> dict[str, str] | None:
+    """Prepare text-only user steer context without treating it as a new turn."""
+    inputs = params.get("input")
+    if (not isinstance(params.get("threadId"), str)
+            or not isinstance(params.get("expectedTurnId"), str)
+            or not isinstance(inputs, list) or not inputs
+            or any(not isinstance(item, dict) or item.get("type") != "text"
+                   or not isinstance(item.get("text"), str) for item in inputs)):
+        return None
+    prompt = "\n".join(item["text"] for item in inputs)
+    if not prompt.strip() or len(prompt) > 256_000:
+        return None
+    return prepare_codex_prompt(prompt)
+
+
+def model_reroute_metadata(response: dict[str, Any], thread_id: str,
+                           turn_id: str) -> dict[str, str] | None:
+    """Accept only a turn-bound server reroute, never infer execution from silence."""
+    if response.get("method") != "model/rerouted":
+        return None
+    params = response.get("params")
+    if not isinstance(params, dict) or params.get("threadId") != thread_id or params.get("turnId") != turn_id:
+        return None
+    fields = {"from_model": params.get("fromModel"), "to_model": params.get("toModel"),
+              "reason": params.get("reason")}
+    if (not all(isinstance(value, str) and 0 < len(value) <= 128 for value in fields.values())
+            or fields["from_model"] == fields["to_model"]):
+        return None
+    return fields
+
+
+def confirm_pending_route_settings(response: dict[str, Any],
+                                   pending: dict[object, dict[str, Any]]) -> bool:
+    """Bind an exact pre-admission host settings notice to one pending turn."""
+    if response.get("method") != "thread/settings/updated":
+        return False
+    params = response.get("params")
+    if not isinstance(params, dict) or not isinstance(params.get("threadId"), str):
+        return False
+    settings = params.get("threadSettings")
+    if not isinstance(settings, dict):
+        return False
+    effort = (settings.get("effort") or settings.get("reasoning_effort")
+              or settings.get("reasoningEffort"))
+    matches = [route_info for route_info in pending.values()
+               if route_info.get("thread_id") == params["threadId"]]
+    if len(matches) != 1:
+        return False
+    route_info = matches[0]
+    if (settings.get("model") != route_info.get("model")
+            or effort != route_info.get("effort")):
+        return False
+    route_info["settings_confirmed"] = True
+    route_info["settings_confirmation_source"] = "host_thread_settings_updated_pre_admission"
+    return True
+
+
+def execution_observation(route_info: dict[str, Any], *, status: str,
+                          exact_usage: bool) -> dict[str, str] | None:
+    """Promote only positive, single-arm host evidence after a completed turn."""
+    if (status != "completed" or not exact_usage
+            or route_info.get("settings_confirmed") is not True
+            or route_info.get("reroute_seen") is True
+            or route_info.get("settings_confirmation_source")
+            != "host_thread_settings_updated_pre_admission"):
+        return None
+    model, effort = route_info.get("model"), route_info.get("effort")
+    if not isinstance(model, str) or not isinstance(effort, str):
+        return None
+    return {"model": model, "effort": effort,
+            "source": route_info["settings_confirmation_source"],
+            "settings_confirmation": "exact"}
+
+
 def selection_is_listed(catalog: dict[str, Any], choice: dict[str, Any]) -> bool:
     """Reject a stale or unsupported model/effort pair before host admission."""
     for entry in catalog.get("data", []):
@@ -303,6 +453,11 @@ async def latest_host_turn_id(thread_id: str, token: str) -> str | None:
             message = str(exc)
             if "is not materialized yet" in message and "before first user message" in message:
                 return None
+            if message == "Model host rejected thread/turns/list: ephemeral threads do not support thread/turns/list":
+                # The host cannot expose a baseline for ephemeral threads. The
+                # forwarded turn/start response still supplies the exact turn
+                # identity; a crash before that response remains unresolved.
+                return None
             raise
     turn = next(iter(turns.get("data", [])), None)
     return turn.get("id") if isinstance(turn, dict) and isinstance(turn.get("id"), str) else None
@@ -312,6 +467,7 @@ def finalize_route(thread_id: str, turn_id: str, route_info: dict[str, Any], *,
                    status: str, elapsed_ms: int | None, terminal_source: str,
                    usage_complete: bool) -> None:
     """Emit exactly one terminal and one exact-or-unavailable usage receipt."""
+    usage_is_exact = False
     if not route_info["terminal_recorded"].is_set():
         reconcile_receipt_stage(thread_id, turn_id, route_info, "terminal", "turn_completed", {
             "model": route_info["model"], "effort": route_info["effort"],
@@ -338,6 +494,18 @@ def finalize_route(thread_id: str, turn_id: str, route_info: dict[str, Any], *,
                     "effort": route_info["effort"], "reason": unavailable_reason}
         reconcile_receipt_stage(thread_id, turn_id, route_info, "usage", event, fields)
         route_info["usage_recorded"].set()
+        usage_is_exact = event == "turn_usage"
+    else:
+        usage_receipt = canonical_receipt(f"{thread_id}:{turn_id}:usage")
+        usage_is_exact = usage_receipt is not None and usage_receipt.get("event") == "turn_usage"
+    observation = execution_observation(route_info, status=status, exact_usage=usage_is_exact)
+    execution_recorded = route_info.setdefault("execution_recorded", asyncio.Event())
+    if observation is not None and not execution_recorded.is_set():
+        receipt_id = f"{thread_id}:{turn_id}:execution"
+        record_metric("route_execution_observed", _accounting_claim=receipt_id,
+                      receipt_id=receipt_id, thread_id=thread_id, turn_id=turn_id,
+                      **observation)
+        execution_recorded.set()
     route_info["finished"].set()
 
 
@@ -1027,6 +1195,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                     request_ledger[request_id] = {"method": method,
                                                   "thread_id": params.get("threadId") if isinstance(params, dict) else None,
                                                   "forwarded": False}
+                    if method == "turn/steer" and isinstance(params, dict):
+                        try:
+                            observation = steer_learning_observation(params)
+                        except Exception:
+                            observation = None
+                        request_ledger[request_id]["steer_expected_turn"] = params.get("expectedTurnId")
+                        if observation is not None:
+                            request_ledger[request_id]["steer_observation"] = observation
+                            request_ledger[request_id]["steer_event_id"] = secrets.token_hex(16)
                 await upstream.send(routed)
 
         async def account_event(response: dict[str, Any]) -> None:
@@ -1037,6 +1214,11 @@ async def handler(client: websockets.ServerConnection) -> None:
             route_info = active.get(key)
             if not route_info:
                 return
+            reroute = model_reroute_metadata(response, key[0], key[1])
+            if reroute is not None:
+                route_info["reroute_seen"] = True
+                record_metric("model_rerouted", thread_id=key[0], turn_id=key[1],
+                              assigned_model=route_info["model"], **reroute)
             agent_text = completed_agent_message(response)
             if agent_text is not None and len(agent_text) <= 256_000:
                 assistant_results[key] = agent_text
@@ -1105,6 +1287,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                             shape_valid = isinstance((result.get("thread") or {}).get("id"), str)
                         elif expected_method == "turn/start":
                             shape_valid = isinstance((result.get("turn") or {}).get("id"), str)
+                        elif expected_method == "turn/steer":
+                            shape_valid = (isinstance(result.get("turnId"), str)
+                                           and result["turnId"] == ledger_entry.get("steer_expected_turn"))
                         else:
                             shape_valid = shape_valid or isinstance(response.get("result"), dict)
                         if not shape_valid:
@@ -1112,6 +1297,16 @@ async def handler(client: websockets.ServerConnection) -> None:
                             ACCOUNTING_BLOCKED = True
                             continue
                     authority_update = authority_pending.get(response_id) if rpc_response else None
+                    if (rpc_response and ledger_entry and ledger_entry["method"] == "turn/steer"
+                            and "error" not in response and ledger_entry.get("steer_observation")):
+                        try:
+                            capture_codex_steer(ledger_entry["thread_id"],
+                                                response["result"]["turnId"],
+                                                ledger_entry["steer_event_id"],
+                                                ledger_entry["steer_observation"])
+                        except Exception as exc:
+                            print(f"ModelLabs steer learning capture skipped: {type(exc).__name__}",
+                                  file=sys.stderr)
                     if authority_update:
                         authority_method = authority_update["method"]
                         if (authority_method == "thread/settings/update"
@@ -1191,7 +1386,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                                           "delivered": terminal_recorded,
                                           "terminal_recorded": terminal_recorded,
                                           "usage_recorded": asyncio.Event(), "finished": asyncio.Event(),
-                                          "usage_tracker": UsageTracker()}
+                                          "execution_recorded": asyncio.Event(),
+                                          "usage_tracker": UsageTracker(), "reroute_seen": False}
                             lifecycle_id = request_lifecycles.get(response_id)
                             quarantine_path = lifecycle_pending.get(lifecycle_id)
                             admission_claim = f"admission:{info['thread_id']}:{info['turn_id']}"
@@ -1250,13 +1446,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                         notification = response.get("params") or {}
                         notification_thread = notification.get("threadId")
                         if isinstance(notification_thread, str):
+                            confirm_pending_route_settings(response, pending)
                             authority_notifications[notification_thread] = notification
                             await reconcile_authority_notification(notification_thread)
                     if response.get("method") is not None and response_id is not None:
                         server_request_ids.add(response_id)
                     params = response.get("params") or {}
                     event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
-                    if (response.get("method") in {"thread/tokenUsage/updated", "item/completed", "turn/completed"}
+                    if (response.get("method") in {"thread/tokenUsage/updated", "item/completed", "turn/completed",
+                                                    "model/rerouted"}
                             and params.get("threadId") in provisional
                             and (params.get("threadId"), event_turn_id) not in active):
                         provisional[params["threadId"]].append(response)

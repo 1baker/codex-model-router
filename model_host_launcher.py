@@ -17,7 +17,9 @@ from pathlib import Path
 
 import websockets
 
-from host_control import HOST_URL, TOKEN_FILE, _read_token
+from authority import path_for as authority_path_for
+from host_control import HOST_URL, THREAD_ID_PATTERN, TOKEN_FILE, _read_token
+from legacy_thread_handoff import import_closed_thread
 from paths import ROOT, proxy_port, proxy_revision, real_codex_binary
 
 
@@ -444,6 +446,12 @@ def main() -> None:
         resume_index = command_index + 1
         if len(args_in) <= resume_index or args_in[resume_index].startswith("-"):
             raise ValueError("Managed resume requires an exact thread UUID, not the session picker or --last.")
+        resume_thread = args_in[resume_index]
+        if not THREAD_ID_PATTERN.fullmatch(resume_thread):
+            raise ValueError("Managed resume requires an exact thread UUID, not the session picker or --last.")
+        authority_path = authority_path_for(resume_thread)
+        if not authority_path.exists() and not authority_path.is_symlink():
+            import_closed_thread(resume_thread)
     token = _read_token()
     ensure_proxy()
     ensure_proxy_supervisor()

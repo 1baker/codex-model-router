@@ -21,7 +21,7 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parent
 PYTHON_FILES = [
     "adaptive_policy.py", "authority.py", "health_dashboard.py", "host_control.py", "install.py", "model_host_launcher.py", "model_host_mcp.py",
-    "modellabs.py", "outcome_model.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
+    "legacy_thread_handoff.py", "modellabs.py", "outcome_model.py", "paths.py", "prompt_hook.py", "proxy_supervisor.py", "telemetry.py",
     "protocol_policy.py", "receipt_journal.py", "thread_owner.py", "turn_proxy.py", "usage_observer.py", "smoke_bench.py",
 ]
 SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
@@ -29,6 +29,14 @@ SHELL_PATH_END = "# <<< ModelLabs managed Codex route <<<"
 OWNED_MANIFEST = "owned-files.json"
 PINNED_CODEX_VERSION = "codex-cli 0.156.1"
 AUTHORITY_SCHEMA = "modellabs.thread_authority.v1"
+PROXY_GENERATION_FILES = (
+    "adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
+    "modellabs.py", "outcome_model.py", "paths.py", "protocol_policy.py",
+    "receipt_journal.py", "telemetry.py", "thread_owner.py", "turn_proxy.py",
+)
+# Every byte loaded by a pinned generation participates in its identity.  A
+# dependency-only upgrade must never alias an older immutable bundle.
+PROXY_REVISION_FILES = PROXY_GENERATION_FILES
 
 
 def default_home() -> Path:
@@ -66,6 +74,55 @@ def _atomic_bytes(path: Path, content: bytes, mode: int = 0o644) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _proxy_revision(payloads: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for name in PROXY_REVISION_FILES:
+        digest.update(name.encode())
+        digest.update(payloads[name])
+    return digest.hexdigest()[:16]
+
+
+def _proxy_generation_port(revision: str) -> int:
+    return 46000 + int(revision[:8], 16) % 16000
+
+
+def _stage_proxy_generation(home: Path, payloads: dict[str, bytes]) -> tuple[str, int, Path]:
+    """Materialize one immutable runtime bundle and its port binding."""
+    if set(payloads) != set(PROXY_GENERATION_FILES):
+        raise RuntimeError("proxy generation payload is incomplete")
+    revision = _proxy_revision(payloads)
+    port = _proxy_generation_port(revision)
+    generations = home / "proxy-generations"
+    bundle = generations / revision
+    ports = generations / "ports"
+    for directory in (generations, bundle, ports):
+        _assert_lexical_destination(directory)
+        if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
+            raise RuntimeError(f"proxy generation path is redirected: {directory}")
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    digests = {name: _digest_bytes(payloads[name]) for name in PROXY_GENERATION_FILES}
+    for name in PROXY_GENERATION_FILES:
+        target = bundle / name
+        _assert_lexical_destination(target)
+        if target.exists() or target.is_symlink():
+            if target.is_symlink() or not target.is_file() or target.read_bytes() != payloads[name]:
+                raise RuntimeError("proxy generation bundle conflicts with immutable source")
+        else:
+            _atomic_bytes(target, payloads[name], 0o600)
+    receipt = {"schema": "modellabs.proxy_generation.v1", "port": port,
+               "revision": revision, "files": digests}
+    receipt_bytes = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode()
+    receipt_path = ports / f"{port}.json"
+    _assert_lexical_destination(receipt_path)
+    if receipt_path.exists() or receipt_path.is_symlink():
+        if receipt_path.is_symlink() or not receipt_path.is_file() or receipt_path.read_bytes() != receipt_bytes:
+            raise RuntimeError("proxy generation port collision or receipt conflict")
+    else:
+        _atomic_bytes(receipt_path, receipt_bytes, 0o600)
+    return revision, port, receipt_path
 
 
 def _service_bytes(home: Path) -> bytes:
@@ -226,6 +283,246 @@ def write_owned_manifest(home: Path, payloads: dict[Path, bytes]) -> None:
                                     for path, value in sorted(payloads.items(), key=lambda item: str(item[0]))}},
                          indent=2, sort_keys=True).encode() + b"\n"
     _atomic_bytes(home / OWNED_MANIFEST, content, 0o600)
+
+
+def install_learning_only(home: Path, expected_installed_sha256: str,
+                          expected_smoke_sha256: str | None = None,
+                          expected_benchmark_sha256: str | None = None) -> dict[str, object]:
+    """Update guarded learner modules and pre-stage any affected proxy generation."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_installed_sha256):
+        raise ValueError("learning-only install requires an exact current SHA-256")
+    if expected_smoke_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_smoke_sha256):
+        raise ValueError("learning-only benchmark install requires an exact current SHA-256")
+    if (expected_benchmark_sha256 is not None
+            and not re.fullmatch(r"[0-9a-f]{64}", expected_benchmark_sha256)):
+        raise ValueError("learning-only manifest install requires an exact current SHA-256")
+    home = home.expanduser().absolute()
+    expected = {"outcome_model.py": expected_installed_sha256}
+    if expected_smoke_sha256 is not None:
+        expected["smoke_bench.py"] = expected_smoke_sha256
+    if expected_benchmark_sha256 is not None:
+        expected["benchmarks/smoke.json"] = expected_benchmark_sha256
+    manifest_path = home / OWNED_MANIFEST
+    for path in (manifest_path, *(home / name for name in expected)):
+        _assert_lexical_destination(path)
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"Learning-only install requires a regular owned file: {path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = manifest.get("files") if isinstance(manifest, dict) else None
+    if (not isinstance(manifest, dict) or set(manifest) != {"schema", "files"}
+            or manifest.get("schema") != "modellabs.owned_files.v1"
+            or not isinstance(entries, dict)
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(entries.get(str(home / name))))
+                   for name in expected)):
+        raise RuntimeError("Learning-only install requires a valid ownership manifest")
+    replacements = {}
+    for name, baseline in expected.items():
+        target = home / name
+        previous = target.read_bytes()
+        actual = _digest_bytes(previous)
+        if actual != baseline:
+            raise RuntimeError("Installed learner changed after the inspected baseline")
+        if entries.get(str(target)) != actual:
+            raise RuntimeError("Learning-only install requires exact owned-manifest parity")
+        replacement = (SOURCE / name).read_bytes()
+        if target.suffix == ".py":
+            compile(replacement, str(SOURCE / name), "exec")
+        else:
+            parsed = json.loads(replacement)
+            if parsed.get("schema") != "modellabs.smoke.v1":
+                raise RuntimeError("Learning-only benchmark manifest has an unsupported schema")
+        backup_suffix = ".py" if target.suffix == ".py" else ".json"
+        backup = home / "learning-install-backups" / f"{target.stem}.{actual}{backup_suffix}"
+        _assert_lexical_destination(backup)
+        if backup.exists() or backup.is_symlink():
+            if backup.is_symlink() or backup.read_bytes() != previous:
+                raise RuntimeError("Learning-only backup conflicts with installed baseline")
+        replacements[name] = (target, previous, replacement, backup)
+
+    generation_release: dict[str, object] = {}
+    outcome_replacement = replacements["outcome_model.py"][2]
+    if outcome_replacement != replacements["outcome_model.py"][1]:
+        previous_payloads: dict[str, bytes] = {}
+        for name in PROXY_GENERATION_FILES:
+            path = home / name
+            _assert_lexical_destination(path)
+            if not path.is_file() or path.is_symlink():
+                raise RuntimeError(
+                    f"Learning-only generation staging requires a regular owned file: {path}")
+            content = path.read_bytes()
+            if entries.get(str(path)) != _digest_bytes(content):
+                raise RuntimeError(
+                    "Learning-only generation staging requires exact owned-manifest parity")
+            previous_payloads[name] = content
+        next_payloads = {**previous_payloads, "outcome_model.py": outcome_replacement}
+        old_revision, old_port, old_receipt = _stage_proxy_generation(home, previous_payloads)
+        new_revision, new_port, new_receipt = _stage_proxy_generation(home, next_payloads)
+        if old_revision == new_revision:
+            raise RuntimeError("Learning-only generation staging has no revision change")
+        generation_release = {
+            "old_revision": old_revision, "old_port": old_port,
+            "old_receipt": str(old_receipt), "new_revision": new_revision,
+            "new_port": new_port, "new_receipt": str(new_receipt),
+        }
+    original_manifest = manifest_path.read_bytes()
+    try:
+        for target, previous, replacement, backup in replacements.values():
+            if not backup.exists():
+                _atomic_bytes(backup, previous, 0o600)
+            _atomic_bytes(target, replacement)
+            entries[str(target)] = _digest_bytes(replacement)
+        _atomic_bytes(manifest_path, (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+    except Exception:
+        for target, previous, _replacement, _backup in replacements.values():
+            if target.read_bytes() != previous:
+                _atomic_bytes(target, previous)
+        _atomic_bytes(manifest_path, original_manifest, 0o600)
+        raise
+    target, _previous, _replacement, backup = replacements["outcome_model.py"]
+    result = {"target": str(target), "sha256": entries[str(target)], "backup": str(backup),
+              "services_restarted": "false", "running_process_changed": "false",
+              "new_proxy_started": "false", **generation_release}
+    if "smoke_bench.py" in replacements:
+        smoke, _previous, _replacement, smoke_backup = replacements["smoke_bench.py"]
+        result.update(smoke_target=str(smoke), smoke_sha256=entries[str(smoke)],
+                      smoke_backup=str(smoke_backup))
+    if "benchmarks/smoke.json" in replacements:
+        benchmark, _previous, _replacement, benchmark_backup = replacements["benchmarks/smoke.json"]
+        result.update(benchmark_target=str(benchmark), benchmark_sha256=entries[str(benchmark)],
+                      benchmark_backup=str(benchmark_backup))
+    return result
+
+
+def install_supervisor_source_only(home: Path, expected_installed_sha256: str) -> dict[str, str]:
+    """Publish guarded supervisor bytes without touching its running process."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_installed_sha256):
+        raise ValueError("supervisor-source-only install requires an exact current SHA-256")
+    home = home.expanduser().absolute()
+    target = home / "proxy_supervisor.py"
+    manifest_path = home / OWNED_MANIFEST
+    for path in (target, manifest_path):
+        _assert_lexical_destination(path)
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"Supervisor source-only install requires a regular owned file: {path}")
+    previous = target.read_bytes()
+    if _digest_bytes(previous) != expected_installed_sha256:
+        raise RuntimeError("Installed supervisor changed after the inspected baseline")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = manifest.get("files") if isinstance(manifest, dict) else None
+    if (not isinstance(manifest, dict) or set(manifest) != {"schema", "files"}
+            or manifest.get("schema") != "modellabs.owned_files.v1"
+            or not isinstance(entries, dict)
+            or entries.get(str(target)) != expected_installed_sha256):
+        raise RuntimeError("Supervisor source-only install requires exact owned-manifest parity")
+    replacement = (SOURCE / "proxy_supervisor.py").read_bytes()
+    compile(replacement, str(SOURCE / "proxy_supervisor.py"), "exec")
+    backup = home / "supervisor-install-backups" / f"proxy_supervisor.{expected_installed_sha256}.py"
+    _assert_lexical_destination(backup)
+    if backup.exists() or backup.is_symlink():
+        if backup.is_symlink() or backup.read_bytes() != previous:
+            raise RuntimeError("Supervisor source-only backup conflicts with installed baseline")
+    original_manifest = manifest_path.read_bytes()
+    try:
+        if not backup.exists():
+            _atomic_bytes(backup, previous, 0o600)
+        _atomic_bytes(target, replacement)
+        entries[str(target)] = _digest_bytes(replacement)
+        _atomic_bytes(manifest_path,
+                      (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+    except Exception:
+        if target.read_bytes() != previous:
+            _atomic_bytes(target, previous)
+        _atomic_bytes(manifest_path, original_manifest, 0o600)
+        raise
+    return {"target": str(target), "sha256": entries[str(target)], "backup": str(backup),
+            "services_restarted": "false", "running_process_changed": "false",
+            "new_proxy_started": "false"}
+
+
+def install_proxy_source_only(home: Path, expected_installed_sha256: str) -> dict[str, object]:
+    """Publish a complete proxy generation without touching running processes."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_installed_sha256):
+        raise ValueError("proxy-source-only install requires an exact current SHA-256")
+    home = home.expanduser().absolute()
+    target = home / "turn_proxy.py"
+    manifest_path = home / OWNED_MANIFEST
+    for path in (manifest_path, *(home / name for name in PROXY_GENERATION_FILES)):
+        _assert_lexical_destination(path)
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"Proxy source-only install requires a regular owned file: {path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = manifest.get("files") if isinstance(manifest, dict) else None
+    if (not isinstance(manifest, dict) or set(manifest) != {"schema", "files"}
+            or manifest.get("schema") != "modellabs.owned_files.v1"
+            or not isinstance(entries, dict)):
+        raise RuntimeError("Proxy source-only install requires a valid ownership manifest")
+    previous_payloads: dict[str, bytes] = {}
+    for name in PROXY_GENERATION_FILES:
+        path = home / name
+        content = path.read_bytes()
+        if entries.get(str(path)) != _digest_bytes(content):
+            raise RuntimeError("Proxy source-only install requires exact owned-manifest parity")
+        previous_payloads[name] = content
+    previous = previous_payloads["turn_proxy.py"]
+    if _digest_bytes(previous) != expected_installed_sha256:
+        raise RuntimeError("Installed proxy changed after the inspected baseline")
+    next_payloads: dict[str, bytes] = {}
+    for name in PROXY_GENERATION_FILES:
+        source_path = SOURCE / name
+        replacement = source_path.read_bytes()
+        compile(replacement, str(source_path), "exec")
+        next_payloads[name] = replacement
+    changed_names = [name for name in PROXY_GENERATION_FILES
+                     if next_payloads[name] != previous_payloads[name]]
+    if not changed_names:
+        raise RuntimeError("Proxy source-only install has no generation change")
+
+    # Keep the historical turn_proxy backup/return fields for compatibility,
+    # while also protecting every dependency that this release will replace.
+    backup_names = list(dict.fromkeys((*changed_names, "turn_proxy.py")))
+    backups: dict[str, Path] = {}
+    for name in backup_names:
+        digest = _digest_bytes(previous_payloads[name])
+        backup = home / "proxy-install-backups" / f"{Path(name).stem}.{digest}.py"
+        _assert_lexical_destination(backup)
+        if backup.exists() or backup.is_symlink():
+            if backup.is_symlink() or backup.read_bytes() != previous_payloads[name]:
+                raise RuntimeError(f"Proxy source-only backup conflicts with installed baseline: {name}")
+        backups[name] = backup
+
+    # Stage both immutable generations before making the mutable entrypoint visible.
+    old_revision, old_port, old_receipt = _stage_proxy_generation(home, previous_payloads)
+    new_revision, new_port, new_receipt = _stage_proxy_generation(home, next_payloads)
+    if old_revision == new_revision:
+        raise RuntimeError("Proxy source-only install has no revision change")
+    original_manifest = manifest_path.read_bytes()
+    try:
+        for name in backup_names:
+            if not backups[name].exists():
+                _atomic_bytes(backups[name], previous_payloads[name], 0o600)
+        for name in changed_names:
+            destination = home / name
+            _atomic_bytes(destination, next_payloads[name])
+            entries[str(destination)] = _digest_bytes(next_payloads[name])
+        _atomic_bytes(manifest_path,
+                      (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+    except Exception:
+        for name in changed_names:
+            destination = home / name
+            if (not destination.is_file() or destination.is_symlink()
+                    or destination.read_bytes() != previous_payloads[name]):
+                _atomic_bytes(destination, previous_payloads[name])
+        _atomic_bytes(manifest_path, original_manifest, 0o600)
+        raise
+    return {"target": str(target), "sha256": entries[str(target)],
+            "backup": str(backups["turn_proxy.py"]),
+            "changed_files": changed_names,
+            "backups": {name: str(backups[name]) for name in changed_names},
+            "old_revision": old_revision, "old_port": old_port,
+            "old_receipt": str(old_receipt), "new_revision": new_revision,
+            "new_port": new_port, "new_receipt": str(new_receipt),
+            "services_restarted": "false", "running_process_changed": "false",
+            "new_proxy_started": "false"}
 
 
 def create_venv(venv: Path) -> None:
@@ -519,9 +816,7 @@ def enable_service() -> bool:
 
 def installed_proxy_port(home: Path) -> int:
     digest = hashlib.sha256()
-    for name in ("adaptive_policy.py", "authority.py", "host_control.py", "modellabs.py",
-                 "paths.py", "protocol_policy.py", "receipt_journal.py", "telemetry.py",
-                 "thread_owner.py", "turn_proxy.py"):
+    for name in PROXY_REVISION_FILES:
         digest.update(name.encode())
         digest.update((home / name).read_bytes())
     return 46000 + int(digest.hexdigest()[:8], 16) % 16000
@@ -602,7 +897,39 @@ def main() -> None:
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
     parser.add_argument("--bin-dir", type=Path, default=Path.home() / ".local/bin")
     parser.add_argument("--no-service", action="store_true")
-    install(parser.parse_args())
+    parser.add_argument("--learning-only", action="store_true")
+    parser.add_argument("--supervisor-source-only", action="store_true")
+    parser.add_argument("--proxy-source-only", action="store_true")
+    parser.add_argument("--expect-installed-sha256")
+    parser.add_argument("--expect-smoke-sha256")
+    parser.add_argument("--expect-benchmark-sha256")
+    args = parser.parse_args()
+    exclusive_modes = sum((args.learning_only, args.supervisor_source_only, args.proxy_source_only))
+    if exclusive_modes > 1:
+        parser.error("--learning-only, --supervisor-source-only, and --proxy-source-only are mutually exclusive")
+    if args.proxy_source_only:
+        if (not args.expect_installed_sha256 or args.expect_smoke_sha256
+                or args.expect_benchmark_sha256 or args.no_service):
+            parser.error("--proxy-source-only requires only --expect-installed-sha256")
+        print(json.dumps(install_proxy_source_only(args.home, args.expect_installed_sha256),
+                         sort_keys=True))
+    elif args.supervisor_source_only:
+        if (not args.expect_installed_sha256 or args.expect_smoke_sha256
+                or args.expect_benchmark_sha256 or args.no_service):
+            parser.error("--supervisor-source-only requires only --expect-installed-sha256")
+        print(json.dumps(install_supervisor_source_only(args.home, args.expect_installed_sha256),
+                         sort_keys=True))
+    elif args.learning_only:
+        if not args.expect_installed_sha256:
+            parser.error("--learning-only requires --expect-installed-sha256")
+        print(json.dumps(install_learning_only(args.home, args.expect_installed_sha256,
+                                               args.expect_smoke_sha256,
+                                               args.expect_benchmark_sha256), sort_keys=True))
+    else:
+        if (args.expect_installed_sha256 or args.expect_smoke_sha256
+                or args.expect_benchmark_sha256):
+            parser.error("install digest guards require a source-only install mode")
+        install(args)
 
 
 if __name__ == "__main__":

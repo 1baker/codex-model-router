@@ -167,11 +167,77 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
 def tmux_tabs(session: str) -> list[dict[str, str]]:
     try:
         output = subprocess.check_output(["tmux", "list-windows", "-t", session, "-F",
-            "#{window_index}\t#{window_name}\t#{@byobu-codex-mode}\t#{@byobu-codex-thread-id}"], text=True)
+            "#{window_index}\t#{window_name}\t#{@byobu-codex-mode}\t#{@byobu-codex-thread-id}\t#{pane_pid}"],
+            text=True, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.CalledProcessError):
         return []
-    return [{"index": parts[0], "name": parts[1], "mode": parts[2], "thread_id": parts[3]}
-            for line in output.splitlines() for parts in [(line.split("\t") + ["", "", "", ""])[:4]]]
+    return [{"index": parts[0], "name": parts[1], "mode": parts[2], "thread_id": parts[3],
+             "pane_pid": parts[4]}
+            for line in output.splitlines() for parts in [(line.split("\t") + ["", "", "", "", ""])[:5]]]
+
+
+def active_tmux_session() -> str | None:
+    """Choose the current session, or the largest live session outside tmux."""
+    try:
+        current = subprocess.check_output(
+            ["tmux", "display-message", "-p", "#S"], text=True,
+            stderr=subprocess.DEVNULL).strip()
+        if current:
+            return current
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    try:
+        output = subprocess.check_output(
+            ["tmux", "list-sessions", "-F", "#{session_name}\t#{session_windows}\t#{session_attached}"],
+            text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    candidates = []
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            candidates.append((int(parts[2]), int(parts[1]), parts[0]))
+    return max(candidates)[2] if candidates else None
+
+
+def attach_runtime_modes(tabs: list[dict[str, Any]], process_lines: str) -> None:
+    """Compare saved tab routing with live child processes, without exposing argv."""
+    children: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    for line in process_lines.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid, parent = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children[parent].append((pid, parts[2]))
+    for tab in tabs:
+        try:
+            pending = [int(tab["pane_pid"])]
+        except (KeyError, TypeError, ValueError):
+            tab["runtime_mode"] = "unknown"
+            tab["mode_matches_runtime"] = None
+            continue
+        seen: set[int] = set()
+        modes: set[str] = set()
+        while pending:
+            parent = pending.pop()
+            if parent in seen:
+                continue
+            seen.add(parent)
+            for pid, command in children.get(parent, []):
+                pending.append(pid)
+                if "codex" not in command or "codex-code-mode-host" in command:
+                    continue
+                if " --remote " in f" {command} ":
+                    modes.add("remote")
+                elif command.startswith("node ") or "/bin/codex" in command:
+                    modes.add("standalone")
+        tab["runtime_mode"] = next(iter(modes)) if len(modes) == 1 else ("mixed" if modes else "unknown")
+        tab["mode_matches_runtime"] = (tab["runtime_mode"] == "remote" if tab["mode"] == "model-host"
+                                       else tab["runtime_mode"] == "standalone"
+                                       if tab["mode"] in {"resume", "new"} else None)
 
 
 def process_count(pattern: str) -> int:
@@ -179,12 +245,19 @@ def process_count(pattern: str) -> int:
     return int(result.stdout.strip() or 0) if result.returncode == 0 else 0
 
 
-def report(metrics: Path, session: str) -> dict[str, Any]:
+def report(metrics: Path, session: str | None) -> dict[str, Any]:
     summary = summarize(read_records(metrics))
-    tabs = tmux_tabs(session)
+    selected_session = session if session is not None else active_tmux_session()
+    tabs = tmux_tabs(selected_session) if selected_session else []
+    try:
+        attach_runtime_modes(tabs, subprocess.check_output(
+            ["ps", "-eo", "pid=,ppid=,args="], text=True))
+    except (OSError, subprocess.CalledProcessError):
+        attach_runtime_modes(tabs, "")
     for tab in tabs:
         tab["latest_route"] = summary["latest_by_thread"].get(tab["thread_id"])
-    return {"schema": "modellabs.health.v2", "metrics_path": str(metrics), "managed_tabs": tabs,
+    return {"schema": "modellabs.health.v2", "metrics_path": str(metrics),
+            "byobu_session": selected_session, "managed_tabs": tabs,
             "routing": {key: value for key, value in summary.items() if key != "latest_by_thread"},
             "mcp_processes": {"modelControl": process_count("model_host_mcp.py"),
                               "agentBrowser": process_count("agent-browser mcp serve"),
@@ -196,7 +269,7 @@ def report(metrics: Path, session: str) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Show prompt-free ModelLabs and Byobu health")
     parser.add_argument("--metrics", type=Path, default=METRICS_PATH)
-    parser.add_argument("--session", default="recovered-tabs")
+    parser.add_argument("--session", help="Exact tmux session; defaults to the current or largest live session")
     args = parser.parse_args()
     print(json.dumps(report(args.metrics, args.session), sort_keys=True))
 

@@ -4,6 +4,9 @@
     {
       "id": "simple_transform",
       "task_class": "simple",
+      "comparison_id": "simple_transform_prompt_v1",
+      "prompt_author": "benchmark",
+      "protected_files": ["values.txt", "verify.py"],
       "prompt": "Read values.txt and create result.json containing one JSON array of the distinct integers in ascending order. Do not include booleans or quoted numbers. Finish with exactly {\"product\":\"ready\"}.",
       "files": {
         "values.txt": "8, 3, true, 3, 1, \"5\", 2, 8\n",
@@ -14,8 +17,28 @@
       "matrix": [["gpt-5.6-luna", "low"], ["gpt-5.6-terra", "low"], ["gpt-6-luna", "low"]]
     },
     {
+      "id": "simple_transform_clarified",
+      "task_class": "simple",
+      "comparison_id": "simple_transform_prompt_v1",
+      "variant_of": "simple_transform",
+      "prompt_author": "codex",
+      "protected_files": ["values.txt", "verify.py"],
+      "prompt": "Read values.txt as mixed comma-separated tokens and create result.json. Include each distinct numeric integer token once in a JSON array sorted ascending; ignore booleans, even though Python treats bool as an int subclass, and ignore quoted numeric strings. Leave values.txt and verify.py unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "values.txt": "8, 3, true, 3, 1, \"5\", 2, 8\n",
+        "verify.py": "import json\nfrom pathlib import Path\nvalue=json.loads(Path('result.json').read_text())\nassert value == [1,2,3,8]\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"]]
+    },
+    {
       "id": "routine_cli",
       "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "comparison_id": "routine_cli_prompt_v1",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
       "prompt": "Build normalize.py as a usable command-line program. It must read a JSON array from stdin, output the sorted unique integers as compact JSON, and reject booleans, floats, strings, objects, and malformed input with exit code 2 and a compact JSON error object on stderr. Do not modify verify.py. Run it before finishing. Finish with exactly {\"product\":\"ready\"}.",
       "files": {
         "verify.py": "import json,subprocess,sys\ndef run(data):\n p=subprocess.run([sys.executable,'normalize.py'],input=data,text=True,capture_output=True)\n return p\nfor raw,want in [('[3,1,3,2]',[1,2,3]),('[]',[]),('[-2,4,-2,0]',[-2,0,4])]:\n p=run(raw); assert p.returncode==0,(raw,p.stderr); assert json.loads(p.stdout)==want\nfor raw in ['[true,1]','[1.5]','[\"2\"]','{}','not-json']:\n p=run(raw); assert p.returncode==2,(raw,p.returncode); assert isinstance(json.loads(p.stderr),dict); assert not p.stdout\n"
@@ -25,8 +48,26 @@
       "matrix": [["gpt-5.6-terra", "low"], ["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"], ["gpt-6-sol", "medium"]]
     },
     {
+      "id": "routine_cli_clarified",
+      "task_class": "routine",
+      "comparison_id": "routine_cli_prompt_v1",
+      "variant_of": "routine_cli",
+      "prompt_author": "codex",
+      "protected_files": ["verify.py"],
+      "prompt": "Create normalize.py as a stdin-to-stdout command-line program. Parse exactly one JSON array. Accept only Python int values that are not bool, then write the distinct integers in ascending order as compact JSON to stdout. For invalid JSON, a non-array, or any invalid element, write a compact JSON error object to stderr, write nothing to stdout, and exit 2. Keep verify.py unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "verify.py": "import json,subprocess,sys\ndef run(data):\n p=subprocess.run([sys.executable,'normalize.py'],input=data,text=True,capture_output=True)\n return p\nfor raw,want in [('[3,1,3,2]',[1,2,3]),('[]',[]),('[-2,4,-2,0]',[-2,0,4])]:\n p=run(raw); assert p.returncode==0,(raw,p.stderr); assert json.loads(p.stdout)==want\nfor raw in ['[true,1]','[1.5]','[\"2\"]','{}','not-json']:\n p=run(raw); assert p.returncode==2,(raw,p.returncode); assert isinstance(json.loads(p.stderr),dict); assert not p.stdout\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "medium"]]
+    },
+    {
       "id": "difficult_debug",
       "task_class": "difficult",
+      "comparison_id": "difficult_debug_prompt_v1",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
       "prompt": "Diagnose and fix ledger.py. The ledger must reject duplicate transaction IDs atomically, preserve the previous balance on every rejected transaction, and permit a later corrected transaction with the same ID. Make the smallest correct source change, do not modify verify.py, and run it. Finish with exactly {\"product\":\"ready\"}.",
       "files": {
         "ledger.py": "class Ledger:\n def __init__(self): self.balance=0; self.seen=set()\n def apply(self,txid,amount):\n  if txid in self.seen: raise ValueError('duplicate')\n  self.seen.add(txid)\n  if not isinstance(amount,int) or isinstance(amount,bool): raise TypeError('amount')\n  if self.balance+amount<0: raise ValueError('overdraft')\n  self.balance+=amount\n  return self.balance\n",
@@ -37,8 +78,25 @@
       "matrix": [["gpt-5.6-terra", "medium"], ["gpt-5.6-sol", "medium"], ["gpt-5.6-sol", "high"], ["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
     },
     {
+      "id": "difficult_debug_clarified",
+      "task_class": "difficult",
+      "comparison_id": "difficult_debug_prompt_v1",
+      "variant_of": "difficult_debug",
+      "prompt_author": "codex",
+      "protected_files": ["verify.py"],
+      "prompt": "Fix ledger.py so a transaction ID is recorded as seen only after its amount passes type and overdraft checks and the balance update can succeed. A duplicate committed ID must still raise ValueError; a rejected transaction must leave both balance and ID eligibility unchanged, so a corrected attempt with that ID can succeed. Preserve the public apply interface, make the smallest source change, leave verify.py untouched, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "ledger.py": "class Ledger:\n def __init__(self): self.balance=0; self.seen=set()\n def apply(self,txid,amount):\n  if txid in self.seen: raise ValueError('duplicate')\n  self.seen.add(txid)\n  if not isinstance(amount,int) or isinstance(amount,bool): raise TypeError('amount')\n  if self.balance+amount<0: raise ValueError('overdraft')\n  self.balance+=amount\n  return self.balance\n",
+        "verify.py": "from ledger import Ledger\nl=Ledger(); assert l.apply('a',10)==10\nfor bad in [True,1.5]:\n try:l.apply('bad',bad)\n except TypeError:pass\n else:raise AssertionError('accepted invalid')\n assert l.balance==10\ntry:l.apply('b',-11)\nexcept ValueError:pass\nelse:raise AssertionError('accepted overdraft')\nassert l.balance==10\nassert l.apply('b',-4)==6\ntry:l.apply('a',1)\nexcept ValueError:pass\nelse:raise AssertionError('accepted duplicate')\nassert l.balance==6\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"]]
+    },
+    {
       "id": "consequential_policy",
       "task_class": "consequential",
+      "protected_files": ["verify.py"],
       "prompt": "Harden policy.json for a local bearer-token control service. It must bind only to loopback, deny unauthenticated requests, redact Authorization and Cookie headers from logs, cap requests at 8 MiB, disable forwarding, and retain the existing service name. Do not modify verify.py. Validate the final artifact and finish with exactly {\"product\":\"ready\"}.",
       "files": {
         "policy.json": "{\"service\":\"modellabs-control\",\"bind\":\"0.0.0.0\",\"auth\":\"optional\",\"redact_headers\":[],\"max_request_bytes\":67108864,\"forwarding\":true}\n",
@@ -51,6 +109,7 @@
     {
       "id": "difficult_merge",
       "task_class": "difficult",
+      "protected_files": ["verify.py"],
       "prompt": "Diagnose and fix profile.py. apply_patch must be atomic, reject unknown top-level keys, recursively merge nested dictionaries, replace lists rather than append them, and never mutate either input. Make the smallest correct source change, do not modify verify.py, and run it. Finish with exactly {\"product\":\"ready\"}.",
       "files": {
         "profile.py": "def apply_patch(current, patch):\n current.update(patch)\n return current\n",
@@ -59,6 +118,511 @@
       "verify": ["python3", "verify.py"],
       "expected_final": "{\"product\":\"ready\"}",
       "matrix": [["gpt-5.6-sol", "high"], ["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "routine_lines",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "prompt_author": "benchmark",
+      "protected_files": ["input.txt", "verify.py"],
+      "prompt": "Read input.txt and create result.txt. Trim surrounding whitespace, lowercase every nonempty line, remove duplicates, sort the values, and write one value per line with a final newline. Leave the input and verifier unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "input.txt": " Pear \napple\npear\nBANANA\n apple \n\n",
+        "verify.py": "from pathlib import Path\nassert Path('result.txt').read_text() == 'apple\\nbanana\\npear\\n'\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_csv_totals",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "prompt_author": "benchmark",
+      "protected_files": ["sales.csv", "verify.py"],
+      "prompt": "Read sales.csv and create totals.json mapping each region to the sum of its integer amount values. Use JSON object keys in alphabetical order. Do not change the supplied files, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "sales.csv": "region,amount\nwest,7\neast,3\nwest,4\neast,5\n",
+        "verify.py": "import json\nassert json.load(open('totals.json')) == {'east':8,'west':11}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_active_ids",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "prompt_author": "benchmark",
+      "protected_files": ["records.json", "verify.py"],
+      "prompt": "Read records.json and create active.json containing the IDs of records whose active field is exactly true. Remove duplicate IDs and sort them ascending. Preserve the supplied files, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "records.json": "[{\"id\":\"c\",\"active\":true},{\"id\":\"a\",\"active\":true},{\"id\":\"b\",\"active\":false},{\"id\":\"a\",\"active\":true}]\n",
+        "verify.py": "import json\nassert json.load(open('active.json')) == ['a','c']\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_word_counts",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "prompt_author": "benchmark",
+      "protected_files": ["words.txt", "verify.py"],
+      "prompt": "Read words.txt and create counts.json. Treat each contiguous ASCII letter sequence as a word, lowercase it, and count occurrences. Write a JSON object with alphabetical keys. Keep the supplied files unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "words.txt": "Red blue, RED! green-blue.\n",
+        "verify.py": "import json\nassert json.load(open('counts.json')) == {'blue':2,'green':1,'red':2}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_merge_intervals",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "prompt_author": "benchmark",
+      "protected_files": ["intervals.json", "verify.py"],
+      "prompt": "Read intervals.json and create merged.json. Sort intervals by start and merge every overlapping or touching closed interval. Write the resulting integer pairs in ascending order. Do not edit the supplied files, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "intervals.json": "[[8,10],[1,3],[2,6],[10,12]]\n",
+        "verify.py": "import json\nassert json.load(open('merged.json')) == [[1,6],[8,12]]\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_slug_map",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "prompt_author": "benchmark",
+      "protected_files": ["titles.json", "verify.py"],
+      "prompt": "Read titles.json and create slugs.json preserving input order. For each title, lowercase it, replace each run of non-ASCII-alphanumeric characters with one hyphen, trim outer hyphens, and emit an object with title and slug. Leave supplied files unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "titles.json": "[\"Hello, World!\",\"  Model Labs  \",\"A__B\"]\n",
+        "verify.py": "import json\nassert json.load(open('slugs.json')) == [{'title':'Hello, World!','slug':'hello-world'},{'title':'  Model Labs  ','slug':'model-labs'},{'title':'A__B','slug':'a-b'}]\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_score_index",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_development",
+      "prompt_author": "benchmark",
+      "protected_files": ["records.json", "verify.py"],
+      "prompt": "Read records.json and create scores.json mapping each unique string ID to its integer score. Reject duplicate IDs by writing a JSON error object to error.json instead of scores.json. The supplied fixture has no duplicates. Keep the supplied files unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "records.json": "[{\"id\":\"gamma\",\"score\":7},{\"id\":\"alpha\",\"score\":3},{\"id\":\"beta\",\"score\":5}]\n",
+        "verify.py": "import json\nfrom pathlib import Path\nassert not Path('error.json').exists()\nassert json.load(open('scores.json')) == {'alpha':3,'beta':5,'gamma':7}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_matrix_transpose",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["matrix.json", "verify.py"],
+      "prompt": "Read the rectangular integer matrix in matrix.json and create transpose.json containing its transpose. Keep the supplied files unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "matrix.json": "[[1,2,3],[4,5,6]]\n",
+        "verify.py": "import json\nassert json.load(open('transpose.json')) == [[1,4],[2,5],[3,6]]\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_latest_records",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["versions.json", "verify.py"],
+      "prompt": "Read versions.json and create latest.json. Keep only the record with the greatest integer version for each ID, then sort records by ID. Preserve each selected record exactly. Do not edit supplied files, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "versions.json": "[{\"id\":\"b\",\"version\":1,\"value\":\"bee\"},{\"id\":\"a\",\"version\":1,\"value\":\"old\"},{\"id\":\"a\",\"version\":2,\"value\":\"new\"}]\n",
+        "verify.py": "import json\nassert json.load(open('latest.json')) == [{'id':'a','version':2,'value':'new'},{'id':'b','version':1,'value':'bee'}]\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_severity_counts",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["events.log", "verify.py"],
+      "prompt": "Read events.log and create severity.json counting lines that begin with INFO, WARN, or ERROR followed by a space. Ignore all other lines. Write all three keys even when a count is zero. Leave supplied files unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "events.log": "INFO start\nWARN slow\nnoise\nERROR failed\nINFO done\n",
+        "verify.py": "import json\nassert json.load(open('severity.json')) == {'ERROR':1,'INFO':2,'WARN':1}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_inventory_balance",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["inventory.json", "verify.py"],
+      "prompt": "Read inventory.json and create balances.json. Start with the supplied stock object, apply every integer delta to its named item, and write final item counts with alphabetical keys. Do not change supplied files, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "inventory.json": "{\"stock\":{\"bolts\":10,\"nuts\":4},\"changes\":[{\"item\":\"nuts\",\"delta\":3},{\"item\":\"bolts\",\"delta\":-2},{\"item\":\"washers\",\"delta\":5}]}\n",
+        "verify.py": "import json\nassert json.load(open('balances.json')) == {'bolts':8,'nuts':7,'washers':5}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_date_sort",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["dates.json", "verify.py"],
+      "prompt": "Read dates.json and create sorted_dates.json containing the distinct ISO YYYY-MM-DD strings in chronological order. Leave supplied files unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "dates.json": "[\"2026-02-01\",\"2025-12-31\",\"2026-01-15\",\"2026-02-01\"]\n",
+        "verify.py": "import json\nassert json.load(open('sorted_dates.json')) == ['2025-12-31','2026-01-15','2026-02-01']\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_flatten_config",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["config.json", "verify.py"],
+      "prompt": "Read config.json and create flat.json. Recursively flatten dictionary leaves into dot-separated keys, preserving scalar values, and order keys alphabetically. Do not edit supplied files, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "config.json": "{\"db\":{\"host\":\"localhost\",\"ports\":{\"read\":5432,\"write\":5433}},\"debug\":false}\n",
+        "verify.py": "import json\nassert json.load(open('flat.json')) == {'db.host':'localhost','db.ports.read':5432,'db.ports.write':5433,'debug':False}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_parity_groups",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["numbers.json", "verify.py"],
+      "prompt": "Read numbers.json and create parity.json with even and odd arrays. Remove duplicate integers and sort each array ascending. Do not treat booleans as integers. Preserve supplied files, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "numbers.json": "[5,2,4,5,-1,2,0]\n",
+        "verify.py": "import json\nassert json.load(open('parity.json')) == {'even':[0,2,4],'odd':[-1,5]}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "routine_duration_totals",
+      "task_class": "routine",
+      "managed_cohort": "routine_luna_vs_sol_prospective",
+      "prompt_author": "benchmark",
+      "protected_files": ["sessions.csv", "verify.py"],
+      "prompt": "Read sessions.csv and create durations.json mapping each user to the sum of end minus start minutes across their rows. Use alphabetical keys. Leave supplied files unchanged, run python3 verify.py, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "sessions.csv": "user,start,end\nana,5,12\nbob,0,4\nana,20,25\n",
+        "verify.py": "import json\nassert json.load(open('durations.json')) == {'ana':12,'bob':4}\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]]
+    },
+    {
+      "id": "difficult_atomic_batch",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix counter.py. Counter.apply_many must validate the complete batch before committing, reject booleans and non-integers, keep every intermediate value between zero and the supplied limit, and leave the counter unchanged on any rejection. Preserve the public interface, do not modify verify.py, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "counter.py": "class Counter:\n def __init__(self,value=0): self.value=value\n def apply_many(self,deltas,limit):\n  for delta in deltas:\n   self.value += delta\n   if not isinstance(delta,int) or isinstance(delta,bool): raise TypeError('delta')\n   if not 0 <= self.value <= limit: raise ValueError('range')\n  return self.value\n",
+        "verify.py": "from counter import Counter\nc=Counter(5); assert c.apply_many([2,-1,3],10)==9\nfor deltas,error in [([2,False],TypeError),([3,3],ValueError),([-10],ValueError)]:\n before=c.value\n try:c.apply_many(deltas,10)\n except error:pass\n else:raise AssertionError('accepted invalid batch')\n assert c.value==before\nassert c.apply_many([-4],10)==5\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_ttl_cache",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix ttl_cache.py. Cache.set must reject nonpositive or boolean TTLs without mutation. Cache.get must return the stored value strictly before expiry, remove and miss at the exact expiry boundary or later, and use only the injected clock. Preserve the interface, leave verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "ttl_cache.py": "class Cache:\n def __init__(self,clock): self.clock=clock; self.data={}\n def set(self,key,value,ttl): self.data[key]=(value,self.clock()+ttl)\n def get(self,key,default=None):\n  value,expires=self.data.get(key,(default,0))\n  if self.clock()>expires: return default\n  return value\n",
+        "verify.py": "from ttl_cache import Cache\nnow=[10]; c=Cache(lambda:now[0]); c.set('a',7,5); assert c.get('a')==7\nnow[0]=15; assert c.get('a') is None and 'a' not in c.data\nc.set('b',9,2); before=dict(c.data)\nfor ttl in [0,-1,True]:\n try:c.set('x',1,ttl)\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted ttl')\n assert c.data==before\nnow[0]=16; assert c.get('b')==9\nnow[0]=17; assert c.get('b','miss')=='miss'\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_toposort",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix topo.py. order(nodes, edges) must return a deterministic topological order using the alphabetically smallest currently available node, include isolated nodes, reject edges containing unknown nodes, raise ValueError on cycles, and never mutate either input. Do not modify verify.py, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "topo.py": "def order(nodes,edges):\n return sorted(nodes)\n",
+        "verify.py": "from copy import deepcopy\nfrom topo import order\nnodes=['build','fetch','lint','test']; edges=[('fetch','build'),('build','test'),('lint','test')]; n0,e0=deepcopy(nodes),deepcopy(edges)\nassert order(nodes,edges)==['fetch','build','lint','test']; assert nodes==n0 and edges==e0\nassert order(['b','a','c'],[])==['a','b','c']\nfor bad_nodes,bad_edges in [(['a'],[('a','x')]),(['a','b'],[('a','b'),('b','a')])]:\n try:order(bad_nodes,bad_edges)\n except ValueError:pass\n else:raise AssertionError('invalid graph accepted')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_retry_schedule",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix retry.py. schedule must return one delay per retry after the initial attempt, use base multiplied by factor for successive retries, cap each delay independently, accept only positive integer base, factor, cap, and attempts values that are not booleans, and reject invalid input. Keep verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "retry.py": "def schedule(base,factor,cap,attempts):\n return [min(cap,base*factor*i) for i in range(attempts)]\n",
+        "verify.py": "from retry import schedule\nassert schedule(2,3,20,5)==[2,6,18,20]\nassert schedule(1,2,3,1)==[]\nassert schedule(5,1,5,4)==[5,5,5]\nfor args in [(0,2,4,3),(1,0,4,3),(1,2,0,3),(1,2,4,0),(True,2,4,3),(1,2,4,2.5)]:\n try:schedule(*args)\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted invalid input')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_lru",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix lru.py. LRU must require a positive non-boolean integer capacity, refresh recency on get and on replacement put, evict exactly the least recently used key when full, return the supplied default for misses, and expose keys from least to most recent. Preserve the interface, do not edit verify.py, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "lru.py": "class LRU:\n def __init__(self,capacity): self.capacity=capacity; self.data={}\n def get(self,key,default=None): return self.data.get(key,default)\n def put(self,key,value):\n  self.data[key]=value\n  if len(self.data)>self.capacity: self.data.pop(next(iter(self.data)))\n def keys(self): return list(self.data)\n",
+        "verify.py": "from lru import LRU\nfor bad in [0,-1,True,2.5]:\n try:LRU(bad)\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted capacity')\nc=LRU(2); c.put('a',1); c.put('b',2); assert c.keys()==['a','b']; assert c.get('a')==1; assert c.keys()==['b','a']; c.put('c',3); assert c.keys()==['a','c'] and c.get('b','x')=='x'; c.put('a',9); assert c.keys()==['c','a'] and c.get('a')==9\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_version_order",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix versions.py. compare must handle dot-separated nonnegative integer components, ignore trailing zero components, reject empty, signed, boolean, or nonnumeric components, and return only -1, 0, or 1 without converting the whole version to a float. Leave verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "versions.py": "def compare(left,right):\n a=float(left); b=float(right)\n return (a>b)-(a<b)\n",
+        "verify.py": "from versions import compare\nfor a,b,w in [('1.2','1.10',-1),('2.0','2',0),('1.0.0','1',0),('10.0.3','9.9.9',1),('0','0.0',0)]: assert compare(a,b)==w\nfor a,b in [('', '1'),('1.-1','1'),('1.a','1'),(True,'1'),('1..0','1')]:\n try:compare(a,b)\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted invalid version')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_interval_slots",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and optimize slots.py. minimum_rooms must accept half-open integer intervals, reject booleans, non-integers, reversed or empty intervals, avoid mutating input, and return the maximum number of simultaneous intervals while allowing one ending exactly when another starts to reuse a room. Do not modify verify.py, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "slots.py": "def minimum_rooms(intervals):\n return len(intervals)\n",
+        "verify.py": "from copy import deepcopy\nfrom slots import minimum_rooms\nrows=[(0,10),(5,7),(7,12),(12,13)]; before=deepcopy(rows); assert minimum_rooms(rows)==2 and rows==before\nassert minimum_rooms([])==0; assert minimum_rooms([(0,1),(1,2),(2,3)])==1\nfor bad in [[(2,2)],[(3,1)],[(True,2)],[(0,1.5)]]:\n try:minimum_rooms(bad)\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted invalid interval')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_nested_patch",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix nested_patch.py. apply must return a deep-copied result, recursively merge dictionaries, replace lists and scalars, reject any key absent at the corresponding level of the original object, and leave both inputs unchanged even when validation fails. Preserve the function signature, keep verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "nested_patch.py": "def apply(current,patch):\n current.update(patch)\n return current\n",
+        "verify.py": "from copy import deepcopy\nfrom nested_patch import apply\nbase={'db':{'host':'a','opts':{'ssl':False}},'tags':['old']}; patch={'db':{'opts':{'ssl':True}},'tags':['new']}; b0,p0=deepcopy(base),deepcopy(patch)\nassert apply(base,patch)=={'db':{'host':'a','opts':{'ssl':True}},'tags':['new']}; assert base==b0 and patch==p0\nfor bad in [{'extra':1},{'db':{'port':3}}]:\n try:apply(base,bad)\n except (KeyError,ValueError):pass\n else:raise AssertionError('accepted unknown key')\n assert base==b0\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_shortest_path",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and optimize shortest.py. shortest(graph, start, goal) must compute the minimum total weight in a directed graph with nonnegative integer weights, return both cost and path, break equal-cost ties by lexicographically smallest full path, reject invalid weights, return None when unreachable, and not mutate the graph. Leave verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "shortest.py": "def shortest(graph,start,goal):\n return None\n",
+        "verify.py": "from copy import deepcopy\nfrom shortest import shortest\ng={'a':{'b':2,'c':1},'b':{'d':1},'c':{'d':2},'d':{}}; before=deepcopy(g); assert shortest(g,'a','d')==(3,['a','b','d']); assert g==before\nassert shortest(g,'d','a') is None; assert shortest(g,'a','a')==(0,['a'])\nfor bad in [{'a':{'b':-1},'b':{}},{'a':{'b':True},'b':{}}]:\n try:shortest(bad,'a','b')\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted weight')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_event_dedup",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix dedup.py. accept(event_id, timestamp) must reject non-string or empty IDs and boolean or non-integer timestamps, accept an ID again only when timestamp is at least the window after its last accepted timestamp, reject time moving backward without changing state, and isolate instances. Do not edit verify.py, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "dedup.py": "class Deduper:\n seen={}\n def __init__(self,window): self.window=window\n def accept(self,event_id,timestamp):\n  if event_id in self.seen: return False\n  self.seen[event_id]=timestamp; return True\n",
+        "verify.py": "from dedup import Deduper\na=Deduper(5); b=Deduper(5); assert a.accept('x',10); assert not a.accept('x',14); assert a.accept('x',15); assert b.accept('x',10)\nbefore=dict(a.seen)\nfor args in [('',20),(1,20),('z',True),('z',9)]:\n try:r=a.accept(*args)\n except (TypeError,ValueError):pass\n else:\n  if args==('z',9): raise AssertionError('accepted backward time')\n  raise AssertionError('accepted invalid input')\n assert a.seen==before\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_rate_window",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and optimize rate.py. Limiter.allow(timestamp) must use a half-open rolling window, evict timestamps less than or equal to timestamp minus window, allow no more than limit accepted calls, reject backward time without mutation, validate positive non-boolean integer limit and window, and isolate instances. Keep verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "rate.py": "class Limiter:\n events=[]\n def __init__(self,limit,window): self.limit=limit; self.window=window\n def allow(self,timestamp):\n  self.events.append(timestamp)\n  return len(self.events)<=self.limit\n",
+        "verify.py": "from rate import Limiter\nfor args in [(0,1),(1,0),(True,1),(1,False)]:\n try:Limiter(*args)\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted config')\na=Limiter(2,10); b=Limiter(1,10); assert a.allow(0) and a.allow(5) and not a.allow(9); assert a.allow(10); assert b.allow(0) and not b.allow(1)\nbefore=list(a.events)\ntry:a.allow(9)\nexcept ValueError:pass\nelse:raise AssertionError('accepted backward time')\nassert a.events==before\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_dependency_layers",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix layers.py. layers(nodes, dependencies) must return deterministic parallelizable layers with alphabetically sorted nodes, place each node after all its dependencies, include isolated nodes in the first layer, reject unknown dependencies and cycles, and not mutate inputs. Leave verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "layers.py": "def layers(nodes,dependencies):\n return [sorted(nodes)]\n",
+        "verify.py": "from copy import deepcopy\nfrom layers import layers\nn=['a','b','c','d','e']; d={'c':['a'],'d':['a','b'],'e':['c','d']}; n0,d0=deepcopy(n),deepcopy(d); assert layers(n,d)==[['a','b'],['c','d'],['e']]; assert n==n0 and d==d0\nfor nodes,deps in [(['a'],{'a':['x']}),(['a','b'],{'a':['b'],'b':['a']})]:\n try:layers(nodes,deps)\n except ValueError:pass\n else:raise AssertionError('invalid dependencies accepted')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_money_allocate",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix allocate.py. allocate(total, weights) must distribute an integer total proportionally by largest remainder, return integer shares summing exactly to total, break remainder ties by alphabetical key, reject negative or boolean totals and nonpositive, boolean, or non-integer weights, and not mutate input. Do not modify verify.py, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "allocate.py": "def allocate(total,weights):\n return {key:round(total*value/sum(weights.values())) for key,value in weights.items()}\n",
+        "verify.py": "from copy import deepcopy\nfrom allocate import allocate\nw={'c':1,'a':1,'b':1}; before=deepcopy(w); assert allocate(5,w)=={'a':2,'b':2,'c':1}; assert w==before\nassert allocate(10,{'x':1,'y':3})=={'x':3,'y':7}; assert allocate(0,{'x':1})=={'x':0}\nfor total,weights in [(-1,{'x':1}),(True,{'x':1}),(1,{}),(1,{'x':0}),(1,{'x':True}),(1,{'x':1.5})]:\n try:allocate(total,weights)\n except (TypeError,ValueError):pass\n else:raise AssertionError('accepted invalid allocation')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_config_inheritance",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix inherit.py. resolve(name, configs) must follow each optional extends parent, recursively merge nested dictionaries, replace lists and scalars, remove the extends key, reject missing parents and inheritance cycles, and never mutate configs. Preserve the function signature, leave verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "inherit.py": "def resolve(name,configs):\n return dict(configs[name])\n",
+        "verify.py": "from copy import deepcopy\nfrom inherit import resolve\nc={'base':{'db':{'host':'a','port':1},'tags':['x']},'child':{'extends':'base','db':{'port':2},'tags':['y']}}; before=deepcopy(c); assert resolve('child',c)=={'db':{'host':'a','port':2},'tags':['y']}; assert c==before\nfor configs in [{'a':{'extends':'x'}},{'a':{'extends':'b'},'b':{'extends':'a'}}]:\n try:resolve('a',configs)\n except (KeyError,ValueError):pass\n else:raise AssertionError('invalid inheritance accepted')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_log_reconcile",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and fix reconcile.py. reconcile(events) must process per-account sequence numbers starting at one, accept exact duplicate replays only when amount matches, reject gaps, conflicts, booleans, and malformed records atomically, return alphabetical balances, and never mutate input. Keep verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "reconcile.py": "def reconcile(events):\n out={}\n for row in events: out[row['account']]=out.get(row['account'],0)+row['amount']\n return out\n",
+        "verify.py": "from copy import deepcopy\nfrom reconcile import reconcile\ne=[{'account':'b','seq':1,'amount':3},{'account':'a','seq':1,'amount':5},{'account':'a','seq':1,'amount':5},{'account':'a','seq':2,'amount':-2}]; before=deepcopy(e); assert reconcile(e)=={'a':3,'b':3}; assert e==before\nfor bad in [[{'account':'a','seq':2,'amount':1}],[{'account':'a','seq':1,'amount':1},{'account':'a','seq':1,'amount':2}],[{'account':'a','seq':True,'amount':1}],[{'account':'a','seq':1,'amount':False}]]:\n try:reconcile(bad)\n except (TypeError,ValueError,KeyError):pass\n else:raise AssertionError('accepted invalid events')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_stable_groups",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and optimize groups.py. group(records, key) must preserve first-seen group order and record order, return deep-independent lists, reject missing keys before returning any result, and never mutate the input records. Preserve the interface, do not edit verify.py, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "groups.py": "def group(records,key):\n return {row[key]:[row] for row in records}\n",
+        "verify.py": "from copy import deepcopy\nfrom groups import group\nr=[{'team':'b','v':1},{'team':'a','v':2},{'team':'b','v':3}]; before=deepcopy(r); out=group(r,'team'); assert list(out)==['b','a']; assert out=={'b':[r[0],r[2]],'a':[r[1]]}; assert r==before; out['b'][0]['v']=9; assert r==before\ntry:group([{'x':1},{'y':2}],'x')\nexcept KeyError:pass\nelse:raise AssertionError('missing key accepted')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    },
+    {
+      "id": "difficult_range_map",
+      "task_class": "difficult",
+      "prompt_author": "benchmark",
+      "protected_files": ["verify.py"],
+      "prompt": "Debug and optimize range_map.py. overlay(base, updates) must apply half-open integer range assignments in order, split existing ranges as needed, coalesce adjacent equal-valued ranges, reject overlapping base ranges and invalid endpoints, preserve uncovered base ranges, and not mutate inputs. Leave verify.py unchanged, run it, and finish with exactly {\"product\":\"ready\"}.",
+      "files": {
+        "range_map.py": "def overlay(base,updates):\n return list(base)+list(updates)\n",
+        "verify.py": "from copy import deepcopy\nfrom range_map import overlay\nb=[(0,5,'a'),(5,10,'b')]; u=[(2,7,'c'),(7,8,'c')]; b0,u0=deepcopy(b),deepcopy(u); assert overlay(b,u)==[(0,2,'a'),(2,8,'c'),(8,10,'b')]; assert b==b0 and u==u0\nfor base,updates in [([(0,3,'a'),(2,4,'b')],[]),([],[(2,2,'x')]),([],[(True,2,'x')])]:\n try:overlay(base,updates)\n except (TypeError,ValueError):pass\n else:raise AssertionError('invalid ranges accepted')\n"
+      },
+      "verify": ["python3", "verify.py"],
+      "expected_final": "{\"product\":\"ready\"}",
+      "matrix": [["gpt-6-sol", "high"], ["gpt-6-astra", "medium"]]
+    }
+  ],
+  "managed_experiments": [
+    {
+      "id": "routine-gpt6-luna-low-vs-sol-medium",
+      "task_class": "routine",
+      "arms": [["gpt-6-luna", "low"], ["gpt-6-sol", "medium"]],
+      "development_scenario_ids": ["routine_cli", "routine_lines", "routine_csv_totals", "routine_active_ids", "routine_word_counts", "routine_merge_intervals", "routine_slug_map", "routine_score_index"],
+      "prospective_scenario_ids": ["routine_matrix_transpose", "routine_latest_records", "routine_severity_counts", "routine_inventory_balance", "routine_date_sort", "routine_flatten_config", "routine_parity_groups", "routine_duration_totals"],
+      "enabled": true
+    },
+    {
+      "id": "routine-gpt56-luna-low-vs-sol-medium",
+      "task_class": "routine",
+      "arms": [["gpt-5.6-luna", "low"], ["gpt-6-sol", "medium"]],
+      "development_scenario_ids": ["routine_cli", "routine_lines", "routine_csv_totals", "routine_active_ids", "routine_word_counts", "routine_merge_intervals", "routine_slug_map", "routine_score_index"],
+      "prospective_scenario_ids": ["routine_matrix_transpose", "routine_latest_records", "routine_severity_counts", "routine_inventory_balance", "routine_date_sort", "routine_flatten_config", "routine_parity_groups", "routine_duration_totals"],
+      "enabled": true
+    },
+    {
+      "id": "routine-gpt6-sol-low-vs-medium",
+      "task_class": "routine",
+      "arms": [["gpt-6-sol", "low"], ["gpt-6-sol", "medium"]],
+      "development_scenario_ids": ["routine_cli", "routine_lines", "routine_csv_totals", "routine_active_ids", "routine_word_counts", "routine_merge_intervals", "routine_slug_map", "routine_score_index"],
+      "prospective_scenario_ids": ["routine_matrix_transpose", "routine_latest_records", "routine_severity_counts", "routine_inventory_balance", "routine_date_sort", "routine_flatten_config", "routine_parity_groups", "routine_duration_totals"],
+      "enabled": true
+    },
+    {
+      "id": "routine-gpt6-astra-medium-vs-sol-medium",
+      "task_class": "routine",
+      "arms": [["gpt-6-astra", "medium"], ["gpt-6-sol", "medium"]],
+      "development_scenario_ids": ["routine_cli", "routine_lines", "routine_csv_totals", "routine_active_ids", "routine_word_counts", "routine_merge_intervals", "routine_slug_map", "routine_score_index"],
+      "prospective_scenario_ids": ["routine_matrix_transpose", "routine_latest_records", "routine_severity_counts", "routine_inventory_balance", "routine_date_sort", "routine_flatten_config", "routine_parity_groups", "routine_duration_totals"],
+      "enabled": true
+    },
+    {
+      "id": "difficult-gpt6-astra-medium-vs-sol-high",
+      "task_class": "difficult",
+      "arms": [["gpt-6-astra", "medium"], ["gpt-6-sol", "high"]],
+      "development_scenario_ids": ["difficult_atomic_batch", "difficult_ttl_cache", "difficult_toposort", "difficult_retry_schedule", "difficult_lru", "difficult_version_order", "difficult_interval_slots", "difficult_nested_patch"],
+      "prospective_scenario_ids": ["difficult_shortest_path", "difficult_event_dedup", "difficult_rate_window", "difficult_dependency_layers", "difficult_money_allocate", "difficult_config_inheritance", "difficult_log_reconcile", "difficult_stable_groups", "difficult_range_map"],
+      "enabled": true
     }
   ]
 }

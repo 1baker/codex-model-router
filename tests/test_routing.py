@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import sys
 import io
 import unittest
@@ -17,7 +18,9 @@ from install import (SHELL_PATH_START, discover_real_codex,
                      ensure_managed_route_precedence, upsert_toml, write_wrappers)
 from paths import real_codex_binary
 from turn_proxy import route_request, selection_is_listed
-from adaptive_policy import adapt, record_outcome
+import turn_proxy as turn_proxy_module
+from adaptive_policy import adapt, feedback, record_outcome
+import adaptive_policy
 from health_dashboard import summarize
 import model_host_launcher
 import host_control
@@ -28,6 +31,260 @@ import thread_owner
 
 
 class RoutingTests(unittest.TestCase):
+    def test_every_generation_dependency_changes_the_proxy_revision(self):
+        payloads = {name: f"VALUE = {name!r}\n".encode()
+                    for name in installer.PROXY_GENERATION_FILES}
+        baseline = installer._proxy_revision(payloads)
+        for name in installer.PROXY_GENERATION_FILES:
+            with self.subTest(name=name):
+                changed = {**payloads, name: payloads[name] + b"# changed\n"}
+                self.assertNotEqual(installer._proxy_revision(changed), baseline)
+
+    def test_proxy_source_only_pins_old_and_new_generation_bundles(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, home = root / "source", root / "installed"
+            source.mkdir()
+            home.mkdir()
+            manifest = {"schema": "modellabs.owned_files.v1", "files": {}}
+            old_proxy = b"VALUE = 'old proxy'\n"
+            new_proxy = b"VALUE = 'new proxy'\n"
+            for name in installer.PROXY_GENERATION_FILES:
+                content = old_proxy if name == "turn_proxy.py" else f"VALUE = {name!r}\n".encode()
+                target = home / name
+                target.write_bytes(content)
+                (source / name).write_bytes(
+                    new_proxy if name == "turn_proxy.py" else content)
+                manifest["files"][str(target)] = hashlib.sha256(content).hexdigest()
+            manifest_path = home / installer.OWNED_MANIFEST
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with patch.object(installer, "SOURCE", source):
+                result = installer.install_proxy_source_only(
+                    home, hashlib.sha256(old_proxy).hexdigest())
+            self.assertEqual((home / "turn_proxy.py").read_bytes(), new_proxy)
+            self.assertEqual(Path(result["backup"]).read_bytes(), old_proxy)
+            self.assertEqual(result["services_restarted"], "false")
+            self.assertEqual(result["changed_files"], ["turn_proxy.py"])
+            self.assertNotEqual(result["old_revision"], result["new_revision"])
+            for generation, expected in ((result["old_revision"], old_proxy),
+                                         (result["new_revision"], new_proxy)):
+                entry = home / "proxy-generations" / str(generation) / "turn_proxy.py"
+                self.assertEqual(entry.read_bytes(), expected)
+                self.assertEqual(entry.stat().st_mode & 0o777, 0o600)
+            selected = turn_proxy_module.pinned_proxy_generation(
+                home, {"MODELLABS_PROXY_PORT": str(result["old_port"])})
+            self.assertEqual(selected[0].read_bytes(), old_proxy)
+            self.assertEqual(selected[1][turn_proxy_module.PROXY_GENERATION_ENTRY_ENV], "1")
+            self.assertEqual(selected[1]["MODELLABS_HOME"], str(home))
+            self.assertEqual(set(installer.PROXY_GENERATION_FILES),
+                             set(turn_proxy_module.PROXY_GENERATION_FILES))
+            with patch.object(turn_proxy_module.os, "execve", side_effect=SystemExit) as execute:
+                with self.assertRaises(SystemExit):
+                    turn_proxy_module.dispatch_pinned_proxy_generation(
+                        home, {"MODELLABS_PROXY_PORT": str(result["new_port"])})
+            self.assertEqual(Path(execute.call_args.args[1][1]).read_bytes(), new_proxy)
+            self.assertEqual(execute.call_args.args[2]["MODELLABS_HOME"], str(home))
+            selected[0].write_bytes(b"tampered\n")
+            with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+                turn_proxy_module.pinned_proxy_generation(
+                    home, {"MODELLABS_PROXY_PORT": str(result["old_port"])})
+
+    def test_proxy_source_only_publishes_dependency_only_generation_change(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, home = root / "source", root / "installed"
+            source.mkdir()
+            home.mkdir()
+            manifest = {"schema": "modellabs.owned_files.v1", "files": {}}
+            old_policy = b"VALUE = 'old policy'\n"
+            new_policy = b"VALUE = 'new policy'\n"
+            proxy = b"VALUE = 'unchanged proxy'\n"
+            for name in installer.PROXY_GENERATION_FILES:
+                content = (old_policy if name == "adaptive_policy.py" else
+                           proxy if name == "turn_proxy.py" else
+                           f"VALUE = {name!r}\n".encode())
+                target = home / name
+                target.write_bytes(content)
+                (source / name).write_bytes(
+                    new_policy if name == "adaptive_policy.py" else content)
+                manifest["files"][str(target)] = hashlib.sha256(content).hexdigest()
+            manifest_path = home / installer.OWNED_MANIFEST
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with patch.object(installer, "SOURCE", source):
+                result = installer.install_proxy_source_only(
+                    home, hashlib.sha256(proxy).hexdigest())
+            self.assertEqual(result["changed_files"], ["adaptive_policy.py"])
+            self.assertEqual((home / "adaptive_policy.py").read_bytes(), new_policy)
+            self.assertEqual((home / "turn_proxy.py").read_bytes(), proxy)
+            self.assertEqual(Path(result["backups"]["adaptive_policy.py"]).read_bytes(),
+                             old_policy)
+            self.assertNotEqual(result["old_revision"], result["new_revision"])
+            new_bundle = home / "proxy-generations" / str(result["new_revision"])
+            self.assertEqual((new_bundle / "adaptive_policy.py").read_bytes(), new_policy)
+            self.assertEqual((new_bundle / "turn_proxy.py").read_bytes(), proxy)
+
+    def test_supervisor_source_only_requires_exact_owned_baseline(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, home = root / "source", root / "installed"
+            source.mkdir()
+            home.mkdir()
+            old, new = b"VALUE = 'old'\n", b"VALUE = 'new'\n"
+            digest = lambda value: hashlib.sha256(value).hexdigest()
+            (source / "proxy_supervisor.py").write_bytes(new)
+            target = home / "proxy_supervisor.py"
+            target.write_bytes(old)
+            proxy = home / "turn_proxy.py"
+            proxy.write_bytes(b"live proxy untouched\n")
+            manifest_path = home / installer.OWNED_MANIFEST
+            manifest = {"schema": "modellabs.owned_files.v1", "files": {
+                str(target): digest(old), str(proxy): digest(proxy.read_bytes())}}
+            manifest_path.write_text(json.dumps(manifest))
+            with patch.object(installer, "SOURCE", source):
+                with self.assertRaisesRegex(RuntimeError, "inspected baseline"):
+                    installer.install_supervisor_source_only(home, "0" * 64)
+                manifest["files"][str(target)] = "0" * 64
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(RuntimeError, "owned-manifest parity"):
+                    installer.install_supervisor_source_only(home, digest(old))
+                manifest["files"][str(target)] = digest(old)
+                manifest_path.write_text(json.dumps(manifest))
+                result = installer.install_supervisor_source_only(home, digest(old))
+            self.assertEqual(target.read_bytes(), new)
+            self.assertEqual(proxy.read_bytes(), b"live proxy untouched\n")
+            self.assertEqual(Path(result["backup"]).read_bytes(), old)
+            self.assertEqual(Path(result["backup"]).stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(manifest_path.read_text())["files"][str(target)], digest(new))
+            self.assertEqual(result["running_process_changed"], "false")
+            self.assertEqual(result["services_restarted"], "false")
+
+    def test_learning_only_install_preserves_proxy_and_requires_exact_baseline(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, home = root / "source", root / "installed"
+            source.mkdir()
+            home.mkdir()
+            old, new = b"VALUE = 'old'\n", b"VALUE = 'new'\n"
+            (source / "outcome_model.py").write_bytes(new)
+            target = home / "outcome_model.py"
+            target.write_bytes(old)
+            digest = lambda value: hashlib.sha256(value).hexdigest()
+            generation_contents = {}
+            for name in installer.PROXY_GENERATION_FILES:
+                if name == "outcome_model.py":
+                    generation_contents[name] = old
+                    continue
+                content = (b"proxy stays unchanged\n" if name == "turn_proxy.py"
+                           else f"VALUE = {name!r}\n".encode())
+                (home / name).write_bytes(content)
+                generation_contents[name] = content
+            other = home / "turn_proxy.py"
+            manifest_path = home / installer.OWNED_MANIFEST
+            manifest = {"schema": "modellabs.owned_files.v1", "files": {
+                str(home / name): digest(content)
+                for name, content in generation_contents.items()}}
+            manifest_path.write_text(json.dumps(manifest))
+            with patch.object(installer, "SOURCE", source):
+                with self.assertRaisesRegex(RuntimeError, "inspected baseline"):
+                    installer.install_learning_only(home, "0" * 64)
+                self.assertEqual(target.read_bytes(), old)
+                result = installer.install_learning_only(home, digest(old))
+            self.assertEqual(target.read_bytes(), new)
+            self.assertEqual(other.read_bytes(), b"proxy stays unchanged\n")
+            self.assertEqual(Path(result["backup"]).read_bytes(), old)
+            self.assertEqual(Path(result["backup"]).stat().st_mode & 0o777, 0o600)
+            updated = json.loads(manifest_path.read_text())
+            self.assertEqual(updated["files"][str(target)], digest(new))
+            self.assertEqual(updated["files"][str(other)], digest(other.read_bytes()))
+            self.assertEqual(result["services_restarted"], "false")
+            self.assertEqual(result["running_process_changed"], "false")
+            self.assertNotEqual(result["old_revision"], result["new_revision"])
+            self.assertEqual(
+                (home / "proxy-generations" / result["new_revision"] /
+                 "outcome_model.py").read_bytes(), new)
+
+    def test_learning_only_pair_install_is_guarded_and_leaves_proxy_running(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, home = root / "source", root / "installed"
+            source.mkdir()
+            home.mkdir()
+            digest = lambda value: hashlib.sha256(value).hexdigest()
+            old_learner, old_smoke = b"VALUE = 'learner old'\n", b"VALUE = 'smoke old'\n"
+            new_learner, new_smoke = b"VALUE = 'learner new'\n", b"VALUE = 'smoke new'\n"
+            for name, old, new in (("outcome_model.py", old_learner, new_learner),
+                                   ("smoke_bench.py", old_smoke, new_smoke)):
+                (home / name).write_bytes(old)
+                (source / name).write_bytes(new)
+            generation_contents = {"outcome_model.py": old_learner}
+            for name in installer.PROXY_GENERATION_FILES:
+                if name == "outcome_model.py":
+                    continue
+                content = (b"untouched\n" if name == "turn_proxy.py"
+                           else f"VALUE = {name!r}\n".encode())
+                (home / name).write_bytes(content)
+                generation_contents[name] = content
+            proxy = home / "turn_proxy.py"
+            manifest_path = home / installer.OWNED_MANIFEST
+            manifest_path.write_text(json.dumps({"schema": "modellabs.owned_files.v1",
+                                                "files": {
+                                                    **{str(home / name): digest(content)
+                                                       for name, content in generation_contents.items()},
+                                                    str(home / "smoke_bench.py"): digest(old_smoke)}}))
+            with patch.object(installer, "SOURCE", source):
+                with self.assertRaisesRegex(RuntimeError, "inspected baseline"):
+                    installer.install_learning_only(home, digest(old_learner), "0" * 64)
+                self.assertEqual((home / "outcome_model.py").read_bytes(), old_learner)
+                self.assertEqual((home / "smoke_bench.py").read_bytes(), old_smoke)
+                result = installer.install_learning_only(home, digest(old_learner), digest(old_smoke))
+            self.assertEqual((home / "outcome_model.py").read_bytes(), new_learner)
+            self.assertEqual((home / "smoke_bench.py").read_bytes(), new_smoke)
+            self.assertEqual(proxy.read_bytes(), b"untouched\n")
+            self.assertEqual(Path(result["smoke_backup"]).read_bytes(), old_smoke)
+            self.assertEqual(result["services_restarted"], "false")
+            self.assertNotEqual(result["old_revision"], result["new_revision"])
+
+    def test_learning_only_publishes_benchmark_manifest_in_same_guarded_transaction(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, home = root / "source", root / "installed"
+            (source / "benchmarks").mkdir(parents=True)
+            (home / "benchmarks").mkdir(parents=True)
+            digest = lambda value: hashlib.sha256(value).hexdigest()
+            learner = b"VALUE = 'same learner'\n"
+            old_manifest = b'{"schema":"modellabs.smoke.v1","scenarios":[]}\n'
+            new_manifest = b'{"schema":"modellabs.smoke.v1","scenarios":[{}]}\n'
+            (source / "outcome_model.py").write_bytes(learner)
+            (source / "benchmarks/smoke.json").write_bytes(new_manifest)
+            (home / "outcome_model.py").write_bytes(learner)
+            (home / "benchmarks/smoke.json").write_bytes(old_manifest)
+            manifest_path = home / installer.OWNED_MANIFEST
+            manifest_path.write_text(json.dumps({"schema": "modellabs.owned_files.v1",
+                "files": {str(home / "outcome_model.py"): digest(learner),
+                          str(home / "benchmarks/smoke.json"): digest(old_manifest)}}))
+            with patch.object(installer, "SOURCE", source):
+                result = installer.install_learning_only(
+                    home, digest(learner), expected_benchmark_sha256=digest(old_manifest))
+            self.assertEqual((home / "benchmarks/smoke.json").read_bytes(), new_manifest)
+            self.assertEqual(Path(result["benchmark_backup"]).read_bytes(), old_manifest)
+            self.assertEqual(result["benchmark_sha256"], digest(new_manifest))
+            self.assertNotIn("new_revision", result)
+
+    def test_followup_feedback_is_short_direct_and_never_a_grade(self):
+        self.assertEqual(feedback("okay that is now working"), "verified")
+        self.assertEqual(feedback("this is still not working"), "retry")
+        self.assertEqual(feedback("tests passed"), "verified")
+        self.assertEqual(feedback("tests failed"), "retry")
+        self.assertIsNone(feedback("Please continue; the prior version still needs citation checks."))
+        self.assertIsNone(feedback("Review a file that says 'fixed' in its title."))
+        self.assertIsNone(feedback("This is a quoted failure report.\nPlease analyze it."))
+
     def test_grade_updates_local_learner_without_reversing_grade_on_failure(self):
         arguments = ["modellabs", "grade", "--thread-id", "thread", "--turn-id", "turn",
                      "--quality-score", "95", "--verification", "passed"]
@@ -82,6 +339,27 @@ class RoutingTests(unittest.TestCase):
                                 "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN"])
         self.assertEqual(environment["MODEL_SELECTOR_HOST_TOKEN"], "token")
 
+    def test_managed_resume_imports_a_closed_standalone_thread_before_launch(self):
+        from tempfile import TemporaryDirectory
+        thread_id = "00000000-0000-4000-8000-000000000009"
+        with TemporaryDirectory() as directory, \
+             patch.object(sys, "argv", ["codex", "resume", thread_id]), \
+             patch.object(model_host_launcher, "authority_path_for",
+                          return_value=Path(directory) / "missing-authority.json"), \
+             patch.object(model_host_launcher, "import_closed_thread") as handoff, \
+             patch.object(model_host_launcher, "_read_token", return_value="token"), \
+             patch.object(model_host_launcher, "ensure_proxy"), \
+             patch.object(model_host_launcher, "ensure_proxy_supervisor"), \
+             patch.object(model_host_launcher, "real_codex_binary",
+                          return_value=Path("/real/codex")), \
+             patch.object(model_host_launcher.os, "execve") as launch:
+            model_host_launcher.main()
+        handoff.assert_called_once_with(thread_id)
+        self.assertEqual(launch.call_args.args[1][-2:], ["resume", thread_id])
+
+    def test_installer_ships_legacy_thread_handoff(self):
+        self.assertIn("legacy_thread_handoff.py", installer.PYTHON_FILES)
+
     def test_selects_the_lowest_sufficient_effort(self):
         cases = [
             ("Format these three values as CSV.", "gpt-6-luna", "low"),
@@ -129,6 +407,43 @@ class RoutingTests(unittest.TestCase):
             result = adapt(choice, thread_id="thread", records=records, now_ms=2_000_000_000_000)
         self.assertEqual(result["model"], choice["model"])
         self.assertEqual(result["adaptive_reason"], "shadow_retry_escalation")
+
+    def test_managed_policy_is_digest_bound_and_pilot_is_ten_percent(self):
+        from tempfile import TemporaryDirectory
+        choice = route("Build a complete tested command line parser from the supplied fixture.")
+        evidence = {"comparison_id": "a" * 64, "task_class": choice["class"],
+                    "baseline_arm": [choice["model"], choice["effort"]],
+                    "recommended_arm": ["gpt-6-luna", "low"],
+                    "prospective_products": 8, "prospective_wins": 8,
+                    "prospective_losses": 0, "checkpoint_sha256": "b" * 64}
+        value = {**evidence, "evidence_sha256": hashlib.sha256(json.dumps(
+            evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                 "validated_at_ms": 1}
+        artifact = {"schema": "modellabs.managed_routing_policy.v2",
+                    "checkpoints": {}, "validations": {"a" * 64: value}}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            path.write_text(json.dumps(artifact), encoding="utf-8")
+            recommendation = adaptive_policy.managed_policy_recommendation(choice, path)
+            self.assertEqual(recommendation[0], {"model": "gpt-6-luna", "effort": "low"})
+            path.write_text(json.dumps({**artifact, "validations": {"a" * 64: {
+                **value, "prospective_losses": 1}}}), encoding="utf-8")
+            self.assertIsNone(adaptive_policy.managed_policy_recommendation(choice, path))
+        managed = ({"model": "gpt-6-luna", "effort": "low"},
+                   {"source": "managed_randomized_policy", "provisional": False})
+        selected = {**choice, "prompt_sha256": "0" * 64}
+        with patch("adaptive_policy.managed_policy_recommendation", return_value=managed), \
+                patch.dict("os.environ", {"MODELLABS_ADAPTIVE_MODE": "pilot"}):
+            result = adapt(selected, records=[])
+        self.assertEqual((result["model"], result["effort"], result["adaptive_reason"]),
+                         ("gpt-6-luna", "low", "managed_policy_pilot"))
+        held_out = {**choice, "prompt_sha256": "f" * 64}
+        with patch("adaptive_policy.managed_policy_recommendation", return_value=managed), \
+                patch.dict("os.environ", {"MODELLABS_ADAPTIVE_MODE": "pilot"}):
+            result = adapt(held_out, records=[])
+        self.assertEqual((result["model"], result["effort"]),
+                         (choice["model"], choice["effort"]))
+        self.assertEqual(result["adaptive_reason"], "shadow_managed_policy_pilot_holdout")
 
     def test_explicit_outcome_only(self):
         records = []

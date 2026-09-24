@@ -26,9 +26,9 @@ RUNTIME_SOURCE = Path(__file__).resolve().parent
 def proxy_revision() -> str:
     """Identify the exact proxy/accounting implementation loaded at runtime."""
     digest = hashlib.sha256()
-    for name in ("adaptive_policy.py", "authority.py", "host_control.py", "modellabs.py",
-                 "paths.py", "protocol_policy.py", "receipt_journal.py", "telemetry.py",
-                 "thread_owner.py", "turn_proxy.py"):
+    for name in ("adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
+                 "modellabs.py", "outcome_model.py", "paths.py", "protocol_policy.py",
+                 "receipt_journal.py", "telemetry.py", "thread_owner.py", "turn_proxy.py"):
         digest.update(name.encode())
         digest.update((RUNTIME_SOURCE / name).read_bytes())
     return digest.hexdigest()[:16]

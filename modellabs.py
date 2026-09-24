@@ -192,7 +192,7 @@ def main() -> None:
     parser.add_argument("--outcome", choices=["verified", "retry"])
     parser.add_argument("--quality-score", type=int)
     parser.add_argument("--verification", choices=["passed", "failed"])
-    parser.add_argument("--mode", choices=["shadow", "enforce"])
+    parser.add_argument("--mode", choices=["shadow", "pilot", "enforce"])
     args = parser.parse_intermixed_args()
     if args.action == "adaptive-mode":
         if not args.mode:

@@ -32,7 +32,13 @@ def port_has_established_connection(port: int) -> bool:
 
 
 def retire_drained_proxy_generations() -> None:
-    """Stop only obsolete proxies with no established client connection."""
+    """Retire old generations only after an explicit operator opt-in.
+
+    A disconnected TUI may later reconnect to its original proxy URL. Socket
+    quiescence alone cannot prove that the old generation is disposable.
+    """
+    if os.environ.get("MODELLABS_RETIRE_DRAINED_PROXY_GENERATIONS") != "1":
+        return
     expected_script = str(ROOT / "turn_proxy.py").encode()
     for proc in Path("/proc").iterdir():
         if not proc.name.isdecimal() or int(proc.name) == os.getpid():
