@@ -488,9 +488,8 @@ async def _managed_turn(workspace: Path, prompt: str, model: str, effort: str,
             "capabilities": {"experimentalApi": True}}}))
         await receive_until(websocket, 1)
         await websocket.send(json.dumps({"method": "initialized"}))
-        await websocket.send(json.dumps({"id": 2, "method": "thread/start", "params": {
-            "cwd": str(workspace), "ephemeral": True, "sandbox": "workspace-write",
-            "approvalPolicy": "never"}}))
+        await websocket.send(json.dumps({"id": 2, "method": "thread/start",
+                                         "params": managed_thread_start_params(workspace)}))
         started, _answer, _turn = await receive_until(websocket, 2)
         thread_id = (started.get("thread") or {}).get("id")
         if not isinstance(thread_id, str):
@@ -503,6 +502,19 @@ async def _managed_turn(workspace: Path, prompt: str, model: str, effort: str,
     if not isinstance(turn_id, str) or not isinstance(answer, str):
         raise RuntimeError("managed benchmark turn has no exact result identity")
     return thread_id, turn_id, status, answer
+
+
+def managed_thread_config() -> dict[str, Any]:
+    """Disable unrelated MCP servers for isolated benchmark product turns."""
+    from modellabs import config_for
+
+    return config_for([])
+
+
+def managed_thread_start_params(workspace: Path) -> dict[str, Any]:
+    """Build the exact isolated thread/start payload used by managed benchmarks."""
+    return {"cwd": str(workspace), "ephemeral": True, "sandbox": "workspace-write",
+            "approvalPolicy": "never", "config": managed_thread_config()}
 
 
 def run_managed_one(scenario: dict[str, Any], model: str, effort: str,

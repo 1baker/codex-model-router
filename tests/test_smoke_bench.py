@@ -11,13 +11,26 @@ from contextlib import redirect_stdout
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adaptive_policy import adapt
-from modellabs import route
+from modellabs import SERVERS, route
 from smoke_bench import (browser_prompt_variant, explicit_inline_revision, grade, load_manifest, materialize, run_one,
                          parse_codex_jsonl, product_definition, ranked, stable_digest)
 import smoke_bench
 
 
 class SmokeBenchTests(unittest.TestCase):
+    def test_managed_benchmark_thread_disables_unneeded_mcp_servers(self):
+        params = smoke_bench.managed_thread_start_params(Path("/tmp/managed-benchmark"))
+        self.assertEqual(params["cwd"], "/tmp/managed-benchmark")
+        self.assertEqual({key: params[key] for key in (
+            "ephemeral", "sandbox", "approvalPolicy")}, {
+                "ephemeral": True, "sandbox": "workspace-write",
+                "approvalPolicy": "never"})
+        config = params["config"]
+        self.assertEqual(set(config), {"mcp_servers"})
+        self.assertEqual(set(config["mcp_servers"]), SERVERS)
+        self.assertTrue(all(value == {"enabled": False}
+                            for value in config["mcp_servers"].values()))
+
     def test_daily_managed_cohorts_and_registered_experiments_are_frozen(self):
         manifest = load_manifest(Path(__file__).resolve().parents[1] / "benchmarks/smoke.json")
         cohorts = {"routine_luna_vs_sol_development": [],

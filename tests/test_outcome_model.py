@@ -921,6 +921,36 @@ class OutcomeModelTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unavailable"):
                     outcome_model.managed_turn_evidence(thread_id, turn_id, metrics)
 
+    def test_managed_attempt_budget_excludes_class_unproven_and_mismatched_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.private_store(Path(directory)):
+                scenario = {"id": "attempt-product", "prompt": "Build the verified product.",
+                            "prompt_author": "benchmark", "comparison_id": "attempt-pair",
+                            "task_class": "routine", "files": {"verify.py": "pass\n"},
+                            "protected_files": ["verify.py"],
+                            "verify": ["python3", "verify.py"], "expected_final": "ready"}
+                arms = [("gpt-6-luna", "low"), ("gpt-6-sol", "medium")]
+                suite_id = "11111111-1111-1111-1111-111111111111"
+                block_ids = [
+                    "22222222-2222-2222-2222-222222222222",
+                    "33333333-3333-3333-3333-333333333333",
+                    "44444444-4444-4444-4444-444444444444",
+                ]
+                for repetition, block_id in enumerate(block_ids):
+                    outcome_model.create_managed_benchmark_block(
+                        suite_id, block_id, scenario, arms, repetition)
+                key = outcome_model._key()
+                with outcome_model._connect() as connection:
+                    connection.execute("""UPDATE managed_benchmark_blocks
+                        SET scenario_task_class=NULL WHERE block_key=?""",
+                                       (outcome_model._digest(key, block_ids[1]),))
+                    connection.execute("""UPDATE managed_benchmark_blocks
+                        SET scenario_task_class='difficult' WHERE block_key=?""",
+                                       (outcome_model._digest(key, block_ids[2]),))
+                self.assertEqual(
+                    outcome_model.managed_scenario_attempts([scenario], arms),
+                    {"attempt-product": 1})
+
     def test_browser_benchmark_capture_requires_bound_review(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.private_store(Path(directory)):
@@ -1148,6 +1178,46 @@ class OutcomeModelTests(unittest.TestCase):
                     connection.execute("UPDATE benchmark_prompt_runs SET model_provenance='observed_per_request'")
                 label_only = outcome_model.analyze_browser_revision_product_outcomes()
                 self.assertEqual(label_only["execution_verified_groups"], 0)
+                managed_sets = []
+                for repeat in range(3):
+                    managed_sets.append({
+                        "prompt_set_key": f"prompt-set-{repeat}",
+                        "suite_key": outcome_model._digest(
+                            key, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                        "created_at_ms": 100 + repeat,
+                        "comparison_key": outcome_model._digest(key, "pair"),
+                        "product_key": outcome_model._digest(
+                            key, stable_digest(product_definition(base))),
+                        "task_class": "routine", "repetition_index": repeat,
+                        "prompts": [
+                            {"prompt_digest": outcome_model._digest(key, base["prompt"]),
+                             "prompt_features": {}, "prompt_author": "benchmark",
+                             "browser_guard_key": None, "browser_response_key": None,
+                             "arms": {("gpt-6-sol", "medium"): {
+                                 "product_pass": True, "quality_score": 100,
+                                 "total_tokens": 1000}}},
+                            {"prompt_digest": candidate_digest,
+                             "prompt_features": {}, "prompt_author": "chatgpt",
+                             "browser_guard_key": outcome_model._digest(key, "guard-parent"),
+                             "browser_response_key": parent_id,
+                             "arms": {("gpt-6-sol", "medium"): {
+                                 "product_pass": True, "quality_score": 100,
+                                 "total_tokens": 1200}}},
+                        ],
+                    })
+                with patch.object(outcome_model, "_managed_complete_prompt_sets",
+                                  return_value=(managed_sets, {})):
+                    managed = outcome_model.analyze_browser_revision_product_outcomes()
+                    self.assertEqual(managed["execution_verified_groups"], 1)
+                    self.assertEqual(managed["execution_verified_product_losses"], 1)
+                    forged_sets = [{**item, "prompts": [
+                        {**item["prompts"][0], "prompt_digest": "forged"},
+                        item["prompts"][1],
+                    ]} for item in managed_sets]
+                    with patch.object(outcome_model, "_managed_complete_prompt_sets",
+                                      return_value=(forged_sets, {})):
+                        forged = outcome_model.analyze_browser_revision_product_outcomes()
+                    self.assertEqual(forged["execution_verified_groups"], 0)
                 with outcome_model._connect() as connection:
                     connection.execute("""UPDATE benchmark_prompt_runs
                                        SET observed_model='gpt-6-sol', observed_effort='medium'""")
@@ -1728,7 +1798,7 @@ class OutcomeModelTests(unittest.TestCase):
                 self.assertEqual(outcome_model.train_bound_loop_model()["status"],
                                  "insufficient_bound_loop_rounds")
                 key = outcome_model._key()
-                def insert_roots(first: int, last: int) -> None:
+                def insert_roots(first: int, last: int, started_at: datetime) -> None:
                     with outcome_model._connect() as connection:
                         for root in range(first, last):
                             previous = None
@@ -1738,9 +1808,11 @@ class OutcomeModelTests(unittest.TestCase):
                                 codex = f"private Codex result {root} {number}"
                                 browser = f"private browser result {root} {number}"
                                 passed = int((root + number) % 2 == 0)
+                                submitted_at = (started_at + timedelta(
+                                    days=root - first, minutes=number)).isoformat()
                                 connection.execute("INSERT INTO bound_loop_rounds VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                     (episode, f"root-{root}", number,
-                                     f"2026-09-{(root + 1 if root < 12 else root + 13):02d}T0{number}:00:00Z",
+                                     submitted_at,
                                      outcome_model._digest(key, f"goal-{root}"),
                                      outcome_model._digest(key, prompt),
                                      json.dumps(outcome_model._features(f"goal-{root}", prompt, number, key)),
@@ -1750,7 +1822,8 @@ class OutcomeModelTests(unittest.TestCase):
                                      previous, 95 if passed else 65, passed,
                                      f"resp_{root}_{number}", "a" * 64, "gpt-5.2", 0, 1, 1, 0))
                                 previous = episode
-                insert_roots(0, 12)
+                now = datetime.now().astimezone()
+                insert_roots(0, 12, now - timedelta(days=20))
                 trained = outcome_model.train_bound_loop_model()
                 self.assertEqual(trained["rounds"], 36)
                 self.assertEqual(trained["input_stage"], "post_codex_pre_browser")
@@ -1758,7 +1831,7 @@ class OutcomeModelTests(unittest.TestCase):
                 self.assertEqual(trained["prospective_holdout_rounds"], 0)
                 checkpoint = outcome_model.BOUND_LOOP_EVAL_PATH.read_bytes()
                 score_checkpoint = outcome_model.BOUND_LOOP_SCORE_EVAL_PATH.read_bytes()
-                insert_roots(12, 14)
+                insert_roots(12, 14, now + timedelta(days=2))
                 later = outcome_model.train_bound_loop_model()
                 self.assertEqual(later["prospective_holdout_rounds"], 6)
                 self.assertEqual(later["prospective_score_holdout_rounds"], 6)

@@ -1502,7 +1502,9 @@ def managed_scenario_attempts(scenarios: list[dict[str, Any]],
         raise ValueError("managed scenario attempts require distinct arms")
     with _connect() as connection:
         rows = connection.execute("""SELECT product_key,arm_order
-            FROM managed_benchmark_blocks""").fetchall()
+            FROM managed_benchmark_blocks
+            WHERE scenario_task_class IS NOT NULL
+              AND scenario_task_class=task_class""").fetchall()
     counts: Counter[str] = Counter()
     for product_key, arm_order in rows:
         try:
@@ -1667,7 +1669,8 @@ def analyze_browser_revision_product_outcomes() -> dict[str, Any]:
             base.total_tokens,candidate.total_tokens,
             base.model_provenance,candidate.model_provenance,
             base.observed_model,candidate.observed_model,
-            base.observed_effort,candidate.observed_effort
+            base.observed_effort,candidate.observed_effort,
+            base.prompt_digest,candidate.prompt_digest
             FROM benchmark_prompt_runs AS candidate
             JOIN episodes AS parent ON parent.episode_id=candidate.browser_response_key
             JOIN iteration_traces AS trace ON trace.parent_episode_id=parent.episode_id
@@ -1686,6 +1689,20 @@ def analyze_browser_revision_product_outcomes() -> dict[str, Any]:
                 AND candidate.source_kind='browser_review_local_sandbox_benchmark'
                 AND candidate.browser_response_key IS NOT NULL
                 AND candidate.repetition_index IS NOT NULL""").fetchall()
+    complete_prompt_sets, _managed_counts = _managed_complete_prompt_sets()
+    managed_execution_counts: Counter[tuple[Any, ...]] = Counter()
+    for prompt_set in complete_prompt_sets:
+        baseline = next(item for item in prompt_set["prompts"]
+                        if item["prompt_author"] == "benchmark")
+        for candidate in (item for item in prompt_set["prompts"]
+                          if item["prompt_author"] == "chatgpt"):
+            for model, effort in set(baseline["arms"]) & set(candidate["arms"]):
+                managed_execution_counts[(
+                    candidate["browser_response_key"], prompt_set["product_key"],
+                    model, effort, prompt_set["suite_key"],
+                    prompt_set["repetition_index"], baseline["prompt_digest"],
+                    candidate["prompt_digest"],
+                )] += 1
     blocks: dict[tuple[Any, ...], list[tuple[Any, ...]]] = {}
     for row in rows:
         blocks.setdefault((row[0], *row[2:7]), []).append(row)
@@ -1722,9 +1739,12 @@ def analyze_browser_revision_product_outcomes() -> dict[str, Any]:
             counts["candidate_more_tokens_every_block_groups"] += 1
             if next(iter(child_scores)) > next(iter(parent_scores)):
                 counts["review_improved_without_token_gain_groups"] += 1
-        if all(row[17] == row[18] == "observed_per_request"
-               and row[19] == row[20] == row[3]
-               and row[21] == row[22] == row[4] for row in matched):
+        if all((row[17] == row[18] == "observed_per_request"
+                and row[19] == row[20] == row[3]
+                and row[21] == row[22] == row[4])
+               or managed_execution_counts[(row[0], row[2], row[3], row[4],
+                                             row[5], row[6], row[23], row[24])] == 1
+               for row in matched):
             counts["execution_verified_groups"] += 1
             product = matched[0][2]
             verified_products.add(product)
