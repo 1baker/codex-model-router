@@ -1518,6 +1518,85 @@ def managed_scenario_attempts(scenarios: list[dict[str, Any]],
         key, stable_digest(product_definition(scenario)))] for scenario in scenarios}
 
 
+def managed_collection_progress(
+        manifest: dict[str, Any] | None = None,
+        policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Report the frozen daily plan's exact repeat-floor progress without changing it."""
+    if manifest is None:
+        from smoke_bench import load_manifest
+        manifest = load_manifest(ROOT / "benchmarks/smoke.json")
+    experiments = manifest.get("managed_experiments") or []
+    scenarios = manifest.get("scenarios") or []
+    by_id = {scenario["id"]: scenario for scenario in scenarios}
+    if policy is None:
+        policy = train_managed_routing_policy(create_checkpoint=False)
+
+    reports: list[dict[str, Any]] = []
+    next_selection: dict[str, Any] | None = None
+    for experiment in experiments:
+        if not experiment["enabled"]:
+            reports.append({"experiment_id": experiment["id"], "status": "disabled"})
+            continue
+        arms = [tuple(arm) for arm in experiment["arms"]]
+        comparison = next((row for row in policy.get("comparisons", ())
+                           if {tuple(row["left_arm"]), tuple(row["right_arm"])} == set(arms)
+                           and row["task_class"] == experiment["task_class"]), None)
+        phase = ("prospective" if comparison
+                 and comparison.get("development_checkpoint_created") else "development")
+        products = [by_id[identifier] for identifier in experiment[f"{phase}_scenario_ids"]]
+        progress = managed_scenario_progress(products, arms)
+        attempts = managed_scenario_attempts(products, arms)
+        failures = {scenario["id"]: max(
+            0, attempts.get(scenario["id"], 0) - progress.get(scenario["id"], 0))
+                    for scenario in products}
+        pending = [scenario for scenario in products
+                   if progress.get(scenario["id"], 0) < MIN_MANAGED_REPEATS_PER_PRODUCT
+                   and failures[scenario["id"]] < MAX_MANAGED_FAILURES_PER_PRODUCT]
+        quarantined = [scenario for scenario in products
+                       if progress.get(scenario["id"], 0) < MIN_MANAGED_REPEATS_PER_PRODUCT
+                       and failures[scenario["id"]] >= MAX_MANAGED_FAILURES_PER_PRODUCT]
+        next_product = min(pending, key=lambda scenario: (
+            progress.get(scenario["id"], 0), failures[scenario["id"]], scenario["id"])
+                           ) if pending else None
+        complete_toward_floor = sum(min(progress.get(scenario["id"], 0),
+                                        MIN_MANAGED_REPEATS_PER_PRODUCT)
+                                    for scenario in products)
+        minimum_blocks = len(products) * MIN_MANAGED_REPEATS_PER_PRODUCT
+        status_name = ("complete" if complete_toward_floor == minimum_blocks else
+                       "collecting" if pending else "failure_budget_exhausted")
+        report = {
+            "experiment_id": experiment["id"],
+            "task_class": experiment["task_class"],
+            "phase": phase,
+            "status": status_name,
+            "scenario_products": len(products),
+            "products_with_complete_block": sum(
+                progress.get(scenario["id"], 0) > 0 for scenario in products),
+            "products_at_repeat_floor": sum(
+                progress.get(scenario["id"], 0) >= MIN_MANAGED_REPEATS_PER_PRODUCT
+                for scenario in products),
+            "required_repeats_per_product": MIN_MANAGED_REPEATS_PER_PRODUCT,
+            "complete_blocks_toward_floor": complete_toward_floor,
+            "minimum_complete_blocks": minimum_blocks,
+            "minimum_complete_blocks_remaining": minimum_blocks - complete_toward_floor,
+            "failed_or_incomplete_attempts": sum(failures.values()),
+            "quarantined_products": len(quarantined),
+            "next_scenario_id": next_product["id"] if next_product else None,
+        }
+        reports.append(report)
+        if next_selection is None and next_product is not None:
+            next_selection = {"experiment_id": experiment["id"],
+                              "phase": phase,
+                              "scenario_id": next_product["id"],
+                              "minimum_complete_blocks_remaining":
+                                  report["minimum_complete_blocks_remaining"]}
+    return {"schema": "modellabs.managed-collection-progress.v1",
+            "experiments": reports,
+            "next_selection": next_selection,
+            "all_registered_experiments_complete_or_quarantined": next_selection is None}
+
+
 def managed_prompt_experiment_counts(base: dict[str, Any], candidate: dict[str, Any],
                                      arms: list[tuple[str, str]]) -> dict[str, int]:
     """Count exact precommitted and complete runs for one reviewed prompt pair."""
@@ -4625,6 +4704,8 @@ def status() -> dict[str, Any]:
         "independent_products": len({row["product_key"] for row in valid_managed}),
         "training_role": "causal_candidate_not_yet_trained"}
     summary["managed_routing_policy"] = train_managed_routing_policy(create_checkpoint=False)
+    summary["managed_collection_progress"] = managed_collection_progress(
+        policy=summary["managed_routing_policy"])
     summary["managed_prompt_policy"] = train_managed_prompt_policy(create_checkpoint=False)
     summary["browser_revision_product_outcomes"] = analyze_browser_revision_product_outcomes()
     summary["bound_legacy_loop"] = {

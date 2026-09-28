@@ -235,6 +235,13 @@ task experiment comparing the routed `gpt-6-sol`/`high` baseline against
 disjoint development and prospective sets; routine evidence cannot satisfy its
 checkpoint.
 
+`modellabs-learn status` reports this scheduler state as
+`managed_collection_progress`. For each registered comparison it shows how many
+products have any complete block, how many reached the three-repeat floor, the
+minimum successful blocks still needed for the current phase, quarantined
+products, and the next frozen scenario. These are progress diagnostics only;
+they do not relax checkpoint, prospective, or live-pilot requirements.
+
 Reviewed browser-prompt collection uses a separate private registry at
 `~/.local/share/model-selector/prompt-experiments.json`. Each enabled entry
 binds one frozen scenario to one exact Pro-guard ID and one owner-only prompt

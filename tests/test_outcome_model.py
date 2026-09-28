@@ -387,6 +387,35 @@ class OutcomeModelTests(unittest.TestCase):
         reports, _private = outcome_model._managed_pair_evidence(blocks[:2])
         self.assertEqual(reports[0]["eligible_repeated_products"], 0)
 
+    def test_managed_collection_progress_explains_balanced_repeat_floor(self):
+        arms = [["gpt-6-astra", "medium"], ["gpt-6-sol", "high"]]
+        scenarios = [{"id": "product-a"}, {"id": "product-b"}]
+        manifest = {"scenarios": scenarios, "managed_experiments": [{
+            "id": "difficult-comparison", "task_class": "difficult",
+            "arms": arms, "development_scenario_ids": ["product-a", "product-b"],
+            "prospective_scenario_ids": ["product-a", "product-b"], "enabled": True}]}
+        policy = {"comparisons": [{"left_arm": arms[0], "right_arm": arms[1],
+                                    "task_class": "difficult",
+                                    "development_checkpoint_created": False}]}
+        with patch.object(outcome_model, "managed_scenario_progress",
+                          return_value={"product-a": 1, "product-b": 0}), \
+                patch.object(outcome_model, "managed_scenario_attempts",
+                             return_value={"product-a": 1, "product-b": 1}):
+            report = outcome_model.managed_collection_progress(manifest, policy)
+        experiment = report["experiments"][0]
+        self.assertEqual(experiment, {
+            "experiment_id": "difficult-comparison", "task_class": "difficult",
+            "phase": "development", "status": "collecting", "scenario_products": 2,
+            "products_with_complete_block": 1, "products_at_repeat_floor": 0,
+            "required_repeats_per_product": 3, "complete_blocks_toward_floor": 1,
+            "minimum_complete_blocks": 6, "minimum_complete_blocks_remaining": 5,
+            "failed_or_incomplete_attempts": 1, "quarantined_products": 0,
+            "next_scenario_id": "product-b"})
+        self.assertEqual(report["next_selection"], {
+            "experiment_id": "difficult-comparison", "phase": "development",
+            "scenario_id": "product-b", "minimum_complete_blocks_remaining": 5})
+        self.assertFalse(report["all_registered_experiments_complete_or_quarantined"])
+
     def test_managed_pair_evidence_never_pools_prompt_revisions(self):
         left = ("gpt-6-luna", "low")
         right = ("gpt-6-sol", "medium")
