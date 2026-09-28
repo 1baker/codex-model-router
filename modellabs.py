@@ -18,6 +18,7 @@ from pathlib import Path
 
 import websockets
 
+from authority import acquire_lock as acquire_authority_lock, clear_pins_locked
 from host_control import HOST_URL, _read_token, _rpc
 from model_host_launcher import PROXY_URL, ensure_host, ensure_proxy
 from paths import ROOT, real_codex_binary
@@ -181,7 +182,8 @@ def read_prompt(args: argparse.Namespace) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Route a new Codex chat before its first model call")
-    parser.add_argument("action", choices=["route", "start", "run", "outcome", "grade", "adaptive-mode"])
+    parser.add_argument("action", choices=["route", "start", "run", "outcome", "grade",
+                                           "adaptive-mode", "unpin"])
     parser.add_argument("prompt", nargs="*")
     parser.add_argument("--prompt-file")
     parser.add_argument("--model")
@@ -193,7 +195,23 @@ def main() -> None:
     parser.add_argument("--quality-score", type=int)
     parser.add_argument("--verification", choices=["passed", "failed"])
     parser.add_argument("--mode", choices=["shadow", "pilot", "enforce"])
+    parser.add_argument("--field", choices=["all", "model", "effort"], default="all")
     args = parser.parse_intermixed_args()
+    if args.action == "unpin":
+        if not args.thread_id:
+            parser.error("unpin requires --thread-id")
+        descriptor = acquire_authority_lock(args.thread_id)
+        try:
+            authority = clear_pins_locked(
+                args.thread_id,
+                clear_model=args.field in {"all", "model"},
+                clear_effort=args.field in {"all", "effort"},
+            )
+        finally:
+            os.close(descriptor)
+        print(json.dumps({"status": "unpinned", "field": args.field, **authority},
+                         sort_keys=True))
+        return
     if args.action == "adaptive-mode":
         if not args.mode:
             parser.error("adaptive-mode requires --mode")

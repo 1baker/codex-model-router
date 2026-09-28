@@ -336,6 +336,7 @@ class ConsequentialGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(classify("thread/name/set"), "owner_mutation")
         self.assertEqual(classify("thread/unarchive"), "owner_mutation")
         self.assertEqual(classify("thread/shellCommand"), "owner_mutation")
+        self.assertEqual(classify("thread/rollback"), "unknown")
         self.assertEqual(classify("review/start"), "rejected_inference")
         self.assertEqual(classify("future/dangerousMutation"), "unknown")
 

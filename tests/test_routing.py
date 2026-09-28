@@ -775,6 +775,30 @@ class RoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "symlinked"):
                 installer.preflight_install_payloads(payloads, home, upstream, codex_home)
 
+    def test_manifest_adopts_only_an_exact_unmanifested_service(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, codex_home, bin_dir = root / "home", root / "codex", root / "bin"
+            home.mkdir()
+            upstream = root / "real-codex"
+            upstream.write_text("#!/bin/sh\n", encoding="utf-8")
+            upstream.chmod(0o755)
+            service = root / "config/systemd/user/modellabs-proxy.service"
+            service.parent.mkdir(parents=True)
+            expected = b"[Unit]\nDescription=ModelLabs exact test service\n"
+            service.write_bytes(expected)
+            payloads = {service: expected}
+            manifest = {"schema": "modellabs.owned_files.v1", "files": {}}
+            (home / installer.OWNED_MANIFEST).write_text(
+                json.dumps(manifest), encoding="utf-8")
+            installer.preflight_install_payloads(
+                payloads, home, upstream, codex_home, bin_dir)
+            service.write_bytes(expected + b"# changed\n")
+            with self.assertRaisesRegex(RuntimeError, "missing existing payload"):
+                installer.preflight_install_payloads(
+                    payloads, home, upstream, codex_home, bin_dir)
+
     def test_manifest_digest_and_parent_symlink_fail_closed(self):
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as directory:

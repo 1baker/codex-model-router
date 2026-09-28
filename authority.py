@@ -129,3 +129,26 @@ def update_locked(thread_id: str, model: str | None, effort: str | None, *,
     }, thread_id)
     _atomic_write(path_for(thread_id), payload)
     return payload
+
+
+def clear_pins_locked(thread_id: str, *, clear_model: bool = True,
+                      clear_effort: bool = True) -> dict[str, Any]:
+    """Release selected explicit choices so later turns may be routed again.
+
+    The caller must hold this thread's authority lock.  Clearing a pin also
+    clears its stored value so a later reader cannot mistake stale metadata for
+    an active user choice.
+    """
+    if not clear_model and not clear_effort:
+        raise AuthorityError("At least one authority pin must be selected for clearing.")
+    current = read_locked(thread_id)
+    payload = _validate({
+        "schema": SCHEMA,
+        "thread_id": thread_id,
+        "model": None if clear_model else current["model"],
+        "effort": None if clear_effort else current["effort"],
+        "explicit_model": False if clear_model else current["explicit_model"],
+        "explicit_effort": False if clear_effort else current["explicit_effort"],
+    }, thread_id)
+    _atomic_write(path_for(thread_id), payload)
+    return payload

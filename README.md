@@ -671,6 +671,19 @@ In plain English: This reconnects the same saved conversation through the
 managed host. It refuses if the original standalone Codex process is still
 open, preventing two processes from writing to the same chat.
 
+An explicit model or reasoning-effort choice remains authoritative until the
+user asks to return the thread to adaptive routing. Release both choices with:
+
+```bash
+modellabs unpin --thread-id THREAD_ID
+```
+
+In plain English: This clears the saved model and reasoning-effort choices for
+that exact managed conversation. It changes future routing only; restart that
+conversation through the managed host to discard any connection-local choice,
+and never run a second owner beside the existing TUI. Use `--field model` or
+`--field effort` when the user wants to keep the other explicit choice.
+
 Noninteractive inference through `codex exec` currently fails closed. Use the
 interactive TUI until ModelLabs can bind that branch to admission, terminal,
 cancellation, and exact-or-unavailable usage receipts. Help and version queries

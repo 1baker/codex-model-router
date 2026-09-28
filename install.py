@@ -27,7 +27,7 @@ PYTHON_FILES = [
 SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
 SHELL_PATH_END = "# <<< ModelLabs managed Codex route <<<"
 OWNED_MANIFEST = "owned-files.json"
-PINNED_CODEX_VERSION = "codex-cli 0.156.1"
+PINNED_CODEX_VERSION = "codex-cli 0.158.0"
 AUTHORITY_SCHEMA = "modellabs.thread_authority.v1"
 PROXY_GENERATION_FILES = (
     "adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
@@ -164,6 +164,14 @@ def _legacy_owned(path: Path, source_content: bytes) -> bool:
     return marker is not None and marker in content
 
 
+def _exact_unmanifested_service(path: Path, source_content: bytes) -> bool:
+    """Adopt only the unchanged service left by an earlier no-service manifest."""
+    return (path.name == "modellabs-proxy.service"
+            and path.parent.name == "user"
+            and path.parent.parent.name == "systemd"
+            and path.read_bytes() == source_content)
+
+
 def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream: Path,
                                codex_home: Path | None = None, bin_dir: Path | None = None) -> None:
     manifest_path = home / OWNED_MANIFEST
@@ -236,6 +244,8 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
                 raise RuntimeError(f"Refusing unrelated modified owned content: {owned}.")
         for path in payloads:
             if path.exists() and str(path) not in manifest:
+                if _exact_unmanifested_service(path, payloads[path]):
+                    continue
                 raise RuntimeError(f"Owned manifest is missing existing payload {path}.")
     for path in authority_files:
         try:
@@ -271,6 +281,9 @@ def preflight_install_payloads(payloads: dict[Path, bytes], home: Path, upstream
         if manifest.get(str(path)) == actual:
             continue
         if str(path) in manifest and actual == _digest_bytes(source_content):
+            continue
+        if (str(path) not in manifest
+                and _exact_unmanifested_service(path, source_content)):
             continue
         if not has_manifest and legacy_install and _legacy_owned(path, source_content):
             continue
