@@ -239,11 +239,68 @@ class SmokeBenchTests(unittest.TestCase):
         with patch.object(smoke_bench, "browser_prompt_variant", side_effect=variant), \
                 patch("outcome_model.managed_prompt_experiment_counts", side_effect=counts), \
                 patch("outcome_model.train_managed_prompt_policy",
-                      return_value={"comparisons": []}):
-            selected, arms, phase = smoke_bench.daily_prompt_selection(scenarios, registry)
+                      return_value={"comparisons": [], "independent_products": 1,
+                                    "minimum_development_products": 8}):
+            selected, arms, phase, collection = smoke_bench.daily_prompt_selection(
+                scenarios, registry)
         self.assertEqual([item["id"] for item in selected], ["dev-b", "dev-b-candidate"])
         self.assertEqual(set(arms), {("gpt-6-luna", "low"), ("gpt-6-sol", "medium")})
         self.assertEqual(phase, "prompt_development:b")
+        self.assertEqual(collection, {
+            "schema": "modellabs.managed-prompt-collection-progress.v1",
+            "phase": "development",
+            "cohort": "routine_luna_vs_sol_development",
+            "registered_products": 2,
+            "ineligible_registered_products": 0,
+            "pending_products": 1,
+            "completed_products": 1,
+            "quarantined_products": 0,
+            "independent_products": 1,
+            "minimum_independent_products": 8,
+            "independent_product_deficit": 7,
+            "additional_reviewed_products_needed": 6,
+        })
+
+    def test_daily_prompt_selection_explains_exhausted_registry_deficit(self):
+        scenarios = [
+            {"id": "complete", "prompt": "Build a complete tested record converter.",
+             "task_class": "routine", "managed_cohort": "routine_luna_vs_sol_development"},
+            {"id": "quarantined", "prompt": "Build a complete tested data formatter.",
+             "task_class": "routine", "managed_cohort": "routine_luna_vs_sol_development"},
+        ]
+        registry = {"experiments": [
+            {"id": "complete", "scenario_id": "complete", "guard_id": "guard-a",
+             "prompt_file": "/private/a", "enabled": True},
+            {"id": "quarantined", "scenario_id": "quarantined", "guard_id": "guard-b",
+             "prompt_file": "/private/b", "enabled": True},
+        ]}
+
+        def variant(base, guard_id, _prompt_file):
+            return {**base, "id": f"{base['id']}-candidate",
+                    "prompt": base["prompt"] + " Exact output.", "prompt_author": "chatgpt",
+                    "variant_of": base["id"], "browser_origin_prompt": base["prompt"],
+                    "browser_review": {"guard_id": guard_id, "response_id": "resp_1"}}
+
+        def counts(base, _candidate, _arms):
+            return ({"attempts": 3, "complete": 3, "failed_or_incomplete": 0}
+                    if base["id"] == "complete" else
+                    {"attempts": 2, "complete": 0, "failed_or_incomplete": 2})
+
+        with patch.object(smoke_bench, "browser_prompt_variant", side_effect=variant), \
+                patch("outcome_model.managed_prompt_experiment_counts", side_effect=counts), \
+                patch("outcome_model.train_managed_prompt_policy", return_value={
+                    "comparisons": [], "independent_products": 1,
+                    "minimum_development_products": 8}):
+            selected, _arms, reason, collection = smoke_bench.daily_prompt_selection(
+                scenarios, registry)
+        self.assertIsNone(selected)
+        self.assertEqual(reason,
+                         "registered_development_prompt_experiments_complete_or_quarantined")
+        self.assertEqual(collection["completed_products"], 1)
+        self.assertEqual(collection["quarantined_products"], 1)
+        self.assertEqual(collection["pending_products"], 0)
+        self.assertEqual(collection["independent_product_deficit"], 7)
+        self.assertEqual(collection["additional_reviewed_products_needed"], 7)
 
     def test_explicit_inline_revision_is_not_inferred_from_ordinary_feedback(self):
         state = {"review_format": "inline", "status": "completed", "nonce": "n",

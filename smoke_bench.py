@@ -696,7 +696,7 @@ def daily_managed_selection(
 
 def daily_prompt_selection(
         scenarios: list[dict[str, Any]], registry: dict[str, Any],
-) -> tuple[list[dict[str, Any]] | None, list[tuple[str, str]], str]:
+) -> tuple[list[dict[str, Any]] | None, list[tuple[str, str]], str, dict[str, Any]]:
     """Choose one reviewed browser revision without crossing its checkpoint boundary."""
     from modellabs import route
     from outcome_model import (MAX_MANAGED_FAILURES_PER_PRODUCT,
@@ -714,13 +714,20 @@ def daily_prompt_selection(
     cohort = f"routine_luna_vs_sol_{phase}"
     by_id = {scenario["id"]: scenario for scenario in scenarios}
     candidates = []
+    matching = 0
+    ineligible = 0
+    completed = 0
+    quarantined = 0
     for experiment in registry["experiments"]:
         if not experiment["enabled"]:
             continue
         base = by_id.get(experiment["scenario_id"])
-        if (base is None or base.get("managed_cohort") != cohort
-                or base.get("task_class") != "routine"
+        if base is None or base.get("managed_cohort") != cohort:
+            continue
+        matching += 1
+        if (base.get("task_class") != "routine"
                 or route(str(base.get("prompt", ""))).get("class") != "routine"):
+            ineligible += 1
             continue
         candidate = browser_prompt_variant(base, experiment["guard_id"],
                                            Path(experiment["prompt_file"]))
@@ -729,13 +736,34 @@ def daily_prompt_selection(
                 and counts["failed_or_incomplete"] < MAX_MANAGED_FAILURES_PER_PRODUCT):
             candidates.append((counts["complete"], counts["failed_or_incomplete"],
                                experiment["id"], base, candidate))
+        elif counts["complete"] >= 3:
+            completed += 1
+        else:
+            quarantined += 1
+    minimum = int(policy.get("minimum_development_products", 8))
+    independent = int(policy.get("independent_products", 0))
+    collection = {
+        "schema": "modellabs.managed-prompt-collection-progress.v1",
+        "phase": phase,
+        "cohort": cohort,
+        "registered_products": matching,
+        "ineligible_registered_products": ineligible,
+        "pending_products": len(candidates),
+        "completed_products": completed,
+        "quarantined_products": quarantined,
+        "independent_products": independent,
+        "minimum_independent_products": minimum,
+        "independent_product_deficit": max(0, minimum - independent),
+        "additional_reviewed_products_needed": max(
+            0, minimum - independent - len(candidates)),
+    }
     if not candidates:
-        matching = [entry for entry in registry["experiments"] if entry["enabled"]
-                    and (by_id.get(entry["scenario_id"]) or {}).get("managed_cohort") == cohort]
-        return None, arms, (f"no_registered_{phase}_prompt_experiments" if not matching
-                            else f"registered_{phase}_prompt_experiments_complete_or_quarantined")
+        return (None, arms,
+                (f"no_registered_{phase}_prompt_experiments" if not matching
+                 else f"registered_{phase}_prompt_experiments_complete_or_quarantined"),
+                collection)
     _complete, _failures, identifier, base, candidate = min(candidates)
-    return [base, candidate], arms, f"prompt_{phase}:{identifier}"
+    return [base, candidate], arms, f"prompt_{phase}:{identifier}", collection
 
 
 def main() -> None:
@@ -803,12 +831,14 @@ def main() -> None:
             scenarios[0], args.browser_variant_guard_id, args.browser_variant_prompt_file)]
     override = [tuple(item.rsplit(":", 1)) for item in (args.pair or [])]
     daily_phase = None
+    daily_collection = None
     if args.daily_browser_prompts:
-        chosen_prompts, daily_arms, daily_phase = daily_prompt_selection(
+        chosen_prompts, daily_arms, daily_phase, daily_collection = daily_prompt_selection(
             scenarios, load_prompt_registry(args.prompt_registry))
         if chosen_prompts is None:
             print(json.dumps({"schema": "modellabs.managed-prompt-daily-skip.v1",
-                              "reason": daily_phase}, sort_keys=True))
+                              "reason": daily_phase,
+                              "collection": daily_collection}, sort_keys=True))
             return
         scenarios = chosen_prompts
         override = daily_arms
@@ -859,6 +889,7 @@ def main() -> None:
                         len(results), repetition, args.record_metrics))
         print(json.dumps({"schema": "modellabs.managed-smoke-report.v1",
                           "suite_id": suite_id, "daily_phase": daily_phase,
+                          "collection": daily_collection,
                           "results": ranked(results)}, sort_keys=True))
         return
     for repetition in range(args.repeat):

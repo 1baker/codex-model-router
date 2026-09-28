@@ -251,6 +251,11 @@ sets, and applies the same two-failure quarantine. It does not discover or
 adopt suggestions automatically: a revision must first be reviewed and
 materialized through the nonce-, origin-, response-, and attachment-bound
 guard path. Development products remain separated from prospective products.
+Every daily run now reports registered, pending, completed, quarantined, and
+ineligible products together with the independent-product deficit and the
+number of additional reviewed registrations still needed. A successful skip
+therefore distinguishes an exhausted registry from a validated prompt policy;
+it never presents "nothing eligible today" as forward readiness.
 Different prompt variants of one frozen product are robustness strata and
 count as one independent product for model-routing validation; conflicting
 strata produce a tie. A user timer may run this prompt canary before the model
