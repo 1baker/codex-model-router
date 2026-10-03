@@ -3,11 +3,13 @@ import json
 import hashlib
 import sys
 import io
+import ast
+import shutil
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -40,6 +42,29 @@ class RoutingTests(unittest.TestCase):
                 changed = {**payloads, name: payloads[name] + b"# changed\n"}
                 self.assertNotEqual(installer._proxy_revision(changed), baseline)
 
+    def test_proxy_generation_contains_transitive_local_imports(self):
+        root = Path(__file__).resolve().parents[1]
+        local_modules = {path.stem for path in root.glob("*.py")}
+        bundled = {Path(name).stem for name in installer.PROXY_GENERATION_FILES}
+        pending = ["turn_proxy"]
+        visited = set()
+        while pending:
+            module = pending.pop()
+            if module in visited:
+                continue
+            visited.add(module)
+            tree = ast.parse((root / f"{module}.py").read_text(encoding="utf-8"))
+            imported = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module.split(".")[0])
+            pending.extend(sorted((imported & local_modules) - visited))
+        self.assertEqual(visited, bundled)
+        self.assertEqual(set(turn_proxy_module.PROXY_GENERATION_FILES),
+                         set(installer.PROXY_GENERATION_FILES))
+
     def test_proxy_source_only_pins_old_and_new_generation_bundles(self):
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as directory:
@@ -59,7 +84,8 @@ class RoutingTests(unittest.TestCase):
                 manifest["files"][str(target)] = hashlib.sha256(content).hexdigest()
             manifest_path = home / installer.OWNED_MANIFEST
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with patch.object(installer, "SOURCE", source):
+            with patch.object(installer, "SOURCE", source), \
+                 patch.object(installer, "_validate_proxy_bundle_imports"):
                 result = installer.install_proxy_source_only(
                     home, hashlib.sha256(old_proxy).hexdigest())
             self.assertEqual((home / "turn_proxy.py").read_bytes(), new_proxy)
@@ -112,7 +138,8 @@ class RoutingTests(unittest.TestCase):
                 manifest["files"][str(target)] = hashlib.sha256(content).hexdigest()
             manifest_path = home / installer.OWNED_MANIFEST
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with patch.object(installer, "SOURCE", source):
+            with patch.object(installer, "SOURCE", source), \
+                 patch.object(installer, "_validate_proxy_bundle_imports"):
                 result = installer.install_proxy_source_only(
                     home, hashlib.sha256(proxy).hexdigest())
             self.assertEqual(result["changed_files"], ["adaptive_policy.py"])
@@ -124,6 +151,47 @@ class RoutingTests(unittest.TestCase):
             new_bundle = home / "proxy-generations" / str(result["new_revision"])
             self.assertEqual((new_bundle / "adaptive_policy.py").read_bytes(), new_policy)
             self.assertEqual((new_bundle / "turn_proxy.py").read_bytes(), proxy)
+
+    def test_proxy_import_preflight_rejects_missing_symbol(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            interpreter = home / "venv/bin/python"
+            interpreter.parent.mkdir(parents=True)
+            shutil.copy2(sys.executable, interpreter)
+            with self.assertRaisesRegex(RuntimeError, "cannot import name 'missing'"):
+                installer._validate_proxy_bundle_imports(home, {
+                    "turn_proxy.py": b"from modellabs import missing\n",
+                    "modellabs.py": b"VALUE = 1\n",
+                })
+
+    def test_proxy_import_preflight_rejects_before_publication(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, home = root / "source", root / "installed"
+            source.mkdir()
+            home.mkdir()
+            manifest = {"schema": "modellabs.owned_files.v1", "files": {}}
+            for name in installer.PROXY_GENERATION_FILES:
+                content = f"VALUE = {name!r}\n".encode()
+                (home / name).write_bytes(content)
+                (source / name).write_bytes(
+                    b"from modellabs import missing\n" if name == "turn_proxy.py" else content)
+                manifest["files"][str(home / name)] = hashlib.sha256(content).hexdigest()
+            manifest_path = home / installer.OWNED_MANIFEST
+            original_manifest = json.dumps(manifest).encode()
+            manifest_path.write_bytes(original_manifest)
+            original_proxy = (home / "turn_proxy.py").read_bytes()
+            with patch.object(installer, "SOURCE", source), \
+                 patch.object(installer, "_validate_proxy_bundle_imports",
+                              side_effect=RuntimeError("import failed")):
+                with self.assertRaisesRegex(RuntimeError, "import failed"):
+                    installer.install_proxy_source_only(
+                        home, hashlib.sha256(original_proxy).hexdigest())
+            self.assertEqual((home / "turn_proxy.py").read_bytes(), original_proxy)
+            self.assertEqual(manifest_path.read_bytes(), original_manifest)
+            self.assertFalse((home / "proxy-generations").exists())
 
     def test_supervisor_source_only_requires_exact_owned_baseline(self):
         from tempfile import TemporaryDirectory
@@ -221,9 +289,10 @@ class RoutingTests(unittest.TestCase):
                                    ("smoke_bench.py", old_smoke, new_smoke)):
                 (home / name).write_bytes(old)
                 (source / name).write_bytes(new)
-            generation_contents = {"outcome_model.py": old_learner}
+            generation_contents = {"outcome_model.py": old_learner,
+                                   "smoke_bench.py": old_smoke}
             for name in installer.PROXY_GENERATION_FILES:
-                if name == "outcome_model.py":
+                if name in {"outcome_model.py", "smoke_bench.py"}:
                     continue
                 content = (b"untouched\n" if name == "turn_proxy.py"
                            else f"VALUE = {name!r}\n".encode())
@@ -374,6 +443,68 @@ class RoutingTests(unittest.TestCase):
                 choice = route(prompt)
                 self.assertEqual((choice["model"], choice["effort"]), (model, effort))
                 self.assertEqual(choice["intelligence_slider"], effort)
+
+    def test_short_conversational_requests_use_luna_low(self):
+        for prompt in [
+            "Okay, so now how does this work?",
+            "How could we improve this then?",
+            "Routing should happen automatically.",
+            "Can you clarify that?",
+        ]:
+            with self.subTest(prompt=prompt):
+                choice = route(prompt)
+                self.assertEqual((choice["class"], choice["model"], choice["effort"]),
+                                 ("simple", "gpt-6-luna", "low"))
+
+    def test_go_ahead_variants_keep_consequential_context(self):
+        context = "Migrate the production database."
+        for prompt in ("proceed", "ship it", "yes please", "ok, go ahead", "do that"):
+            with self.subTest(prompt=prompt):
+                choice = route(prompt, context_prompt=context)
+                self.assertEqual((choice["class"], choice["model"], choice["effort"]),
+                                 ("consequential", "gpt-6-astra", "xhigh"))
+                self.assertTrue(choice["context_inherited"])
+
+    def test_direct_continuation_keeps_prior_effort_even_at_same_class(self):
+        choice = route("ok go", context_prompt="Do an exhaustive independent review of the README.")
+        self.assertEqual((choice["class"], choice["effort"]), ("routine", "ultra"))
+        self.assertTrue(choice["context_inherited"])
+        explicit = route("ok go with reasoning effort low",
+                         context_prompt="Do an exhaustive independent review of the README.")
+        self.assertEqual(explicit["effort"], "low")
+
+    def test_contextual_followups_preserve_prior_task_risk(self):
+        difficult = route(
+            "How could we improve this then?",
+            context_prompt="Investigate the intermittent race condition and find the root cause.",
+        )
+        self.assertEqual((difficult["class"], difficult["model"], difficult["effort"]),
+                         ("difficult", "gpt-6-sol", "high"))
+        self.assertTrue(difficult["context_inherited"])
+
+        consequential = route(
+            "Ok go",
+            context_prompt="Design a production cross-system security architecture.",
+        )
+        self.assertEqual((consequential["class"], consequential["model"], consequential["effort"]),
+                         ("consequential", "gpt-6-astra", "xhigh"))
+        self.assertTrue(consequential["context_inherited"])
+
+        simple = route(
+            "Ok go",
+            context_prompt="Format these three values as CSV.",
+        )
+        self.assertEqual((simple["class"], simple["model"], simple["effort"]),
+                         ("simple", "gpt-6-luna", "low"))
+        self.assertTrue(simple["context_inherited"])
+
+    def test_contextual_followup_keeps_prior_tool_shortlist(self):
+        choice = route(
+            "How does this work?",
+            context_prompt="Review the website and produce a PDF preview.",
+        )
+        self.assertIn("agentBrowser", choice["servers"])
+        self.assertIn("previews", choice["servers"])
 
     def test_explicit_effort_wins(self):
         choice = route("Format these values as CSV with reasoning effort ultra.")
@@ -623,6 +754,95 @@ class RoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(host_control.ModelHostError, "explicitly pinned"):
                 asyncio.run(host_control.switch_current_turn_model(
                     thread_id, "gpt-other", "high"))
+
+    def test_switch_compatibility_preflight_rejects_known_runtime_mismatch(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            cache = Path(directory) / "models_cache.json"
+            cache.write_text(json.dumps({"models": [
+                {"slug": "gpt-6-sol", "visibility": "list",
+                 "node_repl_auto_review_required": True},
+                {"slug": "gpt-6-luna", "visibility": "list",
+                 "node_repl_auto_review_required": False},
+            ]}), encoding="utf-8")
+            now = cache.stat().st_mtime
+            with patch.object(host_control, "MODELS_CACHE_PATH", cache), \
+                 patch.object(host_control.time, "time", return_value=now):
+                with self.assertRaisesRegex(host_control.ModelHostError,
+                                            "different Node REPL auto-review contracts"):
+                    host_control._ensure_switch_runtime_compatible(
+                        "gpt-6-sol", "gpt-6-luna")
+
+    def test_active_turn_switch_marks_evidence_before_host_update(self):
+        import asyncio
+        thread_id = "00000000-0000-4000-8000-000000000004"
+        turn_id = "turn-4"
+
+        class Connection:
+            async def __aenter__(self):
+                return SimpleNamespace(send=AsyncMock())
+
+            async def __aexit__(self, *_args):
+                return False
+
+        marker_calls = []
+
+        async def rpc(_ws, method, _params, _request_id):
+            if method == "model/list":
+                return {"data": [{"id": "gpt-6-sol", "hidden": False,
+                                   "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]}
+            if method == "thread/read":
+                return {"thread": {"id": thread_id, "status": {"type": "active"},
+                                   "model": "gpt-6-sol"}}
+            if method == "thread/turns/list":
+                return {"data": [{"id": turn_id, "status": "inProgress", "items": [
+                    {"type": "commandExecution", "status": "completed", "exitCode": 0,
+                     "command": "printf %s \"$CODEX_THREAD_ID\"",
+                     "aggregatedOutput": thread_id}]}]}
+            if method == "turn/settings/update":
+                self.assertEqual(len(marker_calls), 1)
+                self.assertEqual(marker_calls[0][1]["receipt_id"],
+                                 f"{thread_id}:{turn_id}:model_switch")
+                return {"status": "applied"}
+            return {}
+
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": thread_id}), \
+             patch.object(host_control, "acquire_lock_async", new=AsyncMock(return_value=descriptor)), \
+             patch.object(host_control, "_choice_authority", return_value={}), \
+             patch.object(host_control, "_read_token", return_value="token"), \
+             patch.object(host_control, "_ensure_switch_runtime_compatible"), \
+             patch.object(host_control.websockets, "connect", return_value=Connection()), \
+             patch.object(host_control, "_rpc", side_effect=rpc), \
+             patch.object(host_control, "record_metric",
+                          side_effect=lambda event, **fields: marker_calls.append((event, fields))):
+            result = asyncio.run(host_control.switch_current_turn_model(
+                thread_id, "gpt-6-sol", "high"))
+        self.assertEqual(result["status"], "applied_to_later_steps")
+        self.assertEqual(marker_calls[0][0], "turn_model_switch_attempted")
+
+    def test_switch_compatibility_preflight_defers_when_unknown_or_compatible(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            cache = Path(directory) / "models_cache.json"
+            cache.write_text(json.dumps({"models": [
+                {"slug": "gpt-6-sol", "visibility": "list",
+                 "node_repl_auto_review_required": True},
+                {"slug": "gpt-6.1-sol", "visibility": "list",
+                 "node_repl_auto_review_required": True},
+            ]}), encoding="utf-8")
+            now = cache.stat().st_mtime
+            with patch.object(host_control, "MODELS_CACHE_PATH", cache), \
+                 patch.object(host_control.time, "time", return_value=now):
+                host_control._ensure_switch_runtime_compatible(
+                    "gpt-6-sol", "gpt-6.1-sol")
+                host_control._ensure_switch_runtime_compatible(
+                    "gpt-6-sol", "gpt-unknown")
+            with patch.object(host_control, "MODELS_CACHE_PATH", cache), \
+                 patch.object(host_control.time, "time",
+                              return_value=now + host_control.MODEL_CACHE_MAX_AGE_SECONDS + 1):
+                host_control._ensure_switch_runtime_compatible(
+                    "gpt-6-sol", "gpt-6-luna")
 
     def test_global_option_operands_do_not_become_commands(self):
         args = ["--enable", "search", "--remote", "ws://example", "-a", "never",

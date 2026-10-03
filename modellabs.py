@@ -40,6 +40,58 @@ MODEL_BY_CLASS = {
     "consequential": "gpt-6-astra",
 }
 EFFORT_LEVELS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
+DIRECT_CONTINUATIONS = frozenset({
+    "ok go", "go ahead", "ok go ahead", "okay go ahead", "continue", "proceed",
+    "yes", "yes please", "do it", "do that", "lets do it", "ship it", "sounds good",
+})
+TASK_CLASS_ORDER = {"simple": 0, "routine": 1, "difficult": 2, "consequential": 3}
+
+
+def _normalized_prompt(prompt: str) -> str:
+    return " ".join(re.findall(r"\w+", prompt.lower()))
+
+
+def needs_prior_task_context(prompt: str) -> bool:
+    """Identify short follow-ups whose referent lives in the preceding task."""
+    normalized = _normalized_prompt(prompt)
+    if normalized in DIRECT_CONTINUATIONS:
+        return True
+    if not normalized or len(normalized.split()) > 24 or "\n" in normalized:
+        return False
+    return bool(re.search(
+        r"^(?:(?:ok(?:ay)?|so)\s+)*(?:now\s+)?"
+        r"(?:how|what|why|when|where|can|could|should|would|does|is|are)\b"
+        r".*\b(?:this|that|it|these|those|same|then|next)\b",
+        normalized,
+    ))
+
+
+def _classify_task(prompt: str) -> str:
+    p = prompt.lower()
+    words = len(prompt.split())
+    high = bool(re.search(
+        r"\b(architecture|security|privacy|production|release|deploy|migrat\w*|"
+        r"major refactor|end.to.end|cross.system|legal|medical|financial|high.stakes)\b",
+        p,
+    ))
+    hard = bool(re.search(
+        r"\b(debug|investigat\w*|root cause|race condition|intermittent|complex|"
+        r"optimi[sz]\w*|performance)\b",
+        p,
+    ))
+    simple_signal = bool(re.search(
+        r"\b(translate|format|extract|classify|summari[sz]e|rewrite|convert|explain|"
+        r"clarify|define)\b|"
+        r"\b(?:how|what|why)\s+(?:does|do|is|are|can)\b|"
+        r"^(?:status|ready)\b|"
+        r"\b(?:is|are|does|do)\b.{0,80}\b(?:ready|working|enabled|active|correct)\b|"
+        r"\bhow\s+(?:could|can|should)\s+(?:we|i|you)\s+"
+        r"(?:improve|simplify|streamline)\b|"
+        r"\bshould\b.*\b(?:automatically|by default)\b",
+        p,
+    ))
+    simple = words <= 55 and simple_signal and not high and not hard
+    return "consequential" if high else "difficult" if hard else "simple" if simple else "routine"
 
 
 def choose_effort(prompt: str, task_class: str, model: str) -> str:
@@ -75,15 +127,22 @@ def explicit_effort_requested(prompt: str) -> bool:
 
 
 def route(prompt: str, model_override: str | None = None,
-          effort_override: str | None = None) -> dict:
+          effort_override: str | None = None, context_prompt: str | None = None) -> dict:
     if not prompt.strip():
         raise ValueError("A first prompt is required for prompt-first routing.")
     p = prompt.lower()
-    words = len(prompt.split())
-    high = bool(re.search(r"\b(architecture|security|privacy|production|release|deploy|migrat\w*|major refactor|end.to.end|cross.system|legal|medical|financial|high.stakes)\b", p))
-    hard = bool(re.search(r"\b(debug|investigat\w*|root cause|race condition|intermittent|complex|optimi[sz]\w*|performance)\b", p))
-    simple = words <= 55 and bool(re.search(r"\b(translate|format|extract|classify|summari[sz]e|rewrite|convert)\b", p)) and not high and not hard
-    task_class = "consequential" if high else "difficult" if hard else "simple" if simple else "routine"
+    task_class = _classify_task(prompt)
+    context_inherited = False
+    direct_continuation = _normalized_prompt(prompt) in DIRECT_CONTINUATIONS
+    if context_prompt and needs_prior_task_context(prompt):
+        context_class = _classify_task(context_prompt)
+        if direct_continuation:
+            context_inherited = True
+            task_class = context_class
+        elif (TASK_CLASS_ORDER[context_class] >= TASK_CLASS_ORDER["difficult"]
+              and TASK_CLASS_ORDER[context_class] > TASK_CLASS_ORDER[task_class]):
+            task_class = context_class
+            context_inherited = True
     model = MODEL_BY_CLASS[task_class]
     requested = re.search(r"\b(?:use|run|route to|switch to)\s+(?:the\s+)?(gpt-6[- ](?:astra|sol|luna)|gpt-5\.6[- ](?:luna|terra|sol)|astra|luna|terra|sol)\b", p)
     explicit_model = bool(requested or model_override)
@@ -94,33 +153,37 @@ def route(prompt: str, model_override: str | None = None,
     if model_override:
         model = model_override
     explicit_effort = explicit_effort_requested(prompt) or bool(effort_override)
-    effort = choose_effort(prompt, task_class, model)
+    effort_prompt = context_prompt if context_inherited and context_prompt else prompt
+    effort = choose_effort(prompt if explicit_effort else effort_prompt, task_class, model)
     if effort_override:
         effort = effort_override
 
     selected = {"modelControl"}
-    if re.search(r"\b(web|browse|website|browser|chatgpt|pro session|online|internet)\b", p):
+    tool_text = p + ("\n" + context_prompt.lower()
+                     if context_prompt and needs_prior_task_context(prompt) else "")
+    if re.search(r"\b(web|browse|website|browser|chatgpt|pro session|online|internet)\b", tool_text):
         selected.add("agentBrowser")
-    if re.search(r"\b(research|literature|paper|citation|patent|grant|litscout)\b", p):
+    if re.search(r"\b(research|literature|paper|citation|patent|grant|litscout)\b", tool_text):
         selected.update({"codexResearch", "litScout"})
-    if re.search(r"\b(codex research|graphiti|prior context|memory)\b", p):
+    if re.search(r"\b(codex research|graphiti|prior context|memory)\b", tool_text):
         selected.add("codexResearch")
-    if re.search(r"\b(codegraph|call graph|repository graph)\b", p):
+    if re.search(r"\b(codegraph|call graph|repository graph)\b", tool_text):
         selected.add("codegraph")
-    if re.search(r"\b(openai api|codex docs|codex documentation|openai docs)\b", p):
+    if re.search(r"\b(openai api|codex docs|codex documentation|openai docs)\b", tool_text):
         selected.add("openaiDeveloperDocs")
-    if re.search(r"\b(cloudflare|wrangler|durable object|turnstile)\b", p):
+    if re.search(r"\b(cloudflare|wrangler|durable object|turnstile)\b", tool_text):
         selected.update(x for x in SERVERS if x.startswith("cloudflare"))
-    if re.search(r"\b(preview|pdf|docx|pptx|xlsx|figure|image|report)\b", p):
+    if re.search(r"\b(preview|pdf|docx|pptx|xlsx|figure|image|report)\b", tool_text):
         selected.add("previews")
     # A narrow bundle is a starting context choice, not an authorization gate.
     # Ambiguous requests retain evidence/browser access so they can be resolved.
-    if p.strip().rstrip(".!?") in {"ok go", "go ahead", "continue", "yes", "do it"}:
+    if direct_continuation:
         selected.update({"agentBrowser", "codexResearch", "litScout", "previews"})
     task_bucket = f"{task_class}:" + ",".join(sorted(selected))
     return {"class": task_class, "model": model, "effort": effort,
             "intelligence_slider": effort,
             "explicit_model": explicit_model, "explicit_effort": explicit_effort,
+            "context_inherited": context_inherited,
             "task_bucket": task_bucket,
             "servers": sorted(selected), "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
 

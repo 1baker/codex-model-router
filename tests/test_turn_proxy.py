@@ -79,6 +79,23 @@ class AssistantResultExtractionTests(unittest.TestCase):
             route, status="failed", exact_usage=True))
         self.assertIsNone(turn_proxy.execution_observation(
             route, status="completed", exact_usage=False))
+        for flag in ("switch_attempted", "settings_changed_mid_turn"):
+            self.assertIsNone(turn_proxy.execution_observation(
+                {**route, flag: True}, status="completed", exact_usage=True))
+
+    def test_active_settings_notice_disqualifies_only_changed_thread(self):
+        active = {
+            ("thread-1", "turn-1"): {"model": "gpt-6-sol", "effort": "medium"},
+            ("thread-2", "turn-2"): {"model": "gpt-6-sol", "effort": "medium"},
+        }
+        notice = {"method": "thread/settings/updated", "params": {
+            "threadId": "thread-1", "threadSettings": {
+                "model": "gpt-6-astra", "reasoningEffort": "high"}}}
+        self.assertEqual(turn_proxy.note_active_settings_change(notice, active),
+                         [("thread-1", "turn-1")])
+        self.assertTrue(active[("thread-1", "turn-1")]["settings_changed_mid_turn"])
+        self.assertNotIn("settings_changed_mid_turn", active[("thread-2", "turn-2")])
+        self.assertEqual(turn_proxy.note_active_settings_change(notice, active), [])
 
 
 class FakeClient:
@@ -183,6 +200,40 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
              patch.object(turn_proxy, "_rpc", side_effect=rpc):
             self.assertIsNone(await turn_proxy.latest_host_turn_id("ephemeral-thread", "token"))
 
+    async def test_previous_task_skips_chained_contextual_followups(self):
+        upstream = FakeUpstream([])
+
+        async def rpc(_ws, method, _params, _request_id):
+            if method == "initialize":
+                return {}
+            return {"data": [{"items": [
+                {"type": "userMessage", "content": [
+                    {"type": "text", "text": "Investigate the intermittent race condition."}]},
+                {"type": "userMessage", "content": [
+                    {"type": "text", "text": "How does this work?"}]},
+            ]}]}
+
+        with patch.object(turn_proxy.websockets, "connect",
+                          return_value=ConnectContext(upstream)), \
+             patch.object(turn_proxy, "_rpc", side_effect=rpc):
+            result = await turn_proxy.previous_task("thread", "token")
+        self.assertEqual(result, ("Investigate the intermittent race condition.", "found"))
+
+    async def test_previous_task_reports_lookup_failure(self):
+        with patch.object(turn_proxy.websockets, "connect", side_effect=OSError("unavailable")):
+            self.assertEqual(await turn_proxy.previous_task("thread", "token"),
+                             (None, "error"))
+
+    def test_route_records_context_status_and_digest_without_text(self):
+        raw = json.dumps({"id": 1, "method": "turn/start", "params": {
+            "threadId": "thread", "input": [{"type": "text", "text": "ok go"}]}})
+        _routed, info = turn_proxy.route_request(
+            raw, context_prompt="Migrate the production database.",
+            context_lookup_status="found")
+        self.assertEqual(info["context_lookup_status"], "found")
+        self.assertEqual(len(info["context_prompt_sha256"]), 64)
+        self.assertNotIn("Migrate", str(info))
+
     async def test_durable_completion_claim_prevents_late_duplicate(self):
         delivered = asyncio.Event()
         metrics = []
@@ -281,6 +332,30 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(observed), 1, metrics)
         self.assertEqual(observed[0]["model"], "gpt-5.6-terra")
         self.assertEqual(observed[0]["settings_confirmation"], "exact")
+
+    def test_switch_marker_blocks_execution_promotion_after_exact_usage(self):
+        info = self.route_info(asyncio.Event())
+        info.update({"settings_confirmed": True,
+                     "settings_confirmation_source":
+                         "host_thread_settings_updated_pre_admission",
+                     "execution_recorded": asyncio.Event()})
+        sample = {"inputTokens": 8, "cachedInputTokens": 0, "cacheWriteInputTokens": 0,
+                  "outputTokens": 2, "reasoningOutputTokens": 0, "totalTokens": 10}
+        info["usage_tracker"].observe({"tokenUsage": {"last": sample, "total": sample}})
+        events = []
+        with patch.object(turn_proxy, "canonical_receipt",
+                          side_effect=lambda receipt_id: ({"event": "turn_model_switch_attempted"}
+                              if receipt_id.endswith(":model_switch") else None)), \
+             patch.object(turn_proxy, "reconcile_receipt_stage",
+                          side_effect=lambda *_args: events.append(_args[4])), \
+             patch.object(turn_proxy, "record_metric",
+                          side_effect=lambda event, **_fields: events.append(event)):
+            turn_proxy.finalize_route("thread", "turn", info, status="completed",
+                                      elapsed_ms=1, terminal_source="live_event",
+                                      usage_complete=True)
+        self.assertIn("turn_usage", events)
+        self.assertNotIn("route_execution_observed", events)
+        self.assertTrue(info["switch_attempted"])
 
     def test_server_request_id_never_resolves_pending_rpc(self):
         self.assertFalse(turn_proxy.is_rpc_response({"id": 7, "method": "item/tool/requestUserInput",

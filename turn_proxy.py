@@ -17,8 +17,9 @@ from typing import Any
 
 PROXY_GENERATION_FILES = (
     "adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
-    "modellabs.py", "outcome_model.py", "paths.py", "protocol_policy.py",
-    "receipt_journal.py", "telemetry.py", "thread_owner.py", "turn_proxy.py",
+    "legacy_thread_handoff.py", "modellabs.py", "outcome_model.py", "paths.py",
+    "protocol_policy.py", "receipt_journal.py", "smoke_bench.py", "telemetry.py",
+    "thread_owner.py", "turn_proxy.py",
 )
 PROXY_GENERATION_ENTRY_ENV = "MODELLABS_PROXY_GENERATION_ENTRY"
 
@@ -90,7 +91,8 @@ if __name__ == "__main__":
 import websockets
 
 from host_control import HOST_URL, ModelHostError, _read_token, _rpc
-from modellabs import config_for, record_route, route
+from modellabs import (DIRECT_CONTINUATIONS, config_for, needs_prior_task_context,
+                       record_route, route)
 from telemetry import UsageTracker, canonical_receipt, record as _record_metric, usage_from
 from adaptive_policy import adapt, note_followup
 from paths import ROOT, proxy_port, proxy_revision
@@ -112,7 +114,7 @@ if not 1024 <= PROXY_PORT <= 65535:
     raise ValueError("MODELLABS_PROXY_PORT must be an unprivileged TCP port.")
 PROXY_URL = f"ws://127.0.0.1:{PROXY_PORT}"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
-CONTINUATIONS = {"ok go", "go ahead", "continue", "yes", "do it"}
+CONTINUATIONS = DIRECT_CONTINUATIONS
 CATALOG_TTL_SECONDS = 60.0
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 UNRESOLVED_FILE = ROOT / f"proxy-unresolved-{PROXY_PORT}.state"
@@ -209,7 +211,7 @@ def apply_launch_choice(raw: str, choice: dict[str, Any] | None) -> str:
         return raw
 
 
-async def previous_task(thread_id: str, token: str) -> str | None:
+async def previous_task(thread_id: str, token: str) -> tuple[str | None, str]:
     try:
         async with websockets.connect(HOST_URL, additional_headers={"Authorization": f"Bearer {token}"},
                                       open_timeout=1, max_size=MAX_MESSAGE_BYTES) as ws:
@@ -223,18 +225,19 @@ async def previous_task(thread_id: str, token: str) -> str | None:
                     if item.get("type") != "userMessage":
                         continue
                     message = "\n".join(c.get("text", "") for c in item.get("content", []) if c.get("type") == "text")
-                    if message.strip() and message.lower().strip().rstrip(".!?") not in CONTINUATIONS:
-                        return message
+                    if message.strip() and not needs_prior_task_context(message):
+                        return message, "found"
     except Exception:
-        pass
-    return None
+        return None, "error"
+    return None, "none"
 
 
 def route_request(raw: str, context_prompt: str | None = None,
                   preserve_model: bool = False,
                   preserve_effort: bool = False,
                   explicit_model: bool = False,
-                  explicit_effort: bool = False) -> tuple[str, dict | None]:
+                  explicit_effort: bool = False,
+                  context_lookup_status: str = "not_needed") -> tuple[str, dict | None]:
     try:
         message = json.loads(raw)
         if message.get("method") != "turn/start":
@@ -253,7 +256,10 @@ def route_request(raw: str, context_prompt: str | None = None,
         settings = collaboration.get("settings") if isinstance(collaboration, dict) else None
         incoming_model, incoming_effort = effective_request_settings(params)
         note_followup(params.get("threadId"), prompt)
-        baseline = route(context_prompt or prompt)
+        baseline = route(prompt, context_prompt=context_prompt)
+        baseline["context_lookup_status"] = context_lookup_status
+        if context_prompt:
+            baseline["context_prompt_sha256"] = hashlib.sha256(context_prompt.encode()).hexdigest()
         # A model selected through Codex's settings UI is an explicit user
         # choice even though it is not present in this turn's natural language.
         if explicit_model and incoming_model:
@@ -369,12 +375,40 @@ def confirm_pending_route_settings(response: dict[str, Any],
     return True
 
 
+def note_active_settings_change(response: dict[str, Any],
+                                active: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:
+    """Disqualify active turns when the host reports changed settings."""
+    if response.get("method") != "thread/settings/updated":
+        return []
+    params = response.get("params") or {}
+    if not isinstance(params, dict):
+        return []
+    settings = params.get("threadSettings") or {}
+    if not isinstance(settings, dict):
+        return []
+    model = settings.get("model")
+    effort = (settings.get("effort") or settings.get("reasoning_effort")
+              or settings.get("reasoningEffort"))
+    changed = []
+    for key, route_info in active.items():
+        if key[0] != params.get("threadId"):
+            continue
+        if ((model is not None and model != route_info.get("model"))
+                or (effort is not None and effort != route_info.get("effort"))):
+            if not route_info.get("settings_changed_mid_turn"):
+                route_info["settings_changed_mid_turn"] = True
+                changed.append(key)
+    return changed
+
+
 def execution_observation(route_info: dict[str, Any], *, status: str,
                           exact_usage: bool) -> dict[str, str] | None:
     """Promote only positive, single-arm host evidence after a completed turn."""
     if (status != "completed" or not exact_usage
             or route_info.get("settings_confirmed") is not True
             or route_info.get("reroute_seen") is True
+            or route_info.get("switch_attempted") is True
+            or route_info.get("settings_changed_mid_turn") is True
             or route_info.get("settings_confirmation_source")
             != "host_thread_settings_updated_pre_admission"):
         return None
@@ -498,6 +532,8 @@ def finalize_route(thread_id: str, turn_id: str, route_info: dict[str, Any], *,
     else:
         usage_receipt = canonical_receipt(f"{thread_id}:{turn_id}:usage")
         usage_is_exact = usage_receipt is not None and usage_receipt.get("event") == "turn_usage"
+    if canonical_receipt(f"{thread_id}:{turn_id}:model_switch") is not None:
+        route_info["switch_attempted"] = True
     observation = execution_observation(route_info, status=status, exact_usage=usage_is_exact)
     execution_recorded = route_info.setdefault("execution_recorded", asyncio.Event())
     if observation is not None and not execution_recorded.is_set():
@@ -513,7 +549,9 @@ def record_accepted_receipt(thread_id: str, turn_id: str, route_info: dict[str, 
     reconcile_receipt_stage(thread_id, turn_id, route_info, "accepted", "route_accepted", {
         "model": route_info["model"], "effort": route_info["effort"],
         "task_class": route_info["class"], "task_bucket": route_info.get("task_bucket"),
-        "adaptive_reason": route_info.get("adaptive_reason")})
+        "adaptive_reason": route_info.get("adaptive_reason"),
+        "context_lookup_status": route_info.get("context_lookup_status"),
+        "context_prompt_sha256": route_info.get("context_prompt_sha256")})
 
 
 def track_background(task: asyncio.Task) -> None:
@@ -982,6 +1020,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                             "code": -32005, "message": f"ModelLabs rejected thread configuration: {exc}"}}))
                     continue
                 context = None
+                context_lookup_status = "not_needed"
                 params: dict[str, Any] = {}
                 request_id = None
                 method = None
@@ -1088,6 +1127,16 @@ async def handler(client: websockets.ServerConnection) -> None:
                             begin_admission(request_id, mutation_thread, method)
                     if (method in {"thread/settings/update", "turn/settings/update"}
                             and isinstance(params, dict) and params.get("threadId")):
+                        if method == "turn/settings/update":
+                            switch_key = (params["threadId"], params.get("turnId"))
+                            if switch_key in active:
+                                try:
+                                    record_metric("turn_model_switch_attempted",
+                                                  receipt_id=f"{switch_key[0]}:{switch_key[1]}:model_switch",
+                                                  thread_id=switch_key[0], turn_id=switch_key[1],
+                                                  source="owner_connection")
+                                except Exception as exc:
+                                    raise ValueError("Could not persist the model-switch evidence marker.") from exc
                         requested_model, requested_effort = effective_request_settings(params)
                         if requested_model is not None or requested_effort is not None:
                             if request_id is not None:
@@ -1125,8 +1174,9 @@ async def handler(client: websockets.ServerConnection) -> None:
                         raw = json.dumps(request)
                         prompt = "\n".join(x.get("text", "") for x in params.get("input", [])
                                            if isinstance(x, dict) and x.get("type") == "text")
-                        if prompt.lower().strip().rstrip(".!?") in CONTINUATIONS:
-                            context = await previous_task(params.get("threadId", ""), token)
+                        if needs_prior_task_context(prompt):
+                            context, context_lookup_status = await previous_task(
+                                params.get("threadId", ""), token)
                 except (TypeError, ValueError, AttributeError, AuthorityError) as exc:
                     if request_id is not None:
                         await reject_and_abandon(request_id, method, params, -32003, str(exc))
@@ -1140,7 +1190,8 @@ async def handler(client: websockets.ServerConnection) -> None:
                                                  automatic_initial or preserve_cli_model or ticket_explicit_model or manual_model,
                                                  automatic_initial or preserve_cli_effort or ticket_explicit_effort or manual_effort,
                                                  preserve_cli_model or ticket_explicit_model or manual_model,
-                                                 preserve_cli_effort or ticket_explicit_effort or manual_effort)
+                                                 preserve_cli_effort or ticket_explicit_effort or manual_effort,
+                                                 context_lookup_status)
                 except Exception as exc:
                     if request_id is not None:
                         await reject_and_abandon(
@@ -1447,6 +1498,10 @@ async def handler(client: websockets.ServerConnection) -> None:
                         notification_thread = notification.get("threadId")
                         if isinstance(notification_thread, str):
                             confirm_pending_route_settings(response, pending)
+                            for changed_thread, changed_turn in note_active_settings_change(
+                                    response, active):
+                                record_metric("turn_settings_changed_mid_turn",
+                                              thread_id=changed_thread, turn_id=changed_turn)
                             authority_notifications[notification_thread] = notification
                             await reconcile_authority_notification(notification_thread)
                     if response.get("method") is not None and response_id is not None:

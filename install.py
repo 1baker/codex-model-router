@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -31,8 +32,9 @@ PINNED_CODEX_VERSION = "codex-cli 0.158.0"
 AUTHORITY_SCHEMA = "modellabs.thread_authority.v1"
 PROXY_GENERATION_FILES = (
     "adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
-    "modellabs.py", "outcome_model.py", "paths.py", "protocol_policy.py",
-    "receipt_journal.py", "telemetry.py", "thread_owner.py", "turn_proxy.py",
+    "legacy_thread_handoff.py", "modellabs.py", "outcome_model.py", "paths.py",
+    "protocol_policy.py", "receipt_journal.py", "smoke_bench.py", "telemetry.py",
+    "thread_owner.py", "turn_proxy.py",
 )
 # Every byte loaded by a pinned generation participates in its identity.  A
 # dependency-only upgrade must never alias an older immutable bundle.
@@ -123,6 +125,32 @@ def _stage_proxy_generation(home: Path, payloads: dict[str, bytes]) -> tuple[str
     else:
         _atomic_bytes(receipt_path, receipt_bytes, 0o600)
     return revision, port, receipt_path
+
+
+def _validate_proxy_bundle_imports(home: Path, payloads: dict[str, bytes]) -> None:
+    """Import the exact candidate bundle with the installed runtime before publication."""
+    interpreter = home / "venv/bin/python"
+    if not interpreter.is_file():
+        raise RuntimeError("Proxy source-only install requires its installed Python environment")
+    with tempfile.TemporaryDirectory(prefix="modellabs-proxy-preflight-", dir=home) as directory:
+        bundle = Path(directory)
+        for name, content in payloads.items():
+            (bundle / name).write_bytes(content)
+        environment = os.environ.copy()
+        environment["MODELLABS_HOME"] = str(home)
+        environment["MODELLABS_PROXY_PORT"] = "46000"
+        try:
+            result = subprocess.run(
+                [str(interpreter), "-I", "-B", "-c",
+                 "import sys; sys.path.insert(0, sys.argv[1]); import turn_proxy",
+                 str(bundle)],
+                cwd=bundle, env=environment, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=15, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Candidate proxy import preflight timed out") from exc
+        if result.returncode:
+            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown import error"
+            raise RuntimeError(f"Candidate proxy import preflight failed: {detail[:300]}")
 
 
 def _service_bytes(home: Path) -> bytes:
@@ -457,6 +485,7 @@ def install_proxy_source_only(home: Path, expected_installed_sha256: str) -> dic
     if not re.fullmatch(r"[0-9a-f]{64}", expected_installed_sha256):
         raise ValueError("proxy-source-only install requires an exact current SHA-256")
     home = home.expanduser().absolute()
+    verify_existing_venv_containment(home / "venv")
     target = home / "turn_proxy.py"
     manifest_path = home / OWNED_MANIFEST
     for path in (manifest_path, *(home / name for name in PROXY_GENERATION_FILES)):
@@ -489,6 +518,7 @@ def install_proxy_source_only(home: Path, expected_installed_sha256: str) -> dic
                      if next_payloads[name] != previous_payloads[name]]
     if not changed_names:
         raise RuntimeError("Proxy source-only install has no generation change")
+    _validate_proxy_bundle_imports(home, next_payloads)
 
     # Keep the historical turn_proxy backup/return fields for compatibility,
     # while also protecting every dependency that this release will replace.

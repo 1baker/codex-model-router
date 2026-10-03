@@ -36,6 +36,26 @@ routine and difficult work; and GPT-6 Astra for consequential work. These
 choices are admitted only when the live Codex catalog lists them. Existing short names
 `Sol`, `Luna`, and `Terra` retain their GPT-5.6 meanings.
 
+Short explanations, confirmations, status questions, and lightweight planning
+use Luna at low effort when they contain no difficult or consequential signal.
+A terse continuation such as `ok go`, `proceed`, or `yes please` inherits the
+preceding task class, effort, and tool shortlist. A short referential question may stay simple, but it inherits a
+difficult or consequential predecessor so conversational wording cannot lower
+the task's risk class.
+The proxy records whether prior-task lookup succeeded and a digest of the
+selected context, without recording the context text. This distinguishes an
+unavailable history lookup from a turn that did not need context.
+
+Before an active-turn model change, ModelLabs compares fresh local Codex model
+metadata for runtime contracts that the app-server cannot change mid-turn. A
+known Node REPL auto-review mismatch is rejected locally with an actionable
+next-turn instruction. Missing or stale compatibility metadata is treated as
+unknown, leaving the app-server as the final authority rather than inventing a
+compatibility result.
+Every active-turn switch attempt gets a durable, prompt-free marker before the
+host update. A turn with that marker or a changed-settings notice is excluded
+from single-model execution evidence even if it completes with exact usage.
+
 ## Reasoning effort
 
 The router selects the least effort expected to reach a verified result:
@@ -646,6 +666,8 @@ executes the exact old bundle for its remembered port, while a later chat can
 start the candidate bundle on its new port. The operation itself starts no proxy
 and restarts no service; a missing, redirected, changed, or port-colliding bundle
 fails closed.
+Before publication, it also imports the candidate bundle with the installed
+Python environment and refuses broken local imports.
 
 ```bash
 codex
