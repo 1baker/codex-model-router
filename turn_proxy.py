@@ -90,7 +90,8 @@ if __name__ == "__main__":
 
 import websockets
 
-from host_control import HOST_URL, ModelHostError, _read_token, _rpc
+from host_control import (HOST_URL, ModelHostError, _read_token, _rpc,
+                          list_models, listed_model)
 from modellabs import (DIRECT_CONTINUATIONS, config_for, needs_prior_task_context,
                        record_route, route)
 from telemetry import UsageTracker, canonical_receipt, record as _record_metric, usage_from
@@ -116,6 +117,7 @@ PROXY_URL = f"ws://127.0.0.1:{PROXY_PORT}"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 CONTINUATIONS = DIRECT_CONTINUATIONS
 CATALOG_TTL_SECONDS = 60.0
+CATALOG_MISS_REFRESH_SECONDS = 5.0
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 UNRESOLVED_FILE = ROOT / f"proxy-unresolved-{PROXY_PORT}.state"
 ACCOUNTING_BLOCKED = False
@@ -422,12 +424,28 @@ def execution_observation(route_info: dict[str, Any], *, status: str,
 
 def selection_is_listed(catalog: dict[str, Any], choice: dict[str, Any]) -> bool:
     """Reject a stale or unsupported model/effort pair before host admission."""
-    for entry in catalog.get("data", []):
-        if entry.get("id") != choice.get("model") or entry.get("hidden"):
-            continue
-        efforts = {item.get("reasoningEffort") for item in entry.get("supportedReasoningEfforts", [])}
-        return choice.get("effort") in efforts
-    return False
+    entry = listed_model(catalog, choice.get("model"))
+    if entry is None:
+        return False
+    supported = entry.get("supportedReasoningEfforts")
+    if not isinstance(supported, list):
+        return False
+    efforts = {item.get("reasoningEffort") for item in supported if isinstance(item, dict)}
+    return choice.get("effort") in efforts
+
+
+async def catalog_for_selection(token: str, catalog: dict[str, Any] | None,
+                                catalog_at: float, choice: dict[str, Any]) -> tuple[dict[str, Any], float]:
+    """Refresh expired catalogs or an aged ID miss once, without retry loops."""
+    age = time.monotonic() - catalog_at
+    missing_id = (catalog is not None and not any(
+        isinstance(entry, dict) and entry.get("id") == choice.get("model")
+        for entry in catalog.get("data", [])))
+    if (catalog is None or age > CATALOG_TTL_SECONDS
+            or (missing_id and age >= CATALOG_MISS_REFRESH_SECONDS)):
+        catalog = await live_catalog(token)
+        catalog_at = time.monotonic()
+    return catalog, catalog_at
 
 
 def is_rpc_response(message: dict[str, Any]) -> bool:
@@ -470,7 +488,7 @@ async def live_catalog(token: str) -> dict[str, Any]:
         await _rpc(ws, "initialize", {"clientInfo": {"name": "modellabs-catalog", "version": "0.1"},
                                       "capabilities": {"experimentalApi": True}}, 1)
         await ws.send(json.dumps({"method": "initialized", "params": {}}))
-        return await _rpc(ws, "model/list", {}, 2)
+        return await list_models(ws)
 
 
 async def latest_host_turn_id(thread_id: str, token: str) -> str | None:
@@ -1208,9 +1226,7 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if automatic_initial:
                         initial_preselection_available = False
                     try:
-                        if catalog is None or time.monotonic() - catalog_at > CATALOG_TTL_SECONDS:
-                            catalog = await live_catalog(token)
-                            catalog_at = time.monotonic()
+                        catalog, catalog_at = await catalog_for_selection(token, catalog, catalog_at, info)
                         if not selection_is_listed(catalog, info):
                             raise ValueError("selected model or reasoning effort is unavailable on this host")
                     except Exception as exc:

@@ -21,14 +21,18 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expandus
 REAL_CODEX_PATH_FILE = ROOT / "real-codex-path"
 MANAGED_CODEX_PATH_FILE = ROOT / "managed-codex-path"
 RUNTIME_SOURCE = Path(__file__).resolve().parent
+PROXY_REVISION_FILES = (
+    "adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
+    "legacy_thread_handoff.py", "modellabs.py", "outcome_model.py", "paths.py",
+    "protocol_policy.py", "receipt_journal.py", "smoke_bench.py", "telemetry.py",
+    "thread_owner.py", "turn_proxy.py",
+)
 
 
 def proxy_revision() -> str:
     """Identify the exact proxy/accounting implementation loaded at runtime."""
     digest = hashlib.sha256()
-    for name in ("adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
-                 "modellabs.py", "outcome_model.py", "paths.py", "protocol_policy.py",
-                 "receipt_journal.py", "telemetry.py", "thread_owner.py", "turn_proxy.py"):
+    for name in PROXY_REVISION_FILES:
         digest.update(name.encode())
         digest.update((RUNTIME_SOURCE / name).read_bytes())
     return digest.hexdigest()[:16]

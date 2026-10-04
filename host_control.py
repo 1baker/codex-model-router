@@ -22,6 +22,7 @@ TOKEN_FILE = ROOT / "host-token"
 THREAD_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 MODELS_CACHE_PATH = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "models_cache.json"
 MODEL_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+MAX_MODEL_CATALOG_PAGES = 32
 
 
 class ModelHostError(Exception):
@@ -104,6 +105,37 @@ async def _rpc(ws: Any, method: str, params: dict[str, Any], request_id: int) ->
         return result
 
 
+async def list_models(ws: Any, first_id: int = 2) -> dict[str, Any]:
+    """Read the complete live catalog, rejecting malformed or unbounded paging."""
+    entries: list[dict[str, Any]] = []
+    params: dict[str, Any] = {}
+    cursors: set[str] = set()
+    for page_number in range(MAX_MODEL_CATALOG_PAGES):
+        page = await _rpc(ws, "model/list", params, first_id + page_number)
+        data = page.get("data")
+        if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+            raise ModelHostError("Model host returned invalid model/list data.")
+        entries.extend(data)
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            return {"data": entries}
+        if not isinstance(cursor, str) or not cursor or cursor in cursors:
+            raise ModelHostError("Model host returned an invalid or repeated model/list cursor.")
+        cursors.add(cursor)
+        params = {"cursor": cursor}
+    raise ModelHostError("Model host exceeded the model/list page limit.")
+
+
+def listed_model(catalog: dict[str, Any], model: str) -> dict[str, Any] | None:
+    """Require exactly one visible exact-ID entry, never a first-match guess."""
+    entries = catalog.get("data") if isinstance(catalog, dict) else None
+    if not isinstance(entries, list):
+        return None
+    matches = [entry for entry in entries if isinstance(entry, dict)
+               and entry.get("id") == model and not entry.get("hidden")]
+    return matches[0] if len(matches) == 1 else None
+
+
 async def switch_current_turn_model(thread_id: str, model: str, effort: str | None = None) -> dict[str, Any]:
     """Publish a model choice for later steps of one active turn in the given thread."""
     if not THREAD_ID_PATTERN.fullmatch(thread_id):
@@ -141,16 +173,17 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
                 1,
             )
             await ws.send(json.dumps({"method": "initialized", "params": {}}))
-            catalog = await _rpc(ws, "model/list", {}, 2)
-            matches = [item for item in catalog.get("data", []) if item.get("id") == model and not item.get("hidden")]
-            if len(matches) != 1:
+            catalog = await list_models(ws)
+            selected = listed_model(catalog, model)
+            if selected is None:
                 raise ModelHostError(f"Model {model!r} is not listed as available by this host.")
             if effort is not None:
-                supported = {x.get("reasoningEffort") for x in matches[0].get("supportedReasoningEfforts", [])}
+                supported = {x.get("reasoningEffort") for x in selected.get("supportedReasoningEfforts", [])}
                 if effort not in supported:
                     raise ModelHostError(f"Model {model!r} does not support effort {effort!r} here.")
 
-            read = await _rpc(ws, "thread/read", {"threadId": thread_id, "includeTurns": False}, 3)
+            next_id = 2 + MAX_MODEL_CATALOG_PAGES
+            read = await _rpc(ws, "thread/read", {"threadId": thread_id, "includeTurns": False}, next_id)
             thread = read.get("thread") or {}
             state = (thread.get("status") or {}).get("type")
             if thread.get("id") != thread_id or state != "active":
@@ -162,7 +195,7 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
                 raise ModelHostError("This thread is not active on the connected model host.")
             turns = await _rpc(
                 ws, "thread/turns/list",
-                {"threadId": thread_id, "limit": 1, "itemsView": "full", "sortDirection": "desc"}, 4,
+                {"threadId": thread_id, "limit": 1, "itemsView": "full", "sortDirection": "desc"}, next_id + 1,
             )
             active = [turn for turn in turns.get("data", []) if turn.get("status") == "inProgress"]
             if len(active) != 1:
@@ -195,7 +228,7 @@ async def switch_current_turn_model(thread_id: str, model: str, effort: str | No
                               source="model_control")
             except Exception as exc:
                 raise ModelHostError("Could not persist the model-switch evidence marker.") from exc
-            result = await _rpc(ws, "turn/settings/update", params, 5)
+            result = await _rpc(ws, "turn/settings/update", params, next_id + 2)
             if result.get("status") != "applied":
                 raise ModelHostError(f"Model host did not apply the change: {result.get('status', 'unknown')}.")
             return {

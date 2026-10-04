@@ -36,6 +36,20 @@ routine and difficult work; and GPT-6 Astra for consequential work. These
 choices are admitted only when the live Codex catalog lists them. Existing short names
 `Sol`, `Luna`, and `Terra` retain their GPT-5.6 meanings.
 
+Explicit requests such as `use gpt-6.1-sol`, `use GPT-6.1 Sol`, and
+`switch to gpt 6.1 sol` use the requested ID. Canonical GPT IDs, including
+version-only IDs such as `gpt-5.5` and future snapshot IDs, do not require a
+router code update. Recognizing an ID is not permission to run it: the live
+catalog must still list that exact visible model and requested reasoning effort.
+
+Both proxy admission and active-turn control follow every page of the host's
+[`model/list` catalog](https://learn.chatgpt.com/docs/app-server#list-models-modellist).
+Malformed or looping pages and ambiguous visible IDs fail closed. Proxy
+connections refresh their catalog on the next routed request after 60 seconds;
+an absent ID can trigger one earlier refresh when the cache is at least five
+seconds old. This is request-driven, not a background polling job. New catalog
+entries do not automatically change routing defaults or a user's pinned model.
+
 Short explanations, confirmations, status questions, and lightweight planning
 use Luna at low effort when they contain no difficult or consequential signal.
 A terse continuation such as `ok go`, `proceed`, or `yes please` inherits the

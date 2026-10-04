@@ -19,6 +19,7 @@ import install as installer
 from install import (SHELL_PATH_START, discover_real_codex,
                      ensure_managed_route_precedence, upsert_toml, write_wrappers)
 from paths import real_codex_binary
+import paths
 from turn_proxy import route_request, selection_is_listed
 import turn_proxy as turn_proxy_module
 from adaptive_policy import adapt, feedback, record_outcome
@@ -33,6 +34,47 @@ import thread_owner
 
 
 class RoutingTests(unittest.TestCase):
+    def test_explicit_model_ids_do_not_need_a_router_allowlist(self):
+        requests = {
+            "use gpt-6.1-sol": "gpt-6.1-sol",
+            "Use GPT-6.1 Sol": "gpt-6.1-sol",
+            "switch to gpt 6.1 sol": "gpt-6.1-sol",
+            "route to the GPT-5.5": "gpt-5.5",
+            "use gpt-5.5.": "gpt-5.5",
+            "run gpt 5.5": "gpt-5.5",
+            "use gpt-7-sol-2026-10-04": "gpt-7-sol-2026-10-04",
+            "use gpt 6.1 for review": "gpt-6.1",
+            "use Sol": "gpt-5.6-sol",
+            "use Luna": "gpt-5.6-luna",
+            "use Terra": "gpt-5.6-terra",
+            "use Astra": "gpt-6-astra",
+        }
+        for prompt, model in requests.items():
+            with self.subTest(prompt=prompt):
+                choice = route(prompt)
+                self.assertEqual(choice["model"], model)
+                self.assertTrue(choice["explicit_model"])
+
+    def test_model_mentions_without_a_selection_verb_are_not_pins(self):
+        self.assertFalse(route("Explain gpt-6.1-sol.")["explicit_model"])
+        self.assertFalse(route("Write a gpt-like answer.")["explicit_model"])
+
+    def test_unknown_explicit_model_is_not_silently_replaced(self):
+        choice = route("use gpt-99-sol with reasoning effort low")
+        self.assertEqual(choice["model"], "gpt-99-sol")
+        self.assertTrue(choice["explicit_model"])
+        self.assertFalse(selection_is_listed({"data": []}, choice))
+
+    def test_catalog_selection_rejects_hidden_or_duplicate_visible_ids(self):
+        entry = {"id": "gpt-6.1-sol", "supportedReasoningEfforts": [
+            {"reasoningEffort": "low"}]}
+        choice = {"model": entry["id"], "effort": "low"}
+        for data in ([], [{**entry, "hidden": True}], [entry, dict(entry)],
+                     [None], [{**entry, "supportedReasoningEfforts": None}]):
+            with self.subTest(data=data):
+                self.assertFalse(selection_is_listed({"data": data}, choice))
+        self.assertTrue(selection_is_listed({"data": [entry]}, choice))
+
     def test_every_generation_dependency_changes_the_proxy_revision(self):
         payloads = {name: f"VALUE = {name!r}\n".encode()
                     for name in installer.PROXY_GENERATION_FILES}
@@ -41,6 +83,53 @@ class RoutingTests(unittest.TestCase):
             with self.subTest(name=name):
                 changed = {**payloads, name: payloads[name] + b"# changed\n"}
                 self.assertNotEqual(installer._proxy_revision(changed), baseline)
+
+    def test_runtime_and_installer_hash_the_same_ordered_generation_files(self):
+        self.assertEqual(paths.PROXY_REVISION_FILES, installer.PROXY_GENERATION_FILES)
+        self.assertEqual(paths.PROXY_REVISION_FILES, installer.PROXY_REVISION_FILES)
+        self.assertEqual(paths.PROXY_REVISION_FILES, turn_proxy_module.PROXY_GENERATION_FILES)
+
+    def test_source_generation_matches_installer_and_launcher_revision_and_port(self):
+        source = paths.RUNTIME_SOURCE
+        payloads = {name: (source / name).read_bytes()
+                    for name in installer.PROXY_GENERATION_FILES}
+        revision = paths.proxy_revision()
+        self.assertEqual(revision, installer._proxy_revision(payloads))
+        self.assertEqual(revision, model_host_launcher.PROXY_REVISION)
+        self.assertEqual(paths.proxy_port(revision), installer.installed_proxy_port(source))
+        self.assertEqual(model_host_launcher.PROXY_PORT, installer.installed_proxy_port(source))
+
+    def test_every_bundled_dependency_changes_runtime_and_installer_identity(self):
+        payloads = {name: f"VALUE = {name!r}\n".encode()
+                    for name in installer.PROXY_GENERATION_FILES}
+        with patch.object(paths.Path, "read_bytes", lambda path: payloads[path.name]):
+            baseline = paths.proxy_revision()
+            self.assertEqual(baseline, installer._proxy_revision(payloads))
+            for name in installer.PROXY_GENERATION_FILES:
+                with self.subTest(name=name):
+                    original = payloads[name]
+                    payloads[name] += b"# changed\n"
+                    self.assertNotEqual(paths.proxy_revision(), baseline)
+                    self.assertEqual(paths.proxy_revision(), installer._proxy_revision(payloads))
+                    payloads[name] = original
+
+    def test_runtime_hashes_its_bundle_directory_not_the_mutable_install_home(self):
+        import importlib.util
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            payloads = {name: (paths.RUNTIME_SOURCE / name).read_bytes()
+                        for name in installer.PROXY_GENERATION_FILES}
+            payloads["smoke_bench.py"] += b"\n# bundle-only dependency change\n"
+            for name, content in payloads.items():
+                (bundle / name).write_bytes(content)
+            spec = importlib.util.spec_from_file_location("isolated_bundle_paths", bundle / "paths.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertEqual(module.RUNTIME_SOURCE, bundle)
+            self.assertEqual(module.proxy_revision(), installer._proxy_revision(payloads))
+            self.assertEqual(module.proxy_port(module.proxy_revision()), installer.installed_proxy_port(bundle))
+            self.assertNotEqual(module.proxy_revision(), paths.proxy_revision())
 
     def test_proxy_generation_contains_transitive_local_imports(self):
         root = Path(__file__).resolve().parents[1]
@@ -786,9 +875,14 @@ class RoutingTests(unittest.TestCase):
                 return False
 
         marker_calls = []
+        request_ids = []
 
         async def rpc(_ws, method, _params, _request_id):
+            request_ids.append(_request_id)
             if method == "model/list":
+                if not _params:
+                    return {"data": [], "nextCursor": "page-two"}
+                self.assertEqual(_params, {"cursor": "page-two"})
                 return {"data": [{"id": "gpt-6-sol", "hidden": False,
                                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]}
             if method == "thread/read":
@@ -820,6 +914,7 @@ class RoutingTests(unittest.TestCase):
                 thread_id, "gpt-6-sol", "high"))
         self.assertEqual(result["status"], "applied_to_later_steps")
         self.assertEqual(marker_calls[0][0], "turn_model_switch_attempted")
+        self.assertEqual(request_ids, [1, 2, 3, 34, 35, 36])
 
     def test_switch_compatibility_preflight_defers_when_unknown_or_compatible(self):
         from tempfile import TemporaryDirectory

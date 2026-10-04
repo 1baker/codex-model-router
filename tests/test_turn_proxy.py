@@ -12,6 +12,159 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import turn_proxy
 import authority
 import receipt_journal
+import host_control
+
+
+class CatalogTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def entry(model="gpt-6.1-sol", effort="low", **fields):
+        return {"id": model, "supportedReasoningEfforts": [
+            {"reasoningEffort": effort}], **fields}
+
+    async def test_paginated_catalog_merges_every_page(self):
+        pages = [{"data": [self.entry("gpt-6-sol")], "nextCursor": "two"},
+                 {"data": [self.entry()], "nextCursor": None}]
+        rpc = AsyncMock(side_effect=pages)
+        ws = SimpleNamespace(send=AsyncMock())
+        with patch.object(host_control, "_rpc", new=rpc):
+            catalog = await host_control.list_models(ws)
+        self.assertEqual([item["id"] for item in catalog["data"]],
+                         ["gpt-6-sol", "gpt-6.1-sol"])
+        self.assertEqual([call.args[2:] for call in rpc.await_args_list],
+                         [({}, 2), ({"cursor": "two"}, 3)])
+
+    async def test_missing_cursor_ends_catalog(self):
+        with patch.object(host_control, "_rpc", new=AsyncMock(
+                return_value={"data": []})) as rpc:
+            self.assertEqual(await host_control.list_models(None), {"data": []})
+        rpc.assert_awaited_once()
+
+    async def test_malformed_catalog_pages_fail_closed(self):
+        for page in ({}, {"data": {}}, {"data": [None]},
+                     {"data": [], "nextCursor": 4},
+                     {"data": [], "nextCursor": ""}):
+            with self.subTest(page=page), patch.object(
+                    host_control, "_rpc", new=AsyncMock(return_value=page)):
+                with self.assertRaises(host_control.ModelHostError):
+                    await host_control.list_models(None)
+
+    async def test_repeated_catalog_cursor_fails_closed(self):
+        rpc = AsyncMock(return_value={"data": [], "nextCursor": "same"})
+        with patch.object(host_control, "_rpc", new=rpc):
+            with self.assertRaisesRegex(host_control.ModelHostError, "repeated"):
+                await host_control.list_models(None)
+        self.assertEqual(rpc.await_count, 2)
+
+    async def test_catalog_has_a_bounded_page_count(self):
+        pages = [{"data": [], "nextCursor": str(i)} for i in range(32)]
+        rpc = AsyncMock(side_effect=pages)
+        with patch.object(host_control, "_rpc", new=rpc):
+            with self.assertRaisesRegex(host_control.ModelHostError, "page limit"):
+                await host_control.list_models(None)
+        self.assertEqual(rpc.await_count, 32)
+        self.assertEqual(rpc.await_args.args[-1], 33)
+
+    async def test_last_allowed_catalog_page_can_finish_normally(self):
+        pages = [{"data": [], "nextCursor": str(i)} for i in range(31)]
+        pages.append({"data": [self.entry()], "nextCursor": None})
+        with patch.object(host_control, "_rpc", new=AsyncMock(side_effect=pages)):
+            self.assertEqual(await host_control.list_models(None),
+                             {"data": [self.entry()]})
+
+    async def test_live_catalog_uses_the_shared_pagination(self):
+        ws = SimpleNamespace(send=AsyncMock())
+
+        class Connection:
+            async def __aenter__(self):
+                return ws
+
+            async def __aexit__(self, *_args):
+                return False
+
+        rpc = AsyncMock(side_effect=[
+            {"data": [], "nextCursor": "next"}, {"data": [self.entry()]}])
+        with patch.object(turn_proxy.websockets, "connect", return_value=Connection()), \
+             patch.object(turn_proxy, "_rpc", new=AsyncMock(return_value={})), \
+             patch.object(host_control, "_rpc", new=rpc):
+            catalog = await turn_proxy.live_catalog("token")
+        self.assertEqual(catalog, {"data": [self.entry()]})
+        self.assertEqual(rpc.await_count, 2)
+
+    async def test_aged_missing_id_refreshes_once_and_admits_new_model(self):
+        old = {"data": [self.entry("gpt-6-sol")]}
+        new = {"data": [self.entry()]}
+        choice = {"model": "gpt-6.1-sol", "effort": "low"}
+        fetch = AsyncMock(return_value=new)
+        with patch.object(turn_proxy.time, "monotonic", return_value=100.0), \
+             patch.object(turn_proxy, "live_catalog", new=fetch):
+            catalog, timestamp = await turn_proxy.catalog_for_selection("token", old, 95.0, choice)
+        fetch.assert_awaited_once_with("token")
+        self.assertEqual(timestamp, 100.0)
+        self.assertTrue(turn_proxy.selection_is_listed(catalog, choice))
+
+    async def test_fresh_cache_miss_is_rejected_without_a_fetch(self):
+        choice = {"model": "gpt-6.1-sol", "effort": "low"}
+        fetch = AsyncMock()
+        with patch.object(turn_proxy.time, "monotonic", return_value=100.0), \
+             patch.object(turn_proxy, "live_catalog", new=fetch):
+            catalog, timestamp = await turn_proxy.catalog_for_selection(
+                "token", {"data": []}, 96.0, choice)
+        fetch.assert_not_awaited()
+        self.assertEqual(timestamp, 96.0)
+        self.assertFalse(turn_proxy.selection_is_listed(catalog, choice))
+
+    async def test_missing_id_after_refresh_does_not_loop(self):
+        choice = {"model": "gpt-6.1-sol", "effort": "low"}
+        fetch = AsyncMock(return_value={"data": []})
+        with patch.object(turn_proxy.time, "monotonic", return_value=100.0), \
+             patch.object(turn_proxy, "live_catalog", new=fetch):
+            catalog, timestamp = await turn_proxy.catalog_for_selection(
+                "token", {"data": []}, 90.0, choice)
+            catalog, timestamp = await turn_proxy.catalog_for_selection(
+                "token", catalog, timestamp, choice)
+        fetch.assert_awaited_once()
+        self.assertFalse(turn_proxy.selection_is_listed(catalog, choice))
+
+    async def test_initial_fetch_does_not_retry_a_missing_id(self):
+        fetch = AsyncMock(return_value={"data": []})
+        with patch.object(turn_proxy.time, "monotonic", return_value=100.0), \
+             patch.object(turn_proxy, "live_catalog", new=fetch):
+            await turn_proxy.catalog_for_selection("token", None, 0.0,
+                                                  {"model": "gpt-6.1-sol"})
+        fetch.assert_awaited_once()
+
+    async def test_expired_catalog_rejects_removed_or_hidden_model(self):
+        choice = {"model": "gpt-6.1-sol", "effort": "low"}
+        for entries in ([], [self.entry(hidden=True)]):
+            with self.subTest(entries=entries), \
+                 patch.object(turn_proxy.time, "monotonic", return_value=100.0), \
+                 patch.object(turn_proxy, "live_catalog", new=AsyncMock(
+                     return_value={"data": entries})) as fetch:
+                catalog, _ = await turn_proxy.catalog_for_selection(
+                    "token", {"data": [self.entry()]}, 39.0, choice)
+            fetch.assert_awaited_once()
+            self.assertFalse(turn_proxy.selection_is_listed(catalog, choice))
+
+    async def test_hidden_duplicate_or_unsupported_effort_does_not_force_refresh(self):
+        for entries in ([self.entry(hidden=True)], [self.entry(), self.entry()],
+                        [self.entry(effort="medium")]):
+            with self.subTest(entries=entries), \
+                 patch.object(turn_proxy.time, "monotonic", return_value=100.0), \
+                 patch.object(turn_proxy, "live_catalog", new=AsyncMock()) as fetch:
+                catalog, _ = await turn_proxy.catalog_for_selection(
+                    "token", {"data": entries}, 90.0,
+                    {"model": "gpt-6.1-sol", "effort": "low"})
+            fetch.assert_not_awaited()
+            self.assertFalse(turn_proxy.selection_is_listed(
+                catalog, {"model": "gpt-6.1-sol", "effort": "low"}))
+
+    async def test_catalog_refresh_errors_propagate_for_admission_rejection(self):
+        with patch.object(turn_proxy.time, "monotonic", return_value=100.0), \
+             patch.object(turn_proxy, "live_catalog", new=AsyncMock(
+                 side_effect=host_control.ModelHostError("offline"))):
+            with self.assertRaisesRegex(host_control.ModelHostError, "offline"):
+                await turn_proxy.catalog_for_selection("token", None, 0.0,
+                                                      {"model": "gpt-6.1-sol"})
 
 
 class AssistantResultExtractionTests(unittest.TestCase):

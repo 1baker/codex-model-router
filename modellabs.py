@@ -126,6 +126,26 @@ def explicit_effort_requested(prompt: str) -> bool:
                           r"(?:at|to|=|:)?\s*(none|low|medium|high|xhigh|max|ultra)\b", prompt.lower()))
 
 
+def requested_model(prompt: str) -> str | None:
+    """Recognize explicit IDs without turning the router into a catalog allowlist."""
+    prefix = r"\b(?:use|run|route to|switch to)\s+(?:the\s+)?"
+    requested = re.search(
+        prefix + r"(?:gpt[- ]?(\d+(?:\.\d+)?)\s+(astra|sol|luna|terra)\b"
+        r"|(gpt-[a-z0-9]+(?:[.-][a-z0-9]+)*)\b"
+        r"|gpt\s+(\d+(?:\.\d+)?)\b|(astra|luna|terra|sol)\b)", prompt.lower())
+    if requested is None:
+        return None
+    version, name, canonical, bare_version, alias = requested.groups()
+    if version:
+        return f"gpt-{version}-{name}"
+    if canonical:
+        return canonical
+    if bare_version:
+        return f"gpt-{bare_version}"
+    return {"astra": "gpt-6-astra", "luna": "gpt-5.6-luna",
+            "terra": "gpt-5.6-terra", "sol": "gpt-5.6-sol"}[alias]
+
+
 def route(prompt: str, model_override: str | None = None,
           effort_override: str | None = None, context_prompt: str | None = None) -> dict:
     if not prompt.strip():
@@ -144,12 +164,10 @@ def route(prompt: str, model_override: str | None = None,
             task_class = context_class
             context_inherited = True
     model = MODEL_BY_CLASS[task_class]
-    requested = re.search(r"\b(?:use|run|route to|switch to)\s+(?:the\s+)?(gpt-6[- ](?:astra|sol|luna)|gpt-5\.6[- ](?:luna|terra|sol)|astra|luna|terra|sol)\b", p)
+    requested = requested_model(prompt)
     explicit_model = bool(requested or model_override)
     if requested:
-        alias = requested.group(1).replace(" ", "-")
-        model = alias if alias.startswith("gpt-") else {"astra": "gpt-6-astra", "luna": "gpt-5.6-luna",
-                                                     "terra": "gpt-5.6-terra", "sol": "gpt-5.6-sol"}[alias]
+        model = requested
     if model_override:
         model = model_override
     explicit_effort = explicit_effort_requested(prompt) or bool(effort_override)
