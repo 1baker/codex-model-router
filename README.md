@@ -701,6 +701,22 @@ as a compatibility alias, while `codex-direct` bypasses routing for maintenance
 or recovery. Starting a chat only starts local processes and does not modify
 your project files.
 
+New-folder trust uses the normal TUI confirmation. A new launch, with or without
+an initial prompt, gets a private five-minute, one-use permission to mark only
+its selected canonical workspace trusted. Nothing is trusted until you confirm.
+The proxy accepts exactly that single trust edit and forces `reloadUserConfig`
+to false, so confirming a new folder does not reload existing chats. Other
+configuration writes, mixed edits and alternate config files remain denied.
+The permission is consumed before any thread transition and remains consumed
+after a failed host write; relaunch if confirmation expires or fails.
+Symlink aliases, noncanonical path spellings and changed folder identities are
+refused. If the TUI selects an enclosing repository root instead of the launch
+folder, restart with that canonical root selected explicitly using `-C`.
+Promptless starts do not invent a route or tool scope; explicit model and effort
+pins are taken from the host-confirmed thread settings and remain authoritative.
+These changes apply to newly launched chats; connected older generations keep
+their existing code and connections.
+
 To move an already closed standalone chat to ModelLabs, use its exact thread
 UUID:
 

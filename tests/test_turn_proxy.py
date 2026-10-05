@@ -3,7 +3,11 @@ import json
 import os
 import sys
 import unittest
+import time
+from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -13,6 +17,8 @@ import turn_proxy
 import authority
 import receipt_journal
 import host_control
+import model_host_launcher
+import protocol_policy
 
 
 class CatalogTests(unittest.IsolatedAsyncioTestCase):
@@ -766,6 +772,358 @@ class TurnProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reroutes[0]["to_model"], "gpt-6-sol")
         self.assertEqual([fields for event, fields in metrics
                           if event == "route_execution_observed"], [])
+
+
+class BurstClient(FakeClient):
+    """Send pipelined requests, including notifications and duplicate IDs."""
+    async def __anext__(self):
+        if self._request_index < len(self._requests):
+            raw = self._requests[self._request_index]
+            self._request_index += 1
+            return raw
+        await self.done.wait()
+        raise StopAsyncIteration
+
+
+class ReplyUpstream(FakeUpstream):
+    def __init__(self, response=None):
+        super().__init__([])
+        self.replies = asyncio.Queue()
+        self.response = response or (lambda request: {"id": request["id"], "result": {}})
+
+    async def send(self, raw):
+        await super().send(raw)
+        await self.replies.put(json.dumps(self.response(self.sent[-1])))
+
+    async def __anext__(self):
+        return await self.replies.get()
+
+
+class LaunchTrustTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def ticket(root, *, choice=None, model=False, effort=False):
+        workspace = root / 'project.quoted"back\\slash'
+        workspace.mkdir(exist_ok=True)
+        with patch.object(model_host_launcher, "ROOT", root):
+            binding = model_host_launcher._launch_workspace(["-C", str(workspace)])
+            ticket_id = model_host_launcher._create_launch_ticket(
+                choice, explicit_model=model, explicit_effort=effort, workspace=binding)
+        ticket_path = root / "launch-tickets" / f"{ticket_id}.json"
+        return ticket_id, json.loads(ticket_path.read_text()), ticket_path
+
+    @staticmethod
+    def request(workspace, request_id=7):
+        return {"id": request_id, "method": "config/batchWrite", "params": {
+            "edits": [{"keyPath": turn_proxy.trust_edit_key_path(workspace),
+                       "value": "trusted", "mergeStrategy": "replace"}],
+            "filePath": None, "expectedVersion": None, "reloadUserConfig": True}}
+
+    async def relay(self, root, client, upstream, *, blocked=False):
+        with ExitStack() as stack:
+            for module in (turn_proxy, authority):
+                stack.enter_context(patch.object(module, "ROOT", root))
+            stack.enter_context(patch.object(receipt_journal, "QUARANTINE_DIR", root / "quarantine"))
+            stack.enter_context(patch.object(receipt_journal, "JOURNAL_DIR", root / "receipts"))
+            stack.enter_context(patch.object(turn_proxy, "ACCOUNTING_BLOCKED", blocked))
+            stack.enter_context(patch.object(turn_proxy, "ACCOUNTING_FAILURES", set()))
+            stack.enter_context(patch.object(turn_proxy, "_read_token", return_value="token"))
+            stack.enter_context(patch.object(turn_proxy, "record_metric"))
+            stack.enter_context(patch.object(turn_proxy, "acquire_thread_ownership",
+                                           side_effect=lambda *_args, **_kw: os.open("/dev/null", os.O_RDONLY)))
+            stack.enter_context(patch.object(turn_proxy.websockets, "connect",
+                                           return_value=ConnectContext(upstream)))
+            await asyncio.wait_for(turn_proxy.handler(client), timeout=2)
+
+    async def test_exact_trust_write_normalizes_only_reload_and_preserves_reply(self):
+        for reload in (True, False, "absent"):
+            with self.subTest(reload=reload), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, ticket, _ = self.ticket(root)
+                request = self.request(ticket["workspace"]["path"])
+                request["jsonrpc"] = "2.0"
+                if reload == "absent":
+                    request["params"].pop("reloadUserConfig")
+                else:
+                    request["params"]["reloadUserConfig"] = reload
+                reply = {"id": 7, "result": {"version": "new-version", "filePath": "/config.toml"}}
+                upstream = ReplyUpstream(lambda _request: reply)
+                client = FakeClient(request, f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, client, upstream)
+                expected = json.loads(json.dumps(request))
+                expected["params"]["reloadUserConfig"] = False
+                self.assertEqual(upstream.sent, [expected])
+                self.assertEqual(client.sent, [reply])
+                self.assertTrue((root / "launch-tickets" / f'trust-{ticket["trust_grant"]}.spent.json').exists())
+
+    async def test_malformed_or_unrelated_writes_never_forward_or_spend(self):
+        mutations = {
+            "mixed": lambda r: r["params"]["edits"].append({"keyPath": "model", "value": "other", "mergeStrategy": "replace"}),
+            "empty": lambda r: r["params"].update(edits=[]),
+            "parent": lambda r: r["params"]["edits"][0].update(keyPath=turn_proxy.trust_edit_key_path("/tmp")),
+            "descendant": lambda r: r["params"]["edits"][0].update(keyPath=r["params"]["edits"][0]["keyPath"].replace('.trust_level', '.child.trust_level')),
+            "bare-key": lambda r: r["params"]["edits"][0].update(keyPath="projects.tmp.trust_level"),
+            "untrusted": lambda r: r["params"]["edits"][0].update(value="untrusted"),
+            "nonstring": lambda r: r["params"]["edits"][0].update(value=True),
+            "upsert": lambda r: r["params"]["edits"][0].update(mergeStrategy="upsert"),
+            "extra-edit-field": lambda r: r["params"]["edits"][0].update(extra=True),
+            "extra-param": lambda r: r["params"].update(extra=True),
+            "extra-request": lambda r: r.update(extra=True),
+            "other-file": lambda r: r["params"].update(filePath="/elsewhere.toml"),
+            "version": lambda r: r["params"].update(expectedVersion="sha256:other"),
+            "reload-int": lambda r: r["params"].update(reloadUserConfig=1),
+            "reload-null": lambda r: r["params"].update(reloadUserConfig=None),
+            "notification": lambda r: r.pop("id"),
+            "null-id": lambda r: r.update(id=None),
+            "generic-write": lambda r: r.update(method="config/value/write"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, ticket, _ = self.ticket(root)
+                request = self.request(ticket["workspace"]["path"])
+                mutate(request)
+                client = BurstClient([request, {"id": 99, "method": "config/read", "params": {}}],
+                                     f"Bearer token.launch-{ticket_id}")
+                upstream = ReplyUpstream()
+                await self.relay(root, client, upstream)
+                self.assertEqual([r["method"] for r in upstream.sent], ["config/read"])
+                self.assertTrue((root / "launch-tickets" / f'trust-{ticket["trust_grant"]}.json').exists())
+        self.assertEqual(protocol_policy.classify("config/batchWrite"), "unknown")
+        self.assertEqual(protocol_policy.classify("config/value/write"), "unknown")
+
+    async def test_no_launcher_authority_or_legacy_ticket_never_grants_trust(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ticket_id, ticket, path = self.ticket(root)
+            legacy = {"created_at": time.time(), "model": "gpt-6.1-sol", "effort": "low",
+                      "servers": [], "workspace": ticket["workspace"], "trust_grant": ticket["trust_grant"]}
+            path.write_text(json.dumps(legacy))
+            for authorization in ("Bearer token", "Bearer token.explicit-both", f"Bearer token.launch-{ticket_id}"):
+                client = FakeClient(self.request(ticket["workspace"]["path"]), authorization)
+                upstream = ReplyUpstream()
+                await self.relay(root, client, upstream)
+                self.assertEqual(upstream.sent, [])
+                self.assertIn("error", client.sent[0])
+
+    async def test_replay_across_connections_and_host_failure_remain_spent(self):
+        for fail in (False, True, "disconnect"):
+            with self.subTest(fail=fail), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, ticket, _ = self.ticket(root)
+                request = self.request(ticket["workspace"]["path"])
+                upstream = ReplyUpstream(lambda r: {"id": r["id"], "error": {"code": -1, "message": "host failure"}}
+                                         if fail else {"id": r["id"], "result": {}})
+                if fail == "disconnect":
+                    upstream.send = AsyncMock(side_effect=ConnectionError("disconnected"))
+                client = FakeClient(request, f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, client, upstream)
+                again = ReplyUpstream()
+                replay = FakeClient(request, f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, replay, again)
+                self.assertEqual(again.sent, [])
+                self.assertIn("error", replay.sent[0])
+
+    def test_atomic_grant_claim_has_one_winner(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, ticket, _ = self.ticket(root)
+            with patch.object(turn_proxy, "ROOT", root), ThreadPoolExecutor(max_workers=8) as workers:
+                results = list(workers.map(turn_proxy.spend_trust_grant, [ticket["trust_grant"]] * 8))
+            self.assertEqual(sum(result is not None for result in results), 1)
+
+    async def test_two_handlers_racing_share_one_trust_grant(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ticket_id, ticket, _ = self.ticket(root)
+            request = self.request(ticket["workspace"]["path"])
+            clients = [FakeClient(request, f"Bearer token.launch-{ticket_id}") for _ in range(2)]
+            upstreams = [ReplyUpstream() for _ in range(2)]
+            with patch.object(turn_proxy, "ROOT", root), \
+                 patch.object(turn_proxy, "_read_token", return_value="token"), \
+                 patch.object(turn_proxy.websockets, "connect",
+                              side_effect=[ConnectContext(upstream) for upstream in upstreams]):
+                await asyncio.wait_for(asyncio.gather(*(turn_proxy.handler(client) for client in clients)), timeout=2)
+            self.assertEqual(sum(len(upstream.sent) for upstream in upstreams), 1)
+            self.assertEqual(sum("error" in client.sent[0] for client in clients), 1)
+
+    async def test_grant_spends_before_all_lifecycle_rejections(self):
+        for method in sorted(protocol_policy.TRUST_SPENDING_METHODS):
+            for blocked in (False, True):
+                with self.subTest(method=method, blocked=blocked), TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    choice = {"model": "gpt-6.1-sol", "effort": "low", "servers": []}
+                    ticket_id, ticket, _ = self.ticket(root, choice=choice)
+                    first = {"id": 1, "method": method, "params": {"config": []}}
+                    client = FakeClient([first, self.request(ticket["workspace"]["path"])],
+                                        f"Bearer token.launch-{ticket_id}")
+                    upstream = ReplyUpstream()
+                    await self.relay(root, client, upstream, blocked=blocked)
+                    self.assertEqual(upstream.sent, [])
+                    self.assertTrue((root / "launch-tickets" / f'trust-{ticket["trust_grant"]}.spent.json').exists())
+                    self.assertEqual(len(client.sent), 2)
+                    self.assertTrue(all("error" in reply for reply in client.sent))
+
+    async def test_duplicate_id_guard_precedes_lifecycle_spend(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ticket_id, ticket, _ = self.ticket(root)
+            requests = [{"id": 1, "method": "config/read", "params": {}},
+                        {"id": 1, "method": "thread/fork", "params": {}},
+                        self.request(ticket["workspace"]["path"])]
+            client = BurstClient(requests, f"Bearer token.launch-{ticket_id}")
+            upstream = ReplyUpstream()
+            await self.relay(root, client, upstream)
+            self.assertEqual([r["method"] for r in upstream.sent], ["config/read", "config/batchWrite"])
+            self.assertTrue(any(r.get("error", {}).get("code") == -32600 for r in client.sent))
+
+    async def test_expiry_while_waiting_and_future_or_invalid_grant_rejected(self):
+        for created_at in (time.time() - 301, time.time() + 600, float("nan"), True):
+            with self.subTest(created_at=created_at), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, ticket, _ = self.ticket(root)
+                grant_path = root / "launch-tickets" / f'trust-{ticket["trust_grant"]}.json'
+                grant = json.loads(grant_path.read_text())
+                grant["created_at"] = created_at
+                grant_path.write_text(json.dumps(grant))
+                client = FakeClient(self.request(ticket["workspace"]["path"]), f"Bearer token.launch-{ticket_id}")
+                upstream = ReplyUpstream()
+                await self.relay(root, client, upstream)
+                self.assertEqual(upstream.sent, [])
+                self.assertIn("error", client.sent[0])
+
+    async def test_workspace_redirection_and_inode_replacement_fail_closed(self):
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, ticket, _ = self.ticket(root)
+                workspace = Path(ticket["workspace"]["path"])
+                workspace.rename(root / "original")
+                if symlink:
+                    workspace.symlink_to(root / "original", target_is_directory=True)
+                else:
+                    workspace.mkdir()
+                upstream = ReplyUpstream()
+                client = FakeClient(self.request(str(workspace)), f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, client, upstream)
+                self.assertEqual(upstream.sent, [])
+                self.assertIn("error", client.sent[0])
+
+    async def test_grant_expires_while_connected_at_confirmation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(model_host_launcher.time, "time", return_value=1000):
+                ticket_id, ticket, _ = self.ticket(root)
+            client = FakeClient(self.request(ticket["workspace"]["path"]), f"Bearer token.launch-{ticket_id}")
+            upstream = ReplyUpstream()
+            with patch.object(turn_proxy.time, "time", side_effect=[1000, 1301]):
+                await self.relay(root, client, upstream)
+            self.assertEqual(upstream.sent, [])
+            self.assertIn("error", client.sent[0])
+
+    async def test_symlink_or_mismatched_grant_does_not_forward(self):
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, ticket, _ = self.ticket(root)
+                path = root / "launch-tickets" / f'trust-{ticket["trust_grant"]}.json'
+                payload = json.loads(path.read_text())
+                payload["ticket"] = "f" * 32
+                path.write_text(json.dumps(payload))
+                if symlink:
+                    path.rename(root / "other.json")
+                    path.symlink_to(root / "other.json")
+                upstream = ReplyUpstream()
+                client = FakeClient(self.request(ticket["workspace"]["path"]), f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, client, upstream)
+                self.assertEqual(upstream.sent, [])
+                self.assertIn("error", client.sent[0])
+
+    def test_ticket_shapes_expiry_and_legacy_never_add_trust(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, ticket, _ = self.ticket(root)
+            self.assertIsNone(turn_proxy.parse_launch_ticket(ticket, time.time())["choice"])
+            omitted = {k: v for k, v in ticket.items() if k not in {"model", "effort", "servers"}}
+            self.assertIsNone(turn_proxy.parse_launch_ticket(omitted, time.time())["choice"])
+            full = {**ticket, "model": "gpt-6.1-sol", "effort": "low", "servers": []}
+            self.assertEqual(turn_proxy.parse_launch_ticket(full, time.time())["choice"]["model"], "gpt-6.1-sol")
+            for mutation in ({"model": "gpt-6.1-sol"}, {"servers": []}, {"extra": True},
+                             {"created_at": time.time() - 301}, {"created_at": time.time() + 600},
+                             {"created_at": float("nan")}, {"created_at": True}, {"explicit_model": 1}):
+                with self.subTest(mutation=mutation):
+                    self.assertIsNone(turn_proxy.parse_launch_ticket({**ticket, **mutation}, time.time()))
+            legacy = {"created_at": time.time(), "model": "gpt-6.1-sol", "effort": "low", "servers": [],
+                      "workspace": ticket["workspace"], "trust_grant": ticket["trust_grant"]}
+            self.assertIsNone(turn_proxy.parse_launch_ticket(legacy, time.time())["workspace"])
+            self.assertIsNone(turn_proxy.parse_launch_ticket(legacy, time.time())["trust_grant"])
+            self.assertIsNone(turn_proxy.parse_launch_ticket({**legacy, "created_at": time.time() + 600}, time.time()))
+
+    async def test_promptless_real_handler_binds_only_host_confirmed_pins(self):
+        thread_id = "00000000-0000-4000-8000-000000000044"
+        for model, effort in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(model=model, effort=effort), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, _, _ = self.ticket(root, model=model, effort=effort)
+                request = {"id": 2, "method": "thread/start", "params": {
+                    "cwd": str(root), "model": "gpt-6.1-sol", "config": {"model_reasoning_effort": "low"}}}
+                reply = {"id": 2, "result": {"thread": {"id": thread_id}, "model": "gpt-6.1-sol", "reasoningEffort": "low"}}
+                upstream = ReplyUpstream(lambda _r: reply)
+                client = FakeClient(request, f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, client, upstream)
+                self.assertEqual(upstream.sent, [request])
+                self.assertEqual(client.sent, [reply])
+                with patch.object(authority, "ROOT", root):
+                    payload = json.loads(authority.path_for(thread_id).read_text())
+                self.assertEqual(payload["model"], "gpt-6.1-sol" if model else None)
+                self.assertEqual(payload["effort"], "low" if effort else None)
+                self.assertEqual(payload["explicit_model"], model)
+                self.assertEqual(payload["explicit_effort"], effort)
+
+    async def test_promptless_missing_invalid_mismatched_pins_fail_closed(self):
+        thread_id = "00000000-0000-4000-8000-000000000045"
+        for fields in ({"model": "different", "reasoningEffort": "low"},
+                       {"model": "gpt-6.1-sol", "reasoningEffort": "high"},
+                       {"model": "gpt-6.1-sol"}, {"model": 1, "reasoningEffort": "low"},
+                       {"model": "gpt-6.1-sol", "reasoningEffort": "invalid"}):
+            with self.subTest(fields=fields), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, _, _ = self.ticket(root, model=True, effort=True)
+                request = {"id": 2, "method": "thread/start", "params": {
+                    "model": "gpt-6.1-sol", "config": {"model_reasoning_effort": "low"}}}
+                upstream = ReplyUpstream(lambda _r: {"id": 2, "result": {"thread": {"id": thread_id}, **fields}})
+                client = FakeClient(request, f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, client, upstream)
+                self.assertEqual(upstream.sent, [request])
+                self.assertIn("error", client.sent[0])
+                with patch.object(authority, "ROOT", root):
+                    self.assertFalse(authority.path_for(thread_id).exists())
+
+    async def test_mixed_shape_ticket_is_rejected_before_connecting(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ticket_id, ticket, path = self.ticket(root)
+            ticket["model"] = "gpt-6.1-sol"
+            path.write_text(json.dumps(ticket))
+            client = FakeClient({"id": 2, "method": "thread/start", "params": {}}, f"Bearer token.launch-{ticket_id}")
+            upstream = ReplyUpstream()
+            await self.relay(root, client, upstream)
+            self.assertEqual(upstream.sent, [])
+            self.assertTrue(client.done.is_set())
+
+    async def test_promptless_explicit_pin_without_cli_value_fails_closed(self):
+        thread_id = "00000000-0000-4000-8000-000000000046"
+        for params in ({}, {"model": "gpt-6.1-sol"}, {"config": {"model_reasoning_effort": "low"}}):
+            with self.subTest(params=params), TemporaryDirectory() as directory:
+                root = Path(directory)
+                ticket_id, _, _ = self.ticket(root, model=True, effort=True)
+                request = {"id": 2, "method": "thread/start", "params": params}
+                upstream = ReplyUpstream(lambda _r: {"id": 2, "result": {
+                    "thread": {"id": thread_id}, "model": "gpt-6.1-sol", "reasoningEffort": "low"}})
+                client = FakeClient(request, f"Bearer token.launch-{ticket_id}")
+                await self.relay(root, client, upstream)
+                self.assertIn("error", client.sent[0])
+                with patch.object(authority, "ROOT", root):
+                    self.assertFalse(authority.path_for(thread_id).exists())
 
 
 if __name__ == "__main__":

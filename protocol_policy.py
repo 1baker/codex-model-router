@@ -39,6 +39,12 @@ OWNER_MUTATION_METHODS = {
 
 REJECTED_INFERENCE_METHODS = {"review/start", "thread/compact/start", "thread/fork"}
 
+# Config writes stay "unknown" and denied. The proxy handles only this method,
+# before the generic denial, for one launcher-granted workspace trust edit.
+TRUST_WRITE_METHOD = "config/batchWrite"
+# Any of these spends a connection's unused trust grant before other checks.
+TRUST_SPENDING_METHODS = {"thread/start", "thread/resume", "thread/fork", "turn/start"}
+
 
 def classify(method: object) -> str:
     if method in READ_ONLY_METHODS:

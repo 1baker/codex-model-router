@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -103,7 +104,8 @@ from authority import (AuthorityError, acquire_lock as acquire_authority_lock_sy
                        initialize_locked as initialize_authority_locked,
                        path_for as authority_path, read_locked as read_authority_locked,
                        update_locked as update_authority_locked)
-from protocol_policy import classify as classify_protocol_method
+from protocol_policy import (TRUST_SPENDING_METHODS, TRUST_WRITE_METHOD,
+                             classify as classify_protocol_method)
 import receipt_journal
 from outcome_model import (capture_codex_result, capture_codex_steer,
                            capture_codex_turn, prepare_codex_prompt)
@@ -122,6 +124,14 @@ BACKGROUND_TASKS: set[asyncio.Task] = set()
 UNRESOLVED_FILE = ROOT / f"proxy-unresolved-{PROXY_PORT}.state"
 ACCOUNTING_BLOCKED = False
 ACCOUNTING_FAILURES: set[str] = set()
+LAUNCH_TICKET_SECONDS = 5 * 60
+LAUNCH_TICKET_SCHEMA = "modellabs.launch_ticket.v2"
+LAUNCH_TICKET_KEYS = {"schema", "created_at", "model", "effort", "servers", "explicit_model",
+                      "explicit_effort", "workspace", "trust_grant"}
+TRUST_GRANT_SCHEMA = "modellabs.trust_grant.v1"
+TRUST_GRANT_KEYS = {"schema", "created_at", "ticket", "workspace"}
+TRUST_WRITE_DENIED = ("ModelLabs denies configuration writes other than the launch-bound "
+                      "workspace trust confirmation.")
 
 
 def record_metric(event: str, *, _accounting_claim: str | None = None, **fields: Any) -> None:
@@ -211,6 +221,175 @@ def apply_launch_choice(raw: str, choice: dict[str, Any] | None) -> str:
         return json.dumps(request)
     except (json.JSONDecodeError, TypeError, KeyError):
         return raw
+
+
+def _is_number(value: object) -> bool:
+    try:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value))
+    except OverflowError:
+        return False
+
+
+def _valid_workspace(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"path", "dev", "ino"}:
+        return False
+    path = value["path"]
+    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+        return False
+    try:
+        path.encode("utf-8")
+    except UnicodeError:
+        return False
+    return (not any(ord(character) < 0x20 or 0x7f <= ord(character) <= 0x9f for character in path)
+            and all(isinstance(value[key], int) and not isinstance(value[key], bool)
+                    for key in ("dev", "ino")))
+
+
+def parse_launch_ticket(payload: object, now: float) -> dict[str, Any] | None:
+    """Accept a legacy route ticket or a v2 launch ticket, never a mixed shape.
+
+    Legacy tickets keep their route-only meaning and never carry trust. A v2
+    ticket has either a complete routing choice or none at all. Both shapes
+    expire five minutes after launch; relaunch instead of extending authority.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if "schema" not in payload:
+        created_at = payload.get("created_at")
+        if (not _is_number(created_at) or not 0 <= now - created_at <= LAUNCH_TICKET_SECONDS
+                or not isinstance(payload.get("model"), str)
+                or not isinstance(payload.get("effort"), str)
+                or not isinstance(payload.get("servers"), list)
+                or not isinstance(payload.get("explicit_model", False), bool)
+                or not isinstance(payload.get("explicit_effort", False), bool)):
+            return None
+        return {"choice": {"model": payload["model"], "effort": payload["effort"],
+                           "servers": payload["servers"]},
+                "explicit_model": payload.get("explicit_model", False),
+                "explicit_effort": payload.get("explicit_effort", False),
+                "workspace": None, "trust_grant": None}
+    required = LAUNCH_TICKET_KEYS - {"model", "effort", "servers"}
+    if (payload.get("schema") != LAUNCH_TICKET_SCHEMA
+            or not required <= set(payload) <= LAUNCH_TICKET_KEYS):
+        return None
+    created_at = payload["created_at"]
+    if (not _is_number(created_at) or not 0 <= now - created_at <= LAUNCH_TICKET_SECONDS
+            or not isinstance(payload["explicit_model"], bool)
+            or not isinstance(payload["explicit_effort"], bool)):
+        return None
+    model, effort, servers = (payload.get(key) for key in ("model", "effort", "servers"))
+    if model is None and effort is None and servers is None:
+        choice = None
+    elif (isinstance(model, str) and model and isinstance(effort, str) and effort
+          and isinstance(servers, list) and all(isinstance(item, str) for item in servers)):
+        choice = {"model": model, "effort": effort, "servers": servers}
+    else:
+        return None
+    workspace, grant = payload["workspace"], payload["trust_grant"]
+    if workspace is None and grant is None:
+        pass
+    elif not (_valid_workspace(workspace) and isinstance(grant, str)
+              and re.fullmatch(r"[0-9a-f]{32}", grant)):
+        return None
+    return {"choice": choice, "explicit_model": payload["explicit_model"],
+            "explicit_effort": payload["explicit_effort"],
+            "workspace": workspace, "trust_grant": grant}
+
+
+def trust_edit_key_path(workspace: str) -> str:
+    """Quote the workspace as the upstream TUI does for its trust keyPath."""
+    escaped = workspace.replace("\\", "\\\\").replace('"', '\\"')
+    return f'projects."{escaped}".trust_level'
+
+
+def trust_write_request(request: dict[str, Any], workspace: str) -> dict[str, Any]:
+    """Validate exactly one trust edit and return it with reload disabled.
+
+    Reloading user config would change loaded threads, so the only change is
+    reloadUserConfig=false. Every other field is forwarded unchanged.
+    """
+    if not {"id", "method", "params"} <= set(request) <= {"jsonrpc", "id", "method", "params"}:
+        raise ValueError("unexpected request fields")
+    if "jsonrpc" in request and request["jsonrpc"] != "2.0":
+        raise ValueError("unexpected jsonrpc version")
+    request_id = request["id"]
+    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+        raise ValueError("trust confirmation requires a request id")
+    params = request["params"]
+    if (not isinstance(params, dict) or "edits" not in params
+            or not set(params) <= {"edits", "filePath", "expectedVersion", "reloadUserConfig"}):
+        raise ValueError("unexpected trust write parameters")
+    if params.get("filePath") is not None or params.get("expectedVersion") is not None:
+        raise ValueError("trust confirmation may not target another config file or version")
+    if "reloadUserConfig" in params and not isinstance(params["reloadUserConfig"], bool):
+        raise ValueError("reloadUserConfig must be a boolean")
+    edits = params["edits"]
+    if not isinstance(edits, list) or len(edits) != 1:
+        raise ValueError("trust confirmation must contain exactly one edit")
+    edit = edits[0]
+    if (not isinstance(edit, dict) or set(edit) != {"keyPath", "value", "mergeStrategy"}
+            or not isinstance(edit["keyPath"], str)
+            or edit["keyPath"] != trust_edit_key_path(workspace)
+            or not isinstance(edit["value"], str) or edit["value"] != "trusted"
+            or not isinstance(edit["mergeStrategy"], str) or edit["mergeStrategy"] != "replace"):
+        raise ValueError("only the launch workspace may be marked trusted")
+    return {**request, "params": {**params, "reloadUserConfig": False}}
+
+
+def spend_trust_grant(grant_id: str) -> Path | None:
+    """Claim a grant once across connections; it stays spent after any failure."""
+    directory = ROOT / "launch-tickets"
+    spent = directory / f"trust-{grant_id}.spent.json"
+    try:
+        os.rename(directory / f"trust-{grant_id}.json", spent)
+    except OSError:
+        return None
+    return spent
+
+
+def verify_claimed_trust_grant(spent: Path, ticket_id: str, workspace: dict[str, Any],
+                               now: float) -> None:
+    """Revalidate a claimed grant and the live workspace identity before forwarding."""
+    descriptor = os.open(spent, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024
+                or info.st_uid != os.getuid()):
+            raise ValueError("invalid trust grant")
+        grant = json.load(handle)
+    if (not isinstance(grant, dict) or set(grant) != TRUST_GRANT_KEYS
+            or grant["schema"] != TRUST_GRANT_SCHEMA or grant["ticket"] != ticket_id
+            or grant["workspace"] != workspace or not _valid_workspace(grant["workspace"])):
+        raise ValueError("trust grant does not match this launch")
+    created_at = grant["created_at"]
+    if not _is_number(created_at) or created_at > now or now - created_at > LAUNCH_TICKET_SECONDS:
+        raise ValueError("trust grant expired")
+    path = workspace["path"]
+    current = os.lstat(path)
+    if (not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino)
+            != (workspace["dev"], workspace["ino"]) or os.path.realpath(path) != path):
+        raise ValueError("launch workspace identity changed")
+
+
+def host_pinned_settings(result: dict[str, Any], requested: tuple[Any, Any],
+                         explicit_model: bool, explicit_effort: bool) -> tuple[str | None, str | None]:
+    """Pin only what the host accepted for a promptless start; never invent a value."""
+    pins: list[str | None] = []
+    for explicit, accepted, supplied, name in (
+            (explicit_model, result.get("model"), requested[0], "model"),
+            (explicit_effort, result.get("reasoningEffort"), requested[1], "reasoning effort")):
+        if not explicit:
+            pins.append(None)
+            continue
+        if not isinstance(supplied, str) or not supplied:
+            raise ValueError(f"CLI did not supply the explicit {name}")
+        if not isinstance(accepted, str) or not accepted:
+            raise ValueError(f"host did not confirm the explicit {name}")
+        if supplied != accepted:
+            raise ValueError(f"host {name} differs from the requested explicit {name}")
+        pins.append(accepted)
+    return pins[0], pins[1]
 
 
 async def previous_task(thread_id: str, token: str) -> tuple[str | None, str]:
@@ -821,24 +1000,24 @@ async def handler(client: websockets.ServerConnection) -> None:
     }
     client_mode = modes.get(authorization)
     launch_choice = None
+    launch_ticket = None
+    trust_grant = None
     launch_match = re.fullmatch(rf"Bearer {re.escape(token)}\.launch-([0-9a-f]{{32}})",
                                 authorization or "")
     if launch_match:
         ticket = ROOT / "launch-tickets" / f"{launch_match.group(1)}.json"
         try:
-            launch_choice = json.loads(ticket.read_text(encoding="utf-8"))
-            if time.time() - float(launch_choice["created_at"]) > 5 * 60:
-                launch_choice = None
-            elif (not isinstance(launch_choice.get("model"), str)
-                  or not isinstance(launch_choice.get("effort"), str)
-                  or not isinstance(launch_choice.get("servers"), list)
-                  or not isinstance(launch_choice.get("explicit_model", False), bool)
-                  or not isinstance(launch_choice.get("explicit_effort", False), bool)):
-                launch_choice = None
+            launch_ticket = parse_launch_ticket(
+                json.loads(ticket.read_text(encoding="utf-8")), time.time())
         except (OSError, ValueError, TypeError, KeyError):
-            launch_choice = None
-        if launch_choice is not None:
-            client_mode = "preselected"
+            launch_ticket = None
+        if launch_ticket is not None:
+            launch_choice = launch_ticket["choice"]
+            # A promptless ticket preselects nothing; only its pin flags apply.
+            client_mode = "preselected" if launch_choice is not None else "default"
+            if launch_ticket["trust_grant"] is not None:
+                trust_grant = {"id": launch_ticket["trust_grant"], "ticket": launch_match.group(1),
+                               "workspace": launch_ticket["workspace"]}
     if client_mode is None:
         await client.close(code=1008, reason="authentication required")
         return
@@ -849,8 +1028,9 @@ async def handler(client: websockets.ServerConnection) -> None:
         preserve_cli_effort = client_mode in {"explicit-effort", "explicit-both"}
         initial_preselection_available = client_mode == "preselected"
         launch_scope_available = launch_choice is not None
-        ticket_explicit_model = bool((launch_choice or {}).get("explicit_model"))
-        ticket_explicit_effort = bool((launch_choice or {}).get("explicit_effort"))
+        ticket_explicit_model = bool((launch_ticket or {}).get("explicit_model"))
+        ticket_explicit_effort = bool((launch_ticket or {}).get("explicit_effort"))
+        start_settings: dict[object, tuple[Any, Any]] = {}
         manual_model_threads: set[str] = set()
         manual_effort_threads: set[str] = set()
         active: dict[tuple[str, str], dict[str, Any]] = {}
@@ -944,6 +1124,7 @@ async def handler(client: websockets.ServerConnection) -> None:
             try:
                 if abandon:
                     pending.pop(request_id, None)
+                    start_settings.pop(request_id, None)
                     ownership_pending.discard(request_id)
                     update = authority_pending.pop(request_id, None)
                     if update is not None:
@@ -1017,6 +1198,7 @@ async def handler(client: websockets.ServerConnection) -> None:
 
         async def inbound() -> None:
             nonlocal catalog, catalog_at, initial_preselection_available, launch_scope_available
+            nonlocal trust_grant
             async for raw in client:
                 try:
                     ping = json.loads(raw)
@@ -1026,17 +1208,6 @@ async def handler(client: websockets.ServerConnection) -> None:
                         continue
                 except (TypeError, ValueError, AttributeError):
                     pass
-                try:
-                    raw = apply_launch_choice(raw, launch_choice if launch_scope_available else None)
-                except ValueError as exc:
-                    try:
-                        request_id = json.loads(raw).get("id")
-                    except (TypeError, ValueError, AttributeError):
-                        request_id = None
-                    if request_id is not None:
-                        await client.send(json.dumps({"id": request_id, "error": {
-                            "code": -32005, "message": f"ModelLabs rejected thread configuration: {exc}"}}))
-                    continue
                 context = None
                 context_lookup_status = "not_needed"
                 params: dict[str, Any] = {}
@@ -1060,6 +1231,32 @@ async def handler(client: websockets.ServerConnection) -> None:
                         await client.send(json.dumps({"id": request_id, "error": {
                             "code": -32600, "message": "ModelLabs rejects duplicate outstanding request IDs."}}))
                         continue
+                    if method in TRUST_SPENDING_METHODS and trust_grant is not None:
+                        # Trust can only be confirmed before the first thread
+                        # transition, whatever later checks decide about it.
+                        spend_trust_grant(trust_grant["id"])
+                        trust_grant = None
+                    if method == TRUST_WRITE_METHOD:
+                        try:
+                            if trust_grant is None:
+                                raise ValueError(TRUST_WRITE_DENIED)
+                            forwarded = trust_write_request(request, trust_grant["workspace"]["path"])
+                            grant, trust_grant = trust_grant, None
+                            spent = spend_trust_grant(grant["id"])
+                            if spent is None:
+                                raise ValueError("trust grant was already spent")
+                            verify_claimed_trust_grant(spent, grant["ticket"], grant["workspace"],
+                                                       time.time())
+                        except (TypeError, ValueError, KeyError, OSError) as exc:
+                            if request_id is not None:
+                                detail = "" if str(exc) == TRUST_WRITE_DENIED else f" {exc}"
+                                await client.send(json.dumps({"id": request_id, "error": {
+                                    "code": -32601, "message": TRUST_WRITE_DENIED + detail}}))
+                            continue
+                        request_ledger[request_id] = {"method": method, "thread_id": None,
+                                                      "forwarded": False}
+                        await upstream.send(json.dumps(forwarded))
+                        continue
                     if policy == "unknown":
                         if request_id is not None:
                             await client.send(json.dumps({"id": request_id, "error": {
@@ -1077,6 +1274,15 @@ async def handler(client: websockets.ServerConnection) -> None:
                                 "message": "ModelLabs accounting persistence is unhealthy; admission is fail-closed."}}))
                         continue
                     if method == "thread/start":
+                        try:
+                            raw = apply_launch_choice(raw, launch_choice if launch_scope_available else None)
+                            params = json.loads(raw).get("params", {})
+                        except ValueError as exc:
+                            if request_id is not None:
+                                await client.send(json.dumps({"id": request_id, "error": {
+                                    "code": -32005,
+                                    "message": f"ModelLabs rejected thread configuration: {exc}"}}))
+                            continue
                         launch_scope_available = False
                     if method == "thread/resume" and isinstance(params, dict):
                         if params.get("history") is not None or params.get("path") is not None:
@@ -1121,6 +1327,11 @@ async def handler(client: websockets.ServerConnection) -> None:
                         if request_id is not None:
                             begin_admission(request_id, resume_thread, method)
                     if method == "thread/start" and request_id is not None:
+                        start_config = params.get("config") if isinstance(params, dict) else None
+                        start_settings[request_id] = (
+                            params.get("model") if isinstance(params, dict) else None,
+                            start_config.get("model_reasoning_effort")
+                            if isinstance(start_config, dict) else None)
                         ownership_pending.add(request_id)
                         # The created thread ID is unknown until the response.
                         begin_lifecycle(request_id, method)
@@ -1412,15 +1623,22 @@ async def handler(client: websockets.ServerConnection) -> None:
                     if rpc_response and response_id in ownership_pending:
                         ownership_pending.discard(response_id)
                         thread_id = ((response.get("result") or {}).get("thread") or {}).get("id")
+                        requested_settings = start_settings.pop(response_id, (None, None))
                         ownership_settled = False
                         if thread_id:
                             try:
                                 lifecycle_id = request_lifecycles[response_id]
                                 owner_descriptors[thread_id] = acquire_thread_ownership(
                                     thread_id, existing_thread=False)
+                                if launch_choice is not None:
+                                    authority_model = launch_choice["model"]
+                                    authority_effort = launch_choice["effort"]
+                                else:
+                                    authority_model, authority_effort = host_pinned_settings(
+                                        response.get("result") or {}, requested_settings,
+                                        ticket_explicit_model, ticket_explicit_effort)
                                 write_choice_authority(
-                                    thread_id, (launch_choice or {}).get("model"),
-                                    (launch_choice or {}).get("effort"),
+                                    thread_id, authority_model, authority_effort,
                                     explicit_model=ticket_explicit_model,
                                     explicit_effort=ticket_explicit_effort, initialize=True)
                                 ownership_settled = True

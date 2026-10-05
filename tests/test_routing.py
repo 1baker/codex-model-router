@@ -483,7 +483,10 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(result, json.loads((codex_home / "hooks.json").read_text(encoding="utf-8")))
 
     def test_bare_codex_starts_tui_without_reading_prompt(self):
-        with patch.object(sys, "argv", ["codex"]), \
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory, \
+             patch.object(model_host_launcher, "ROOT", Path(directory)), \
+             patch.object(sys, "argv", ["codex"]), \
              patch.object(model_host_launcher, "_read_token", return_value="token"), \
              patch.object(model_host_launcher, "ensure_proxy"), \
              patch.object(model_host_launcher, "ensure_proxy_supervisor"), \
@@ -491,11 +494,17 @@ class RoutingTests(unittest.TestCase):
              patch.object(model_host_launcher, "_route_choice", side_effect=AssertionError("prompt read")), \
              patch.object(model_host_launcher.os, "execve") as launch:
             model_host_launcher.main()
+            tickets = list((Path(directory) / "launch-tickets").glob("*.json"))
+            payloads = [json.loads(path.read_text()) for path in tickets]
+            ticket = next(item for item in payloads if item["schema"] == "modellabs.launch_ticket.v2")
+            self.assertIsNone(ticket["model"])
+            self.assertIsNone(ticket["effort"])
+            self.assertIsNone(ticket["servers"])
         binary, args, environment = launch.call_args.args
         self.assertEqual(binary, Path("/real/codex"))
         self.assertEqual(args, ["/real/codex", "--remote", model_host_launcher.PROXY_URL,
                                 "--remote-auth-token-env", "MODEL_SELECTOR_HOST_TOKEN"])
-        self.assertEqual(environment["MODEL_SELECTOR_HOST_TOKEN"], "token")
+        self.assertRegex(environment["MODEL_SELECTOR_HOST_TOKEN"], r"^token\.launch-[0-9a-f]{32}$")
 
     def test_managed_resume_imports_a_closed_standalone_thread_before_launch(self):
         from tempfile import TemporaryDirectory
@@ -773,6 +782,84 @@ class RoutingTests(unittest.TestCase):
             payload = json.loads((Path(directory) / "launch-tickets" / f"{ticket}.json").read_text())
             self.assertFalse(payload["explicit_model"])
             self.assertTrue(payload["explicit_effort"])
+
+    def test_launch_workspace_exact_identity_and_alias_rejections(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / 'project.quoted"back\\slash'
+            workspace.mkdir()
+            info = workspace.stat()
+            for args in (["-C", str(workspace)], ["--cd", str(workspace)],
+                         [f"--cd={workspace}"]):
+                with self.subTest(args=args):
+                    self.assertEqual(model_host_launcher._launch_workspace(args),
+                                     {"path": str(workspace), "dev": info.st_dev, "ino": info.st_ino})
+            alias = root / "alias"
+            alias.symlink_to(workspace, target_is_directory=True)
+            for selected in (str(alias), str(workspace) + "/", str(root) + "/./project",
+                             str(root) + "/bad\npath", str(root) + "/bad\udcffpath"):
+                with self.subTest(selected=repr(selected)):
+                    self.assertIsNone(model_host_launcher._launch_workspace(["-C", selected]))
+            with patch.object(model_host_launcher.os, "getcwd", return_value=str(workspace)):
+                self.assertEqual(model_host_launcher._launch_workspace([])["path"], str(workspace))
+                self.assertEqual(model_host_launcher._launch_workspace(["--", "--cd=/other"])["path"], str(workspace))
+                self.assertEqual(model_host_launcher._launch_workspace(["-c", "--cd=/other"])["path"], str(workspace))
+                self.assertIsNone(model_host_launcher._launch_workspace(["-C" + str(workspace)]))
+
+    def test_launch_tickets_and_grants_are_private_and_cleanup_compatible(self):
+        from tempfile import TemporaryDirectory
+        import proxy_supervisor
+        with TemporaryDirectory() as directory, \
+             patch.object(model_host_launcher, "ROOT", Path(directory)):
+            root = Path(directory)
+            workspace = model_host_launcher._launch_workspace(["-C", str(root)])
+            ticket_id = _create_launch_ticket(None, explicit_model=True, explicit_effort=True,
+                                            workspace=workspace)
+            ticket_path = root / "launch-tickets" / f"{ticket_id}.json"
+            ticket = json.loads(ticket_path.read_text())
+            grant_path = root / "launch-tickets" / f'trust-{ticket["trust_grant"]}.json'
+            self.assertEqual(ticket["workspace"], workspace)
+            self.assertEqual(json.loads(grant_path.read_text())["ticket"], ticket_id)
+            self.assertEqual(ticket_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(grant_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(ticket_path.parent.stat().st_mode & 0o777, 0o700)
+            with patch.object(turn_proxy_module, "ROOT", root):
+                spent = turn_proxy_module.spend_trust_grant(ticket["trust_grant"])
+            old = __import__("time").time() - 25 * 60 * 60
+            for path in (ticket_path, spent):
+                os.utime(path, (old, old))
+            with patch.object(proxy_supervisor, "ROOT", root):
+                proxy_supervisor.remove_expired_launch_tickets()
+            self.assertEqual(list(ticket_path.parent.glob("*.json")), [])
+
+    def test_new_launch_forms_mint_one_ticket_without_inventing_promptless_route(self):
+        from tempfile import TemporaryDirectory
+        choice = {"model": "gpt-6.1-sol", "effort": "low", "servers": ["modelControl"]}
+        for form, prompt in (([], False), (["start"], False), (["hello"], True),
+                             (["start", "hello"], True), (["--", "-literal"], True)):
+            with self.subTest(form=form), TemporaryDirectory() as directory, \
+                 patch.object(model_host_launcher, "ROOT", Path(directory)), \
+                 patch.object(sys, "argv", ["codex", "-C", directory, "-m", "gpt-6.1-sol",
+                                           "-c", 'model_reasoning_effort="low"', *form]), \
+                 patch.object(model_host_launcher, "_read_token", return_value="token"), \
+                 patch.object(model_host_launcher, "ensure_proxy"), \
+                 patch.object(model_host_launcher, "ensure_proxy_supervisor"), \
+                 patch.object(model_host_launcher, "real_codex_binary", return_value=Path("/real/codex")), \
+                 patch.object(model_host_launcher, "_route_choice", return_value=choice) as route_call, \
+                 patch.object(model_host_launcher.os, "execve") as launch:
+                model_host_launcher.main()
+                payloads = [json.loads(path.read_text()) for path in
+                            (Path(directory) / "launch-tickets").glob("*.json")]
+                self.assertEqual(len(payloads), 2)
+                ticket = next(item for item in payloads if item["schema"] == "modellabs.launch_ticket.v2")
+                self.assertEqual(ticket["workspace"]["path"], directory)
+                self.assertTrue(ticket["explicit_model"])
+                self.assertTrue(ticket["explicit_effort"])
+                self.assertEqual(ticket["model"], choice["model"] if prompt else None)
+                self.assertEqual(route_call.call_count, int(prompt))
+                self.assertRegex(launch.call_args.args[2]["MODEL_SELECTOR_HOST_TOKEN"],
+                                 r"^token\.launch-[0-9a-f]{32}$")
 
     def test_proxy_preserves_preselection_without_marking_user_override(self):
         request = {"id": 1, "method": "turn/start", "params": {

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import time
@@ -359,19 +360,86 @@ def _routed_interactive_args(args: list[str], prompt: str, choice: dict,
     return result
 
 
-def _create_launch_ticket(choice: dict, *, explicit_model: bool, explicit_effort: bool) -> str:
+def _launch_workspace(args: list[str]) -> dict | None:
+    """Bind the exact canonical folder a new chat may confirm as trusted.
+
+    Aliases, relative segments, symlinks, control characters and non-UTF-8
+    paths receive no binding, so the proxy denies any trust write for them.
+    """
+    selected = None
+    command_index = _command_index(args)
+    delimiter = command_index if command_index is not None else len(args)
+    value_options = {
+        "-c", "--config", "--enable", "--disable", "--remote",
+        "--remote-auth-token-env", "-i", "--image", "-m", "--model",
+        "--local-provider", "-p", "--profile", "-s", "--sandbox", "--add-dir",
+        "-a", "--ask-for-approval",
+    }
+    index = 0
+    while index < delimiter:
+        item = args[index]
+        if item == "--":
+            break
+        if item in {"-C", "--cd"} and index + 1 < delimiter:
+            selected = args[index + 1]
+            index += 2
+            continue
+        elif item.startswith("--cd="):
+            selected = item.split("=", 1)[1]
+        elif item.startswith("-C"):
+            # Do not guess an unparsed attached short-option spelling.
+            return None
+        elif item in value_options:
+            index += 2
+            continue
+        index += 1
+    try:
+        path = os.getcwd() if selected is None else (
+            selected if os.path.isabs(selected) else os.path.join(os.getcwd(), selected))
+        path.encode("utf-8")
+        if (any(ord(character) < 0x20 or 0x7f <= ord(character) <= 0x9f for character in path)
+                or os.path.normpath(path) != path or os.path.realpath(path) != path):
+            return None
+        info = os.lstat(path)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return {"path": path, "dev": info.st_dev, "ino": info.st_ino}
+
+
+def _write_private_json(path: Path, payload: dict) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+        handle.write("\n")
+
+
+def _create_launch_ticket(choice: dict | None, *, explicit_model: bool, explicit_effort: bool,
+                          workspace: dict | None = None) -> str:
+    """Mint one private ticket and, for a bound workspace, one trust grant.
+
+    The grant is a separate top-level file so the proxy can spend it exactly
+    once across connections by renaming it.
+    """
     ticket_id = secrets.token_hex(16)
     directory = ROOT / "launch-tickets"
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
-    path = directory / f"{ticket_id}.json"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump({"created_at": time.time(), "model": choice["model"],
-                   "effort": choice["effort"], "servers": choice.get("servers", []),
-                   "explicit_model": explicit_model,
-                   "explicit_effort": explicit_effort}, handle)
-        handle.write("\n")
+    created_at = time.time()
+    grant_id = None
+    if workspace is not None:
+        grant_id = secrets.token_hex(16)
+        _write_private_json(directory / f"trust-{grant_id}.json", {
+            "schema": "modellabs.trust_grant.v1", "created_at": created_at,
+            "ticket": ticket_id, "workspace": workspace})
+    _write_private_json(directory / f"{ticket_id}.json", {
+        "schema": "modellabs.launch_ticket.v2", "created_at": created_at,
+        "model": choice["model"] if choice else None,
+        "effort": choice["effort"] if choice else None,
+        "servers": choice.get("servers", []) if choice else None,
+        "explicit_model": explicit_model, "explicit_effort": explicit_effort,
+        "workspace": workspace, "trust_grant": grant_id})
     return ticket_id
 
 
@@ -430,18 +498,23 @@ def main() -> None:
     new_chat = literal_after_delimiter or command_name is None or command_name not in utility_commands
     preselected = False
     launch_ticket = None
-    if new_chat and command_index is not None:
+    if new_chat:
         explicit_model = _explicit_setting(args_in, "model") is not None
         explicit_effort = _explicit_setting(args_in, "model_reasoning_effort") is not None
-        prompt = args_in[command_index]
-        if prompt == "--":
-            raise ValueError("A new managed chat requires a prompt after --.")
-        append_prompt = False
-        choice = _route_choice(prompt, args_in, "interactive_preselection")
-        args_in = _routed_interactive_args(args_in, prompt, choice, append_prompt)
-        preselected = True
+        choice = None
+        if command_index is not None:
+            prompt = args_in[command_index]
+            if prompt == "--":
+                raise ValueError("A new managed chat requires a prompt after --.")
+            append_prompt = False
+            choice = _route_choice(prompt, args_in, "interactive_preselection")
+            args_in = _routed_interactive_args(args_in, prompt, choice, append_prompt)
+            preselected = True
+        # A promptless start gets no routing choice; the ticket only carries
+        # its pin flags and the trust binding for the selected folder.
         launch_ticket = _create_launch_ticket(choice, explicit_model=explicit_model,
-                                               explicit_effort=explicit_effort)
+                                               explicit_effort=explicit_effort,
+                                               workspace=_launch_workspace(args_in))
     if command_name == "resume":
         resume_index = command_index + 1
         if len(args_in) <= resume_index or args_in[resume_index].startswith("-"):
@@ -458,7 +531,7 @@ def main() -> None:
     environment = os.environ.copy()
     client_mode = None
     binary = real_codex_binary()
-    if preselected:
+    if launch_ticket is not None:
         client_mode = f"launch-{launch_ticket}"
     elif (_explicit_setting(args_in, "model") is not None
           and _explicit_setting(args_in, "model_reasoning_effort") is not None):
