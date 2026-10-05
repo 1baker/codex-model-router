@@ -1148,7 +1148,7 @@ class RoutingTests(unittest.TestCase):
                 python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
                 python.chmod(0o755)
 
-            completed = SimpleNamespace(returncode=0)
+            completed = SimpleNamespace(returncode=0, stdout="codex-cli 0.160.0\n")
             with patch.dict("os.environ", {"PATH": str(bin_dir)}, clear=False), \
                  patch.object(installer, "create_venv", side_effect=fake_venv), \
                  patch.object(installer, "write_service", return_value=root / "service"), \

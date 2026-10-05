@@ -18,6 +18,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from protocol_policy import SUPPORTED_CODEX_VERSIONS
+
 
 SOURCE = Path(__file__).resolve().parent
 PYTHON_FILES = [
@@ -28,7 +30,6 @@ PYTHON_FILES = [
 SHELL_PATH_START = "# >>> ModelLabs managed Codex route >>>"
 SHELL_PATH_END = "# <<< ModelLabs managed Codex route <<<"
 OWNED_MANIFEST = "owned-files.json"
-PINNED_CODEX_VERSION = "codex-cli 0.158.0"
 AUTHORITY_SCHEMA = "modellabs.thread_authority.v1"
 PROXY_GENERATION_FILES = (
     "adaptive_policy.py", "authority.py", "host_control.py", "model_host_launcher.py",
@@ -595,10 +596,12 @@ def create_venv(venv: Path) -> None:
 def verify_upstream_protocol_version(upstream: Path) -> str:
     result = subprocess.run([str(upstream), "--version"], check=True, capture_output=True,
                             text=True, timeout=15)
-    version = getattr(result, "stdout", PINNED_CODEX_VERSION).strip()
-    if version != PINNED_CODEX_VERSION:
+    stdout = getattr(result, "stdout", None)
+    version = stdout.strip() if isinstance(stdout, str) else ""
+    if version not in SUPPORTED_CODEX_VERSIONS:
         raise RuntimeError(
-            f"ModelLabs protocol policy is pinned to {PINNED_CODEX_VERSION}; found {version or 'unknown'}."
+            "ModelLabs protocol policy has not reviewed this Codex version; "
+            f"found {version or 'unknown'}."
         )
     return version
 
