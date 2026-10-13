@@ -20,6 +20,12 @@ a local watchdog for that proxy. Older proxies are left in place for already
 connected chats; no new managed launcher uses their port. Retire an older proxy
 only after its connected chats have exited and its accounting work has settled.
 
+## Start here
+
+For a new setup, use [Run a managed chat](#run-a-managed-chat) from a cloned repository root; it documents the Python installer, required Codex executable and effects on future launches. For an existing installation, start one new chat through the documented managed launcher, enter a prompt and inspect [Verification](#verification) for route and usage evidence. Expect a normal Codex terminal chat; a suggested route alone does not prove that the requested model ran.
+
+An upgrade changes installed files and the launcher. Keep live chat owners on their existing proxy; read the installation section before upgrading.
+
 ## Network boundary
 
 The ModelLabs host and proxy bind only to `127.0.0.1`. They are not registered
