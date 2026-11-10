@@ -1,5 +1,21 @@
 # ModelLabs
 
+**In one sentence:** ModelLabs picks which AI model and how much 'thinking effort' each Codex chat should use before it starts, and keeps a private log of usage so you can see where your allowance goes.
+
+**Who it is for:** Heavy Codex users who want sensible model choices made automatically and want to track usage.
+
+**How it works:**
+
+```mermaid
+flowchart LR
+    You[Your prompt] --> ML[ModelLabs router]
+    ML -->|chosen model + effort| Codex[Codex chat]
+    Codex -->|token counts only| Log[(Private usage log)]
+```
+
+---
+
+
 ModelLabs is a local Codex prompt router. It selects a model, reasoning effort,
 and starting MCP shortlist before the host begins inference. A managed Codex
 chat can be adjusted again on later turns through the protected local host.
